@@ -131,6 +131,9 @@ static const unsigned long STREAM_RECOVERY_COOLDOWN_MS = 10000;
 static const unsigned long IDLE_WIFI_RECOVERY_COOLDOWN_MS = 30000;
 static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
 static const BaseType_t CONTROL_WORKER_CORE = 0;
+static const uint8_t BLE_SCAN_ATTEMPTS = 3;
+static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
+static const unsigned long BLE_SCAN_RETRY_DELAY_MS = 1000;
 static const uint32_t UDP_LOG_FIRST_PACKETS = 8;
 static const uint32_t UDP_LOG_EVERY_N_PACKETS = 120;
 uint32_t streamRecoveryAttempts = 0;
@@ -768,12 +771,12 @@ bool runExactBleWake() {
   scan->setWindow(449);
   bleTargetDevice = nullptr;
 
-  for (int attempt = 1; attempt <= 3 && bleTargetDevice == nullptr; ++attempt) {
-    Serial.printf("[BLE] scan attempt %d/3\n", attempt);
-    scan->start(15, false);
+  for (int attempt = 1; attempt <= BLE_SCAN_ATTEMPTS && bleTargetDevice == nullptr; ++attempt) {
+    Serial.printf("[BLE] scan attempt %d/%u\n", attempt, BLE_SCAN_ATTEMPTS);
+    scan->start(BLE_SCAN_WINDOW_SEC, false);
     if (bleTargetDevice == nullptr) {
       Serial.println("[BLE] target not found in this scan window");
-      delay(2000);
+      delay(BLE_SCAN_RETRY_DELAY_MS);
     }
   }
 
