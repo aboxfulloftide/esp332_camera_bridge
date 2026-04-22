@@ -1,0 +1,23 @@
+.claude/
+.codex
+.venv-androguard/
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+
+# Local board/network config
+gardepro_dual_radio_bridge/local_config.h
+stream_test/local_config.h
+
+# Large local reverse-engineering artifacts
+*.apk
+*.pcap
+*.pcap.b64
+*.db
+photo.jpg
+phone_crack.txt
+
+# Local extracted APK contents
+apk_extract/
