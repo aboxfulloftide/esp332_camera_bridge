@@ -134,6 +134,8 @@ static const BaseType_t CONTROL_WORKER_CORE = 0;
 static const uint8_t BLE_SCAN_ATTEMPTS = 3;
 static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
 static const unsigned long BLE_SCAN_RETRY_DELAY_MS = 1000;
+static const unsigned long BRINGUP_HOTSPOT_WAIT_MS = 20000;
+static const unsigned long BRINGUP_HOTSPOT_POLL_MS = 3000;
 static const uint32_t UDP_LOG_FIRST_PACKETS = 8;
 static const uint32_t UDP_LOG_EVERY_N_PACKETS = 120;
 uint32_t streamRecoveryAttempts = 0;
@@ -1553,8 +1555,19 @@ bool runBringupSequence() {
   Serial.printf("[BLE] exact wake result: %s stage=%s\n",
                 bleWakeConfirmed ? "success" : "no-confirmation",
                 bleStage.c_str());
-  const bool hotspotVisible = waitForCameraWifiPresence(60000, 5000);
+  if (!bleWakeConfirmed) {
+    Serial.println("[bringup] aborting after BLE wake failure");
+    refreshWifiState();
+    return false;
+  }
+  const bool hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
+                                                        BRINGUP_HOTSPOT_POLL_MS);
   Serial.printf("[WiFi] hotspot visibility after BLE wake: %s\n", hotspotVisible ? "yes" : "no");
+  if (!hotspotVisible) {
+    Serial.println("[bringup] aborting because camera hotspot did not appear");
+    refreshWifiState();
+    return false;
+  }
   connectCameraWifi();
   if (RUN_LOCAL_SERIAL_TEST) {
     Serial.println("[BLE] keeping wake session open in local serial mode");

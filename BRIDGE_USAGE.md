@@ -264,5 +264,9 @@ Prioritized next work from the current live state:
 Current blocker from the latest live validation:
 
 - the board now comes up on HaLow immediately after boot and `/status` is reachable before `bringup`
-- but the latest `bringup` attempt timed out while the board was still in BLE scan
-- during that BLE scan window the HTTP control plane became intermittently unavailable, so settings-key mapping and delete-path confirmation could not be completed against an awake camera in this round
+- `bringup` now fails fast with `control_last_message: "bringup_failed"` when BLE scan/wake does not succeed, instead of falling through into a long hotspot wait
+- `/status` and the Python control path remain usable after that failed `bringup`
+- the remaining live blocker is now narrower:
+  - BLE target discovery / wake reliability
+  - getting the camera hotspot to appear after wake
+  - only after that can settings-key mapping and delete-path confirmation be completed against an awake camera

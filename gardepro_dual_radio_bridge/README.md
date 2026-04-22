@@ -274,9 +274,9 @@ That module now:
 Latest live validation findings after the current stability patches:
 
 - the local-serial-mode board now returns to HaLow immediately after boot and `/status` is reachable before `bringup`
-- a live `bringup` attempt still timed out while the board was in BLE scan
-- during that BLE scan window the HTTP control plane became intermittently unavailable
-- because the camera never reached WiFi-up in that validation window, live settings-key mapping and live delete-path confirmation remain incomplete in this round
+- `bringup` now fails fast as `bringup_failed` when BLE scan/wake does not succeed, instead of continuing into a long hotspot-wait path
+- `/status` remains reachable after that failed `bringup`, so the control plane is no longer wedged behind the failed wake attempt
+- because the camera still never reached WiFi-up in that validation window, live settings-key mapping and live delete-path confirmation remain incomplete in this round
 
 ## Build
 
