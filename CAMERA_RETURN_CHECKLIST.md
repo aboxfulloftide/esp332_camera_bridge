@@ -39,16 +39,17 @@ Once `session-open` works:
    - `format-start`
    - current live result:
      - `take-picture` confirmed
-     - `video-stop` returned camera `code: 0` and produced gallery item `135`
+     - `video-stop` confirmed
      - `video-stop` now also handles the camera's early placeholder-video behavior (`uid: "00000000"`) and no longer requires a post-stop ID change
-     - `format-start` remains intentionally deferred because it is destructive to the SD card
+     - `format-start` confirmed
+     - raw gallery check after format returned an empty `data` array
 4. Validate media path and delete behavior:
    - `media-paths`
    - `media-delete`
    - confirm extension-form vs legacy delete paths
    - current live result:
      - `media-paths` confirmed for photo and video items
-     - `media-delete` remains intentionally deferred unless deleting disposable test captures is acceptable
+     - `media-delete` confirmed for a disposable photo and a disposable video item
 5. If media timestamps look wrong, set the clock:
    - `python3 /home/matheau/esp32_camera/gardepro_server_control.py set-clock --timestamp "$(date -u '+%Y-%m-%d %H:%M:%S')"`
    - note: `/cmd/setGmtClock` expects UTC input; sending local Eastern time produced a 4-hour offset during validation

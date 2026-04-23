@@ -176,6 +176,7 @@ Settings write behavior:
 Media delete behavior:
 
 - `media-delete` now reports the chosen media item's canonical paths, the direct camera delete response, and whether that item still appears in the refreshed gallery afterward
+- live validation confirmed delete success for both a disposable photo and a disposable video item
 
 Picture capture behavior:
 
@@ -199,6 +200,7 @@ Format behavior:
 - use `--timeout` and `--poll-interval` to tune how long the result polling runs
 - the verified result now also includes `poll_attempts`, `elapsed_sec`, and `timed_out`
 - `format-result` remains available as the raw direct camera query
+- live validation confirmed the real post-condition by reading the gallery afterward and observing an empty `data` array
 
 Current board-side camera routes:
 
@@ -251,6 +253,7 @@ Recently confirmed through the live board/camera path:
 - `media-download`
 - `thumb-download`
 - `media-delete`
+- `format-start`
 - `ir-status`
 - `take-picture`
 - `picture-result`
