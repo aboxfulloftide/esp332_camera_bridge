@@ -40,7 +40,7 @@ Once `session-open` works:
    - current live result:
      - `take-picture` confirmed
      - `video-stop` returned camera `code: 0` and produced gallery item `135`
-     - `video-stop` caveat: the current wrapper can still report `new_video_observed:false` if the camera exposes the new video item before stop completes
+     - `video-stop` now also handles the camera's early placeholder-video behavior (`uid: "00000000"`) and no longer requires a post-stop ID change
      - `format-start` remains intentionally deferred because it is destructive to the SD card
 4. Validate media path and delete behavior:
    - `media-paths`

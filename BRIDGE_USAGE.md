@@ -190,9 +190,8 @@ Video stop behavior:
 - it also reports whether a new completed video was actually observed in the refreshed gallery
 - use `--timeout` and `--poll-interval` to tune the post-stop gallery polling
 - the verified result now also includes `poll_attempts`, `elapsed_sec`, and `timed_out`
-- current caveat from live validation:
-  - the camera can expose the new video item in the gallery before stop completes
-  - in that case `response.code` can be `0` and the recorded file can exist, but `new_video_observed` may still be `false`
+- live validation showed the camera can expose an in-progress video early with placeholder `uid: "00000000"`
+- the wrapper now treats that placeholder item as the new recording already being observed, so `video-stop` no longer waits for a post-stop ID change that may never happen
 
 Format behavior:
 

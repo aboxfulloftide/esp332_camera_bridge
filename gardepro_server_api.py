@@ -630,6 +630,10 @@ class GardeProServerAPI:
                 return item
         return None
 
+    @staticmethod
+    def _is_pending_video_item(item: MediaItem | None) -> bool:
+        return isinstance(item, MediaItem) and item.type == 2 and item.uid == "00000000"
+
     def resolve_media(self, media: MediaItem | int, *, media_type: int | None = None) -> MediaItem:
         if isinstance(media, MediaItem):
             return media
@@ -918,6 +922,7 @@ class GardeProServerAPI:
         before = self.latest_media(media_type=2)
         response = self.stop_video_recording_path(camera_path)
         matched_video: MediaItem | None = None
+        before_pending = self._is_pending_video_item(before)
 
         def fetch_video() -> MediaItem | None:
             return self.latest_media(media_type=2)
@@ -927,6 +932,9 @@ class GardeProServerAPI:
             if not isinstance(latest_video, MediaItem):
                 return False
             if before is None or latest_video.id != before.id:
+                matched_video = latest_video
+                return True
+            if before_pending and latest_video.id == before.id:
                 matched_video = latest_video
                 return True
             return False

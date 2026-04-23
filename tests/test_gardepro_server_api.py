@@ -240,6 +240,42 @@ class GardeProServerAPITests(unittest.TestCase):
             },
         )
 
+    def test_stop_video_recording_verified_accepts_pending_video_item(self) -> None:
+        api = self.make_api()
+        calls: list[str] = []
+        items = [
+            MediaItem(id=166, type=2, date="2026-04-23 14:26:04", size=49385892, uid="00000000"),
+            MediaItem(id=166, type=2, date="2026-04-23 14:26:04", size=49385892, uid="00000000"),
+            MediaItem(id=166, type=2, date="2026-04-23 14:26:04", size=49385892, uid="00000000"),
+        ]
+
+        def latest_media(*, media_type=None):
+            calls.append(f"latest_media:{media_type}")
+            return items.pop(0)
+
+        def stop_video_recording_path(camera_path="/media/video/stop"):
+            calls.append(f"stop:{camera_path}")
+            return {"code": 0, "desc": "success"}
+
+        api.latest_media = latest_media
+        api.stop_video_recording_path = stop_video_recording_path
+
+        result = api.stop_video_recording_verified(timeout=5, poll_interval=0)
+
+        self.assertTrue(result["stopped"])
+        self.assertTrue(result["new_video_observed"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["before"]["id"], 166)
+        self.assertEqual(result["after"]["id"], 166)
+        self.assertEqual(
+            calls,
+            [
+                "latest_media:2",
+                "stop:/media/video/stop",
+                "latest_media:2",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
