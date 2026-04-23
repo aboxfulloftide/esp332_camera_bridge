@@ -101,6 +101,7 @@ uint32_t mediaSecondaryBytes = 0;
 bool bleWakeAttempted = false;
 bool bleWakeConfirmed = false;
 bool cameraWifiEverConnected = false;
+bool standbyRequested = false;
 String bleScanMode = "idle";
 String bleLastSeenMac;
 String bleLastSeenName;
@@ -818,7 +819,7 @@ bool tryExistingBleWakeSession() {
 }
 
 bool sendHttpKeepalive() {
-  if (!wifiConnected) {
+  if (!wifiConnected || standbyRequested) {
     return false;
   }
 
@@ -1135,6 +1136,7 @@ void connectCameraWifi() {
   wifiConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiConnected) {
     cameraWifiEverConnected = true;
+    standbyRequested = false;
     lastHttpKeepaliveMs = millis();
     Serial.printf("Camera WiFi connected, IP=%s gateway=%s\n",
                   WiFi.localIP().toString().c_str(),
@@ -1189,6 +1191,10 @@ bool recoverActiveStream(const char *reason) {
 bool recoverIdleWifi(const char *reason) {
   if (isControlActionActive()) {
     Serial.printf("[idle] skipping wifi recovery during control action reason=%s\n", reason);
+    return false;
+  }
+  if (standbyRequested) {
+    Serial.printf("[idle] skipping wifi recovery during requested standby reason=%s\n", reason);
     return false;
   }
   if (!cameraWifiEverConnected) {
@@ -1355,6 +1361,13 @@ bool proxyCameraRequest(const String &method,
 
   Serial.printf("Camera %s %s -> %d, %u bytes\n",
                 method.c_str(), path.c_str(), statusCode, (unsigned)responseBody.length());
+  if (statusCode >= 200 && statusCode < 300) {
+    if (path == "/cmd/standby/now") {
+      standbyRequested = true;
+    } else if (path == "/cmd/standby/reset") {
+      standbyRequested = false;
+    }
+  }
   return true;
 }
 
@@ -1940,6 +1953,7 @@ void handleStatus() {
   payload += ",\"halow_mac\":\"" + HaLow.macAddress() + "\"";
   payload += ",\"camera_ip\":\"" + CAMERA_IP.toString() + "\"";
   payload += ",\"camera_wifi_ever_connected\":" + String(cameraWifiEverConnected ? "true" : "false");
+  payload += ",\"standby_requested\":" + String(standbyRequested ? "true" : "false");
   payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
   payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
   payload += ",\"recoveries\":" + String(streamRecoveryAttempts);

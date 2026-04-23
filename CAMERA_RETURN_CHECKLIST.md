@@ -30,21 +30,41 @@ Once `session-open` works:
    - `screen_timeout`
    - `cellular_transfer`
    - `instant_upload`
+   - current live result:
+     - present: `standby_timeout`, `wifi`
+     - not present on this firmware: `power_source`, `screen_timeout`, `cellular_transfer`, `instant_upload`
 3. Validate verified action wrappers:
    - `take-picture`
    - `video-stop`
    - `format-start`
+   - current live result:
+     - `take-picture` confirmed
+     - `video-stop` returned camera `code: 0` and produced gallery item `135`
+     - `video-stop` caveat: the current wrapper can still report `new_video_observed:false` if the camera exposes the new video item before stop completes
+     - `format-start` remains intentionally deferred because it is destructive to the SD card
 4. Validate media path and delete behavior:
    - `media-paths`
    - `media-delete`
    - confirm extension-form vs legacy delete paths
+   - current live result:
+     - `media-paths` confirmed for photo and video items
+     - `media-delete` remains intentionally deferred unless deleting disposable test captures is acceptable
+5. If media timestamps look wrong, set the clock:
+   - `python3 /home/matheau/esp32_camera/gardepro_server_control.py set-clock --timestamp "$(date -u '+%Y-%m-%d %H:%M:%S')"`
+   - note: `/cmd/setGmtClock` expects UTC input; sending local Eastern time produced a 4-hour offset during validation
+   - direct readback:
+     - `python3 /home/matheau/esp32_camera/gardepro_server_control.py info --index 4`
 
 ## Teardown Validation
 
 1. Stop live view if it was started:
    - `python3 /home/matheau/esp32_camera/gardepro_server_control.py stream-stop --timeout 45 --poll-interval 1`
 2. Close the short-lived session:
-   - `python3 /home/matheau/esp32_camera/gardepro_server_control.py session-close --timeout 30 --poll-interval 1`
+   - `python3 /home/matheau/esp32_camera/gardepro_server_control.py session-close --timeout 45 --poll-interval 2`
+   - expected verified result:
+     - `standby.code == 0`
+     - `after.wifi_connected == false`
+     - `session_closed == true`
 3. If intentionally keeping the camera awake briefly:
    - `python3 /home/matheau/esp32_camera/gardepro_server_control.py session-close --no-standby`
 
@@ -52,4 +72,5 @@ Once `session-open` works:
 
 1. Re-check BLE telemetry in `/status`.
 2. Re-check the camera power state before drawing conclusions from BLE discovery failures.
-3. Keep firmware as a clue source only; do not patch camera firmware unless the bridge approach is exhausted.
+3. Check whether `/status` shows `standby_requested:true`; if it does and WiFi still stays up, re-verify the board is running the patched bridge firmware.
+4. Keep firmware as a clue source only; do not patch camera firmware unless the bridge approach is exhausted.

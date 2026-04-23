@@ -129,6 +129,7 @@ Important control behavior:
 - the HTTP request returns immediately with `202 Accepted`
 - the board executes the requested action in a worker task
 - `bringup`, `stream-start`, and `stream-stop` wait on `/status` by default and now accept `--timeout` and `--poll-interval` to tune that wait
+- `session-close` now polls `/status` after standby instead of taking one immediate snapshot, so delayed WiFi drop is reported correctly
 - in the current local-serial-mode sketch, HaLow and the HTTP control plane now boot immediately instead of waiting for the camera wake path to finish first
 - poll `status` to watch:
   - `control_busy`
@@ -156,13 +157,21 @@ Stability work completed in the current sketch:
   - `idle_recoveries`
   - `http_keepalive_failures`
   - `idle_recovery_last_ms`
+- `/status` now also exposes:
+  - `standby_requested`
 - the control worker now runs on a separate core from the main loop to reduce starvation during long control actions
 - local serial mode now brings up HaLow and the HTTP bridge immediately on boot so remote status/control does not wait for the camera wake path
+- after a successful `/cmd/standby/now`, the bridge now suppresses idle `/cmd/standby/reset` keepalives and idle auto-recovery until the next explicit bringup or standby reset
 
 Settings write behavior:
 
 - `setting-set` and `setting-update-json` send the patch, re-read `/cmd/getSetting`, and report which requested keys actually changed
 - `set-setting-json` sends the raw POST body and prints the direct camera response
+- `set-clock` writes through `/cmd/setGmtClock`
+- live validation showed `/cmd/setGmtClock` expects a UTC timestamp; sending local Eastern time produced a 4-hour offset in saved media timestamps
+- `info --index 4` now provides a direct clock readback path and returned:
+  - `clock: 2026-04-23 10:55:33`
+  - `tz: US/Eastern`
 
 Media delete behavior:
 
@@ -181,6 +190,9 @@ Video stop behavior:
 - it also reports whether a new completed video was actually observed in the refreshed gallery
 - use `--timeout` and `--poll-interval` to tune the post-stop gallery polling
 - the verified result now also includes `poll_attempts`, `elapsed_sec`, and `timed_out`
+- current caveat from live validation:
+  - the camera can expose the new video item in the gallery before stop completes
+  - in that case `response.code` can be `0` and the recorded file can exist, but `new_video_observed` may still be `false`
 
 Format behavior:
 
@@ -243,8 +255,10 @@ Recently confirmed through the live board/camera path:
 - `ir-status`
 - `take-picture`
 - `picture-result`
+- `session-close` with verified WiFi drop
 - `video-start`
 - `video-stop`
+- `info --index 4` direct clock readback
 - `camera-request --camera-path /cmd/standby/now`
 - `camera-request --camera-path /cmd/delete/1/<id>`
 - `download --camera-path /thumb/<id>/JPG`
@@ -258,9 +272,18 @@ Idle session note:
   - server requests `session-open` or `bringup`
   - ESP32 wakes and joins the camera
   - ESP32 performs the requested work quickly
+  - ESP32 requests standby and now allows camera WiFi to fall away cleanly
   - server requests `session-close`
   - `session-close` stops active live view first, then sends camera standby by default
   - ESP32 disconnects and lets the camera return to low power
+
+Deferred follow-up work:
+
+- no additional work is currently needed on deeper Python-side standby-state regression coverage beyond the added delayed-standby unit test
+- no additional work is currently needed on extra board-side serial/log observability for standby transitions
+- if that changes later, resume from:
+  - `gardepro_server_api.py` delayed-standby polling
+  - `gardepro_dual_radio_bridge/gardepro_dual_radio_bridge.ino` `standby_requested` handling
 - do not optimize for permanent WiFi/hotspot uptime; optimize for reliable wake, fast actions, and clean teardown
 
 Session helper behavior:

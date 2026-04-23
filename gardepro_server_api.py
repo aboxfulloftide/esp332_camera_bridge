@@ -318,6 +318,7 @@ class GardeProServerAPI:
         poll_interval: float = 1.0,
         standby: bool = True,
     ) -> dict[str, Any]:
+        deadline = time.time() + float(timeout or self.control_timeout)
         before = self.status()
         stream_stop_result: Any = None
         standby_result: Any = None
@@ -331,6 +332,12 @@ class GardeProServerAPI:
                 standby_result = self.standby_now()
 
         after = self.status()
+        if standby and isinstance(after, dict) and after.get("wifi_connected", False):
+            while time.time() < deadline:
+                time.sleep(poll_interval)
+                after = self.status()
+                if isinstance(after, dict) and not after.get("wifi_connected", False):
+                    break
         stream_inactive = isinstance(after, dict) and not after.get("stream_active", False)
         wifi_inactive = isinstance(after, dict) and not after.get("wifi_connected", False)
         return {

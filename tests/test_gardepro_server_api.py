@@ -117,6 +117,40 @@ class GardeProServerAPITests(unittest.TestCase):
             ],
         )
 
+    def test_close_session_polls_until_standby_disconnects_wifi(self) -> None:
+        api = self.make_api()
+        calls: list[tuple[str, object, object]] = []
+        statuses = [
+            {"wifi_connected": True, "stream_active": False},
+            {"wifi_connected": True, "stream_active": False},
+            {"wifi_connected": False, "stream_active": False},
+        ]
+
+        def status():
+            calls.append(("status", None, None))
+            return statuses.pop(0)
+
+        def standby_now():
+            calls.append(("standby_now", None, None))
+            return {"code": 0}
+
+        api.status = status
+        api.standby_now = standby_now
+
+        result = api.close_session(timeout=2, poll_interval=0)
+
+        self.assertTrue(result["session_closed"])
+        self.assertEqual(result["standby"], {"code": 0})
+        self.assertEqual(
+            calls,
+            [
+                ("status", None, None),
+                ("standby_now", None, None),
+                ("status", None, None),
+                ("status", None, None),
+            ],
+        )
+
     def test_session_context_closes_after_exception(self) -> None:
         api = self.make_api()
         calls: list[tuple[str, object, object, object]] = []
