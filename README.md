@@ -18,6 +18,10 @@ This repository contains the current GardePro ESP32 bridge work:
   - resume checklist for when the camera has power again
 - `SERVER_SIDE_PLAN.md`
   - next-phase plan for the local web service and UI
+- `SERVER_API_SPEC.md`
+  - route-by-route server API contract and bridge/job mapping
+- `SERVER_DEPLOYMENT_HANDOFF.md`
+  - runtime/deployment notes for doing the server work on another machine
 
 ## Local Config
 
