@@ -16,6 +16,8 @@ This repository contains the current GardePro ESP32 bridge work:
   - current operator notes and validation workflow
 - `CAMERA_RETURN_CHECKLIST.md`
   - resume checklist for when the camera has power again
+- `SERVER_SIDE_PLAN.md`
+  - next-phase plan for the local web service and UI
 
 ## Local Config
 
