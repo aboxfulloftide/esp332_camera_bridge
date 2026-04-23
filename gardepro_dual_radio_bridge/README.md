@@ -103,10 +103,35 @@ Local serial mode now proves the camera-side live-view path directly:
 
 So the remaining gap is not camera protocol discovery anymore. It is turning the proven local RTSP/RTP path into the final forwarding/product behavior.
 
-The main remaining runtime issue is camera hotspot lifetime:
+The product target is not a permanently awake camera session.
+
+Desired runtime model:
+
+- receive a server request
+- wake and join the camera on demand
+- perform the requested work:
+  - live view
+  - settings changes
+  - media download
+  - status queries
+- stop and disconnect cleanly
+- let the camera return to low power
+
+So the bridge should optimize for reliable wake and short-lived sessions, not permanent hotspot uptime.
+
+The server-side control layer now reflects that model directly:
+
+- `session-open` / `open_session(...)` for the wake/connect step
+- perform the requested work while the session is active
+- `session-close` / `close_session(...)` for teardown
+- `session-close` stops active streaming first and then requests camera standby by default
+- pass `--no-standby` if you need to keep the camera awake briefly after stopping stream
+- for server code, `run_in_session(...)` and the small one-shot wrappers handle common short-session reads without manual open/close sequencing
+
+The main remaining runtime issue is reliable on-demand session startup:
 
 - the tunnel and receiver path are working
-- the camera still needs more long-run validation, but the sketch now sends periodic `/cmd/standby/reset` even when no stream is active
+- the camera still needs more long-run validation
 - the sketch now auto-recovers by:
   - re-waking the camera over BLE
   - waiting for hotspot return
@@ -182,8 +207,10 @@ registration file and calls the board HTTP bridge automatically:
 ```bash
 python3 /home/matheau/esp32_camera/gardepro_server_control.py status
 python3 /home/matheau/esp32_camera/gardepro_server_control.py bringup --timeout 60 --poll-interval 1
+python3 /home/matheau/esp32_camera/gardepro_server_control.py session-open --timeout 60 --poll-interval 1
 python3 /home/matheau/esp32_camera/gardepro_server_control.py stream-start --timeout 90 --poll-interval 1
 python3 /home/matheau/esp32_camera/gardepro_server_control.py stream-stop --timeout 45 --poll-interval 1
+python3 /home/matheau/esp32_camera/gardepro_server_control.py session-close --timeout 30 --poll-interval 1
 python3 /home/matheau/esp32_camera/gardepro_server_control.py settings
 python3 /home/matheau/esp32_camera/gardepro_server_control.py setting-values
 python3 /home/matheau/esp32_camera/gardepro_server_control.py setting-keys
@@ -207,11 +234,14 @@ reservation is added for the board's HaLow MAC.
 For real server integration, use:
 
 - [gardepro_server_api.py](/home/matheau/esp32_camera/gardepro_server_api.py)
+- [gardepro_server_jobs.py](/home/matheau/esp32_camera/gardepro_server_jobs.py)
 - [GARDEPRO_CAMERA_HTTP_CANDIDATES.md](/home/matheau/esp32_camera/GARDEPRO_CAMERA_HTTP_CANDIDATES.md)
+- [CAMERA_RETURN_CHECKLIST.md](/home/matheau/esp32_camera/CAMERA_RETURN_CHECKLIST.md)
 
 That module now:
 
 - resolves the board IP from the registration file
+- exposes `open_session(...)`, `close_session(...)`, `session(...)`, and `run_in_session(...)` for short-lived session handling
 - waits for queued control actions to finish by polling `/status`
 - retries raw camera fetches once after `bringup` when the board reports a transport-level camera failure
 - returns structured raw camera fetch results with decoded body text and parsed JSON when available
@@ -266,16 +296,41 @@ That module now:
   - thumbnail download via `/thumb/<id>/JPG`
   - delete via `/cmd/delete/1/<id>` and `/cmd/delete/<id>/1`
 - current next work is narrowing the remaining gaps:
-  - keep the HTTP control plane responsive during BLE scan / wake
-  - finish long-run hotspot-lifetime stabilization so recovery is the exception instead of the normal path
+  - finish reliable on-demand wake/connect behavior
+  - keep active sessions short and teardown explicit
   - enumerate more settings keys safely from the live camera
   - confirm the canonical delete syntax with extension/type variants
 
+Firmware-derived setting candidates worth testing through the existing HTTP settings path:
+
+- `standby_timeout`
+- `wifi`
+- `power_source`
+- `screen_timeout`
+- `cellular_transfer`
+- `instant_upload`
+
+Firmware clue summary:
+
+- the newer firmware image contains explicit strings for:
+  - `standby_timeout`
+  - `wifi`
+  - `power_source`
+  - `screen_timeout`
+  - bind / activation success
+  - WiFi-side sleep / standby control (`tc_sleep_ctl`, WiFi MCU control strings)
+- this makes firmware useful as a clue source for session/power behavior without patching or reflashing the camera firmware itself
+
 Latest live validation findings after the current stability patches:
 
+- the attached camera is currently not powered, so the latest BLE wake/discovery failures should be treated as provisional until rechecked against a valid powered state
 - the local-serial-mode board now returns to HaLow immediately after boot and `/status` is reachable before `bringup`
-- `bringup` now fails fast as `bringup_failed` when BLE scan/wake does not succeed, instead of continuing into a long hotspot-wait path
-- `/status` remains reachable after that failed `bringup`, so the control plane is no longer wedged behind the failed wake attempt
+- `/status` now remains reachable while `bringup` is actively running, and the Python control client now gets a board-side `bringup_failed` result instead of timing out waiting for completion
+- the local serial loop now services HTTP much more frequently, and the long BLE / WiFi wait paths now yield cooperatively instead of sleeping in large blocking chunks
+- idle WiFi recovery is now gated off during active control actions, so manual `bringup` no longer races the background recovery path
+- `/status` now also exposes BLE scan telemetry including scan mode, total advertisements seen, target-hit count, and strongest/last seen advertisers
+- in the latest live run, active scan saw `30` advertisements and passive fallback raised that to `56`, but the target MAC was never seen and the final state was still `ble_stage: "scan_not_found"`
+- `bringup` still ends as `bringup_failed`, so the remaining blocker is now primarily BLE target discovery / wake reliability and getting the camera hotspot to appear after wake
 - because the camera still never reached WiFi-up in that validation window, live settings-key mapping and live delete-path confirmation remain incomplete in this round
 
 ## Build

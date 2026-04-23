@@ -77,6 +77,10 @@ static const uint16_t UPSTREAM_TUNNEL_PORT = 6000;
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *CAMERA_BLE_MAC = "a4:6d:d4:9e:47:32";
 static const char *CAMERA_BLE_WAKE = "AT+WAKEPULSE=10\r\n";
+static const char *CAMERA_BLE_NAME = "CAM8Z8_NoName_G_E6";
+static const char *CAMERA_BLE_NAME_PREFIX = "CAM8Z8_";
+static const char *CAMERA_BLE_SERVICE_UUID = "6e000100-b5a3-f393-e0a9-e50e24dcca9e";
+static const size_t BLE_RECENT_DEVICE_SLOTS = 16;
 
 WebServer server(BRIDGE_HTTP_PORT);
 bool httpServerStarted = false;
@@ -96,6 +100,26 @@ uint32_t mediaPrimaryBytes = 0;
 uint32_t mediaSecondaryBytes = 0;
 bool bleWakeAttempted = false;
 bool bleWakeConfirmed = false;
+bool cameraWifiEverConnected = false;
+String bleScanMode = "idle";
+String bleLastSeenMac;
+String bleLastSeenName;
+int bleLastSeenRssi = -127;
+int bleBestSeenRssi = -127;
+String bleBestSeenMac;
+String bleBestSeenName;
+uint32_t bleScanResultCount = 0;
+uint32_t bleTargetSeenCount = 0;
+uint32_t bleScanAttemptCounter = 0;
+String bleRecentMacs[BLE_RECENT_DEVICE_SLOTS];
+String bleRecentNames[BLE_RECENT_DEVICE_SLOTS];
+String bleRecentServices[BLE_RECENT_DEVICE_SLOTS];
+int bleRecentRssis[BLE_RECENT_DEVICE_SLOTS] = {
+  -127, -127, -127, -127,
+  -127, -127, -127, -127,
+  -127, -127, -127, -127,
+  -127, -127, -127, -127
+};
 String serialCommandBuffer;
 bool udpInspectorsStarted = false;
 bool streamSessionActive = false;
@@ -134,6 +158,12 @@ static const BaseType_t CONTROL_WORKER_CORE = 0;
 static const uint8_t BLE_SCAN_ATTEMPTS = 3;
 static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
 static const unsigned long BLE_SCAN_RETRY_DELAY_MS = 1000;
+static const uint8_t BLE_PASSIVE_SCAN_ATTEMPTS = 2;
+static const uint16_t BLE_PASSIVE_SCAN_WINDOW_SEC = 8;
+static const uint16_t BLE_SCAN_INTERVAL_MS = 80;
+static const uint16_t BLE_SCAN_WINDOW_MS = 80;
+static const uint8_t BLE_WAKE_PULSE_ATTEMPTS = 3;
+static const unsigned long BLE_WAKE_PULSE_DELAY_MS = 350;
 static const unsigned long BRINGUP_HOTSPOT_WAIT_MS = 20000;
 static const unsigned long BRINGUP_HOTSPOT_POLL_MS = 3000;
 static const uint32_t UDP_LOG_FIRST_PACKETS = 8;
@@ -332,6 +362,14 @@ bool sendTunnelControlFrame(int sock, TunnelControlType controlType, const Strin
   }
   unlockTunnelWrite();
   return true;
+}
+
+void cooperativeDelay(unsigned long durationMs) {
+  const unsigned long start = millis();
+  while (millis() - start < durationMs) {
+    delay(1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
 }
 
 String buildStreamStartMetadata() {
@@ -572,6 +610,12 @@ void snapshotControlState(ControlState &snapshot) {
   portEXIT_CRITICAL(&controlState.lock);
 }
 
+bool isControlActionActive() {
+  ControlState snapshot{};
+  snapshotControlState(snapshot);
+  return snapshot.busy || snapshot.pendingAction != CONTROL_ACTION_NONE;
+}
+
 bool queueControlAction(ControlAction action, String &message) {
   bool accepted = false;
   const char *messageType = "queued";
@@ -672,6 +716,107 @@ bool sendBleWakePulse() {
   return true;
 }
 
+void resetBleScanStats() {
+  bleScanMode = "idle";
+  bleLastSeenMac = "";
+  bleLastSeenName = "";
+  bleLastSeenRssi = -127;
+  bleBestSeenRssi = -127;
+  bleBestSeenMac = "";
+  bleBestSeenName = "";
+  bleScanResultCount = 0;
+  bleTargetSeenCount = 0;
+  bleScanAttemptCounter = 0;
+  for (size_t i = 0; i < BLE_RECENT_DEVICE_SLOTS; ++i) {
+    bleRecentMacs[i] = "";
+    bleRecentNames[i] = "";
+    bleRecentServices[i] = "";
+    bleRecentRssis[i] = -127;
+  }
+}
+
+void rememberBleAdvertiser(const String &mac, const String &name, const String &serviceUuid, int rssi) {
+  size_t slot = BLE_RECENT_DEVICE_SLOTS;
+  for (size_t i = 0; i < BLE_RECENT_DEVICE_SLOTS; ++i) {
+    if (bleRecentMacs[i] == mac) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == BLE_RECENT_DEVICE_SLOTS) {
+    for (size_t i = 0; i + 1 < BLE_RECENT_DEVICE_SLOTS; ++i) {
+      bleRecentMacs[i] = bleRecentMacs[i + 1];
+      bleRecentNames[i] = bleRecentNames[i + 1];
+      bleRecentServices[i] = bleRecentServices[i + 1];
+      bleRecentRssis[i] = bleRecentRssis[i + 1];
+    }
+    slot = BLE_RECENT_DEVICE_SLOTS - 1;
+  }
+  bleRecentMacs[slot] = mac;
+  bleRecentNames[slot] = name;
+  bleRecentServices[slot] = serviceUuid;
+  bleRecentRssis[slot] = rssi;
+}
+
+String buildBleRecentDevicesJson() {
+  String payload = "[";
+  bool first = true;
+  for (size_t i = 0; i < BLE_RECENT_DEVICE_SLOTS; ++i) {
+    if (bleRecentMacs[i].isEmpty()) {
+      continue;
+    }
+    if (!first) {
+      payload += ",";
+    }
+    first = false;
+    payload += "{";
+    payload += "\"mac\":\"" + jsonEscape(bleRecentMacs[i]) + "\"";
+    payload += ",\"name\":\"" + jsonEscape(bleRecentNames[i]) + "\"";
+    payload += ",\"service\":\"" + jsonEscape(bleRecentServices[i]) + "\"";
+    payload += ",\"rssi\":" + String(bleRecentRssis[i]);
+    payload += "}";
+  }
+  payload += "]";
+  return payload;
+}
+
+bool advertisedDeviceLooksLikeCamera(const String &mac, const String &name, const String &serviceUuid) {
+  if (mac.equalsIgnoreCase(CAMERA_BLE_MAC)) {
+    return true;
+  }
+  if (!name.isEmpty() && (name == CAMERA_BLE_NAME || name.startsWith(CAMERA_BLE_NAME_PREFIX))) {
+    return true;
+  }
+  if (!serviceUuid.isEmpty() && serviceUuid == CAMERA_BLE_SERVICE_UUID) {
+    return true;
+  }
+  return false;
+}
+
+bool tryExistingBleWakeSession() {
+  if (bleClient == nullptr || !bleClient->isConnected() || bleDataChar4 == nullptr) {
+    return false;
+  }
+
+  bleStage = "reuse_wake";
+  bleWakeSawOk = false;
+  bleLastNotifyText = "";
+  bool sent = false;
+  for (uint8_t attempt = 1; attempt <= BLE_WAKE_PULSE_ATTEMPTS; ++attempt) {
+    Serial.printf("[BLE] cached wake attempt %u/%u\n", attempt, BLE_WAKE_PULSE_ATTEMPTS);
+    sent = sendBleWakePulse() || sent;
+    cooperativeDelay(BLE_WAKE_PULSE_DELAY_MS);
+    if (bleWakeSawOk) {
+      break;
+    }
+  }
+  Serial.printf("[BLE] cached wake sent=%s ok=%s last=%s\n",
+                sent ? "yes" : "no",
+                bleWakeSawOk ? "yes" : "no",
+                bleLastNotifyText.c_str());
+  return sent;
+}
+
 bool sendHttpKeepalive() {
   if (!wifiConnected) {
     return false;
@@ -742,17 +887,81 @@ class BridgeBleClientCallbacks : public BLEClientCallbacks {
 class BridgeBleAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
     const String mac = advertisedDevice.getAddress().toString().c_str();
-    if (mac.equalsIgnoreCase(CAMERA_BLE_MAC)) {
+    String name = "";
+    if (advertisedDevice.haveName()) {
+      name = advertisedDevice.getName().c_str();
+    }
+    String serviceUuid = "";
+    if (advertisedDevice.haveServiceUUID()) {
+      serviceUuid = advertisedDevice.getServiceUUID().toString().c_str();
+      serviceUuid.toLowerCase();
+    }
+    const int rssi = advertisedDevice.getRSSI();
+    ++bleScanResultCount;
+    bleLastSeenMac = mac;
+    bleLastSeenName = name;
+    bleLastSeenRssi = rssi;
+    rememberBleAdvertiser(mac, name, serviceUuid, rssi);
+    if (rssi > bleBestSeenRssi) {
+      bleBestSeenRssi = rssi;
+      bleBestSeenMac = mac;
+      bleBestSeenName = name;
+    }
+    if (advertisedDeviceLooksLikeCamera(mac, name, serviceUuid)) {
+      ++bleTargetSeenCount;
       Serial.printf("[BLE] found target advertisement %s", mac.c_str());
-      if (advertisedDevice.haveName()) {
-        Serial.printf(" name=%s", advertisedDevice.getName().c_str());
+      if (!name.isEmpty()) {
+        Serial.printf(" name=%s", name.c_str());
       }
+      if (!serviceUuid.isEmpty()) {
+        Serial.printf(" service=%s", serviceUuid.c_str());
+      }
+      Serial.printf(" rssi=%d", rssi);
       Serial.println();
       BLEDevice::getScan()->stop();
       bleTargetDevice = new BLEAdvertisedDevice(advertisedDevice);
+    } else if (bleScanResultCount <= 5 || (bleScanResultCount % 25) == 0) {
+      Serial.printf("[BLE] saw advertisement mac=%s rssi=%d", mac.c_str(), rssi);
+      if (!name.isEmpty()) {
+        Serial.printf(" name=%s", name.c_str());
+      }
+      if (!serviceUuid.isEmpty()) {
+        Serial.printf(" service=%s", serviceUuid.c_str());
+      }
+      Serial.println();
     }
   }
 };
+
+bool runBleDiscoveryPass(BLEScan *scan,
+                         bool activeScan,
+                         uint8_t attempts,
+                         uint16_t windowSec,
+                         const char *modeLabel) {
+  bleScanMode = modeLabel;
+  scan->setActiveScan(activeScan);
+  for (uint8_t attempt = 1; attempt <= attempts && bleTargetDevice == nullptr; ++attempt) {
+    ++bleScanAttemptCounter;
+    Serial.printf("[BLE] %s scan attempt %u/%u window=%us results=%u best_mac=%s best_rssi=%d\n",
+                  modeLabel,
+                  attempt,
+                  attempts,
+                  static_cast<unsigned>(windowSec),
+                  static_cast<unsigned>(bleScanResultCount),
+                  bleBestSeenMac.c_str(),
+                  bleBestSeenRssi);
+    scan->start(windowSec, false);
+    if (bleTargetDevice == nullptr) {
+      Serial.printf("[BLE] target not found in %s scan window results=%u best_mac=%s best_rssi=%d\n",
+                    modeLabel,
+                    static_cast<unsigned>(bleScanResultCount),
+                    bleBestSeenMac.c_str(),
+                    bleBestSeenRssi);
+      cooperativeDelay(BLE_SCAN_RETRY_DELAY_MS);
+    }
+  }
+  return bleTargetDevice != nullptr;
+}
 
 bool runExactBleWake() {
   bleNotifyCount = 0;
@@ -761,29 +970,29 @@ bool runExactBleWake() {
   bleNotifyChar3 = nullptr;
   bleDataChar4 = nullptr;
   bleStage = "scan";
+  resetBleScanStats();
 
   Serial.printf("[BLE] scanning for target %s\n", CAMERA_BLE_MAC);
   Serial.println("[BLE] warmup before BLE init");
-  delay(5000);
+  cooperativeDelay(5000);
   BLEDevice::init("");
   BLEScan *scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new BridgeBleAdvertisedDeviceCallbacks());
-  scan->setActiveScan(true);
-  scan->setInterval(1349);
-  scan->setWindow(449);
+  scan->setAdvertisedDeviceCallbacks(new BridgeBleAdvertisedDeviceCallbacks(), true, true);
+  scan->setInterval(BLE_SCAN_INTERVAL_MS);
+  scan->setWindow(BLE_SCAN_WINDOW_MS);
   bleTargetDevice = nullptr;
-
-  for (int attempt = 1; attempt <= BLE_SCAN_ATTEMPTS && bleTargetDevice == nullptr; ++attempt) {
-    Serial.printf("[BLE] scan attempt %d/%u\n", attempt, BLE_SCAN_ATTEMPTS);
-    scan->start(BLE_SCAN_WINDOW_SEC, false);
-    if (bleTargetDevice == nullptr) {
-      Serial.println("[BLE] target not found in this scan window");
-      delay(BLE_SCAN_RETRY_DELAY_MS);
-    }
+  runBleDiscoveryPass(scan, true, BLE_SCAN_ATTEMPTS, BLE_SCAN_WINDOW_SEC, "active");
+  if (bleTargetDevice == nullptr) {
+    runBleDiscoveryPass(scan, false, BLE_PASSIVE_SCAN_ATTEMPTS, BLE_PASSIVE_SCAN_WINDOW_SEC, "passive");
   }
 
   if (bleTargetDevice == nullptr) {
-    Serial.println("[BLE] target advertisement not found");
+    Serial.printf("[BLE] target advertisement not found results=%u best_mac=%s best_name=%s best_rssi=%d attempts=%u\n",
+                  static_cast<unsigned>(bleScanResultCount),
+                  bleBestSeenMac.c_str(),
+                  bleBestSeenName.c_str(),
+                  bleBestSeenRssi,
+                  static_cast<unsigned>(bleScanAttemptCounter));
     bleStage = "scan_not_found";
     return false;
   }
@@ -834,17 +1043,17 @@ bool runExactBleWake() {
   }
 
   bleStage = "wake";
-  delay(150);
+  cooperativeDelay(150);
   for (int attempt = 1; attempt <= 3; ++attempt) {
     Serial.printf("[BLE] wake attempt %d/3 -> 6e400004 payload=%s", attempt, CAMERA_BLE_WAKE);
     bleDataChar4->writeValue(reinterpret_cast<uint8_t *>(const_cast<char *>(CAMERA_BLE_WAKE)),
                              strlen(CAMERA_BLE_WAKE),
                              true);
     lastBleKeepaliveMs = millis();
-    delay(350);
+    cooperativeDelay(350);
   }
 
-  delay(2000);
+  cooperativeDelay(2000);
   Serial.printf("[BLE] wake done notify_count=%u ok=%s last=%s\n",
                 bleNotifyCount,
                 bleWakeSawOk ? "yes" : "no",
@@ -897,7 +1106,7 @@ void connectCameraWifi() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.disconnect(true, true);
-  delay(250);
+  cooperativeDelay(250);
 
   Serial.println("Scanning for camera hotspot before connect");
   const int count = WiFi.scanNetworks();
@@ -918,13 +1127,14 @@ void connectCameraWifi() {
 
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(500);
+    cooperativeDelay(100);
     Serial.print(".");
   }
   Serial.println();
 
   wifiConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiConnected) {
+    cameraWifiEverConnected = true;
     lastHttpKeepaliveMs = millis();
     Serial.printf("Camera WiFi connected, IP=%s gateway=%s\n",
                   WiFi.localIP().toString().c_str(),
@@ -977,6 +1187,14 @@ bool recoverActiveStream(const char *reason) {
 }
 
 bool recoverIdleWifi(const char *reason) {
+  if (isControlActionActive()) {
+    Serial.printf("[idle] skipping wifi recovery during control action reason=%s\n", reason);
+    return false;
+  }
+  if (!cameraWifiEverConnected) {
+    Serial.printf("[idle] skipping wifi recovery before first camera WiFi success reason=%s\n", reason);
+    return false;
+  }
   if (millis() - lastIdleRecoveryMs < IDLE_WIFI_RECOVERY_COOLDOWN_MS) {
     return false;
   }
@@ -988,7 +1206,7 @@ bool recoverIdleWifi(const char *reason) {
 
   closeBleWakeSession();
   WiFi.disconnect(true, true);
-  delay(250);
+  cooperativeDelay(250);
   refreshWifiState();
 
   const bool restored = runBringupSequence();
@@ -1037,7 +1255,7 @@ bool waitForCameraWifiPresence(unsigned long timeoutMs, unsigned long intervalMs
     Serial.printf("Target SSID %s not visible yet after %lu ms\n",
                   CAMERA_WIFI_SSID,
                   millis() - start);
-    delay(intervalMs);
+    cooperativeDelay(intervalMs);
   }
   return false;
 }
@@ -1062,7 +1280,7 @@ void connectHaLow() {
 
   unsigned long start = millis();
   while (HaLow.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(500);
+    cooperativeDelay(100);
     Serial.print("#");
   }
   Serial.println();
@@ -1112,7 +1330,7 @@ bool proxyCameraRequest(const String &method,
       responseBody = "{\"error\":\"camera_timeout\"}";
       return false;
     }
-    delay(10);
+    cooperativeDelay(10);
   }
 
   String raw;
@@ -1184,7 +1402,7 @@ bool exchangeCameraRtspRequest(WiFiClient &client,
     if (responseText.length() > 0 && millis() - lastData > 250) {
       break;
     }
-    delay(10);
+    cooperativeDelay(10);
   }
 
   statusCode = 0;
@@ -1541,28 +1759,45 @@ void runCameraHttpSelfTest() {
     if (body.length() > 0) {
       printBodySnippet(body);
     }
-    delay(250);
+    cooperativeDelay(250);
   }
   Serial.println("=== End camera HTTP self-test ===");
 }
 
 bool runBringupSequence() {
-  closeBleWakeSession();
   WiFi.disconnect(true, true);
-  delay(250);
+  cooperativeDelay(250);
+  refreshWifiState();
   bleWakeAttempted = true;
-  bleWakeConfirmed = runExactBleWake();
-  Serial.printf("[BLE] exact wake result: %s stage=%s\n",
-                bleWakeConfirmed ? "success" : "no-confirmation",
-                bleStage.c_str());
-  if (!bleWakeConfirmed) {
-    Serial.println("[bringup] aborting after BLE wake failure");
-    refreshWifiState();
-    return false;
+  bool hotspotVisible = false;
+
+  if (tryExistingBleWakeSession()) {
+    hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
+                                               BRINGUP_HOTSPOT_POLL_MS);
+    Serial.printf("[WiFi] hotspot visibility after cached BLE wake: %s\n",
+                  hotspotVisible ? "yes" : "no");
+    if (hotspotVisible) {
+      bleWakeConfirmed = true;
+    } else {
+      Serial.println("[bringup] cached BLE wake did not restore hotspot, falling back to full scan");
+    }
   }
-  const bool hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
-                                                        BRINGUP_HOTSPOT_POLL_MS);
-  Serial.printf("[WiFi] hotspot visibility after BLE wake: %s\n", hotspotVisible ? "yes" : "no");
+
+  if (!hotspotVisible) {
+    closeBleWakeSession();
+    bleWakeConfirmed = runExactBleWake();
+    Serial.printf("[BLE] exact wake result: %s stage=%s\n",
+                  bleWakeConfirmed ? "success" : "no-confirmation",
+                  bleStage.c_str());
+    if (!bleWakeConfirmed) {
+      Serial.println("[bringup] aborting after BLE wake failure");
+      refreshWifiState();
+      return false;
+    }
+    hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
+                                               BRINGUP_HOTSPOT_POLL_MS);
+    Serial.printf("[WiFi] hotspot visibility after BLE wake: %s\n", hotspotVisible ? "yes" : "no");
+  }
   if (!hotspotVisible) {
     Serial.println("[bringup] aborting because camera hotspot did not appear");
     refreshWifiState();
@@ -1685,11 +1920,11 @@ void runRtspProbeSequence() {
   Serial.println("=== RTSP probe sequence ===");
   for (size_t i = 0; i < sizeof(urls) / sizeof(urls[0]); ++i) {
     runRtspMethodFromSerial("OPTIONS", urls[i]);
-    delay(200);
+    cooperativeDelay(200);
   }
   for (size_t i = 1; i < sizeof(urls) / sizeof(urls[0]); ++i) {
     runRtspMethodFromSerial("DESCRIBE", urls[i]);
-    delay(200);
+    cooperativeDelay(200);
   }
   Serial.println("=== End RTSP probe sequence ===");
 }
@@ -1704,6 +1939,7 @@ void handleStatus() {
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   payload += ",\"halow_mac\":\"" + HaLow.macAddress() + "\"";
   payload += ",\"camera_ip\":\"" + CAMERA_IP.toString() + "\"";
+  payload += ",\"camera_wifi_ever_connected\":" + String(cameraWifiEverConnected ? "true" : "false");
   payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
   payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
   payload += ",\"recoveries\":" + String(streamRecoveryAttempts);
@@ -1714,6 +1950,22 @@ void handleStatus() {
   payload += ",\"media_primary_bytes\":" + String(mediaPrimaryBytes);
   payload += ",\"media_secondary_packets\":" + String(mediaSecondaryPackets);
   payload += ",\"media_secondary_bytes\":" + String(mediaSecondaryBytes);
+  payload += ",\"ble_wake_attempted\":" + String(bleWakeAttempted ? "true" : "false");
+  payload += ",\"ble_wake_confirmed\":" + String(bleWakeConfirmed ? "true" : "false");
+  payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
+  payload += ",\"ble_scan_mode\":\"" + jsonEscape(bleScanMode) + "\"";
+  payload += ",\"ble_scan_results\":" + String(bleScanResultCount);
+  payload += ",\"ble_scan_attempts\":" + String(bleScanAttemptCounter);
+  payload += ",\"ble_target_seen_count\":" + String(bleTargetSeenCount);
+  payload += ",\"ble_last_seen_mac\":\"" + jsonEscape(bleLastSeenMac) + "\"";
+  payload += ",\"ble_last_seen_name\":\"" + jsonEscape(bleLastSeenName) + "\"";
+  payload += ",\"ble_last_seen_rssi\":" + String(bleLastSeenRssi);
+  payload += ",\"ble_best_seen_mac\":\"" + jsonEscape(bleBestSeenMac) + "\"";
+  payload += ",\"ble_best_seen_name\":\"" + jsonEscape(bleBestSeenName) + "\"";
+  payload += ",\"ble_best_seen_rssi\":" + String(bleBestSeenRssi);
+  payload += ",\"ble_recent_devices\":" + buildBleRecentDevicesJson();
+  payload += ",\"ble_notify_count\":" + String(bleNotifyCount);
+  payload += ",\"ble_last_notify\":\"" + jsonEscape(bleLastNotifyText) + "\"";
   payload += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
   payload += ",\"control_pending\":\"" + String(controlActionName(controlSnapshot.pendingAction)) + "\"";
   payload += ",\"control_action\":\"" + String(controlActionName(controlSnapshot.activeAction)) + "\"";
@@ -1757,7 +2009,7 @@ void handleCameraRawGet() {
       server.send(504, "application/json", "{\"error\":\"camera_timeout\"}");
       return;
     }
-    delay(10);
+    cooperativeDelay(10);
   }
 
   String statusLine = client.readStringUntil('\n');
@@ -2476,7 +2728,8 @@ void loop() {
       Serial.printf("[stream] primary RTP stalled for %lu ms\n", msSince(lastPrimaryPacketMs));
       recoverActiveStream("rtp_stall");
     }
-    if (!streamSessionActive && !wifiConnected && millis() - lastRescanMs > 15000) {
+    if (!streamSessionActive && !wifiConnected && cameraWifiEverConnected && !isControlActionActive() &&
+        millis() - lastRescanMs > 15000) {
       lastRescanMs = millis();
       Serial.printf("[state] ble_attempted=%s ble_ok=%s notify_count=%u last=%s\n",
                     bleWakeAttempted ? "yes" : "no",
@@ -2491,7 +2744,7 @@ void loop() {
       lastStatusLogMs = millis();
       printRuntimeStatus();
     }
-    delay(1000);
+    cooperativeDelay(25);
     return;
   }
 

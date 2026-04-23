@@ -6,12 +6,16 @@ This repository contains the current GardePro ESP32 bridge work:
   - ESP32 dual-radio bridge sketch
 - `gardepro_server_api.py`
   - Python client for the board HTTP bridge
+- `gardepro_server_jobs.py`
+  - small server-facing short-session job layer
 - `gardepro_server_control.py`
   - CLI wrapper for live control and validation
 - `gardepro_tunnel_server.py`
   - receiver for the framed tunnel stream
 - `BRIDGE_USAGE.md`
   - current operator notes and validation workflow
+- `CAMERA_RETURN_CHECKLIST.md`
+  - resume checklist for when the camera has power again
 
 ## Local Config
 
@@ -26,3 +30,4 @@ Create these local files from the provided examples:
 
 - The trail-camera hotspot password remains in the repo because it is the vendor default for the device under test.
 - Large local reverse-engineering artifacts and machine-specific files are ignored by git.
+- The current server-side direction is short-lived on-demand sessions, not permanent camera connectivity.

@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -255,6 +256,22 @@ class GardeProServerAPI:
             poll_interval=poll_interval,
         )
 
+    def open_session(
+        self,
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+    ) -> dict[str, Any]:
+        before = self.status()
+        bringup_status = self.bringup(timeout=timeout, poll_interval=poll_interval)
+        after = self.status()
+        return {
+            "before": before,
+            "bringup": bringup_status,
+            "after": after,
+            "session_ready": isinstance(after, dict) and after.get("wifi_connected", False),
+        }
+
     def stream_start(
         self,
         *,
@@ -292,6 +309,151 @@ class GardeProServerAPI:
             and not status.get("control_busy", False),
             timeout=timeout,
             poll_interval=poll_interval,
+        )
+
+    def close_session(
+        self,
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+        standby: bool = True,
+    ) -> dict[str, Any]:
+        before = self.status()
+        stream_stop_result: Any = None
+        standby_result: Any = None
+
+        if isinstance(before, dict) and before.get("stream_active", False):
+            stream_stop_result = self.stream_stop(timeout=timeout, poll_interval=poll_interval)
+
+        if standby:
+            status_before_standby = stream_stop_result if stream_stop_result is not None else before
+            if isinstance(status_before_standby, dict) and status_before_standby.get("wifi_connected", False):
+                standby_result = self.standby_now()
+
+        after = self.status()
+        stream_inactive = isinstance(after, dict) and not after.get("stream_active", False)
+        wifi_inactive = isinstance(after, dict) and not after.get("wifi_connected", False)
+        return {
+            "before": before,
+            "stream_stop": stream_stop_result,
+            "standby": standby_result,
+            "standby_requested": standby,
+            "after": after,
+            "session_closed": stream_inactive and (wifi_inactive if standby else True),
+        }
+
+    @contextmanager
+    def session(
+        self,
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+        close_timeout: int | None = None,
+        close_poll_interval: float | None = None,
+        standby: bool = True,
+    ):
+        self.open_session(timeout=timeout, poll_interval=poll_interval)
+        try:
+            yield self
+        finally:
+            self.close_session(
+                timeout=close_timeout if close_timeout is not None else timeout,
+                poll_interval=(
+                    close_poll_interval if close_poll_interval is not None else poll_interval
+                ),
+                standby=standby,
+            )
+
+    def run_in_session(
+        self,
+        action: Callable[["GardeProServerAPI"], Any],
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+        close_timeout: int | None = None,
+        close_poll_interval: float | None = None,
+        standby: bool = True,
+    ) -> dict[str, Any]:
+        with self.session(
+            timeout=timeout,
+            poll_interval=poll_interval,
+            close_timeout=close_timeout,
+            close_poll_interval=close_poll_interval,
+            standby=standby,
+        ):
+            result = action(self)
+        return {"result": result}
+
+    def get_settings_in_session(
+        self,
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+        close_timeout: int | None = None,
+        close_poll_interval: float | None = None,
+        standby: bool = True,
+    ) -> dict[str, Any]:
+        return self.run_in_session(
+            lambda api: api.get_settings(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+            close_timeout=close_timeout,
+            close_poll_interval=close_poll_interval,
+            standby=standby,
+        )
+
+    def get_setting_values_in_session(
+        self,
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+        close_timeout: int | None = None,
+        close_poll_interval: float | None = None,
+        standby: bool = True,
+    ) -> dict[str, Any]:
+        return self.run_in_session(
+            lambda api: api.get_setting_values(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+            close_timeout=close_timeout,
+            close_poll_interval=close_poll_interval,
+            standby=standby,
+        )
+
+    def list_media_in_session(
+        self,
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+        close_timeout: int | None = None,
+        close_poll_interval: float | None = None,
+        standby: bool = True,
+    ) -> dict[str, Any]:
+        return self.run_in_session(
+            lambda api: [item.to_dict() for item in api.list_media()],
+            timeout=timeout,
+            poll_interval=poll_interval,
+            close_timeout=close_timeout,
+            close_poll_interval=close_poll_interval,
+            standby=standby,
+        )
+
+    def get_ir_status_in_session(
+        self,
+        *,
+        timeout: int | None = None,
+        poll_interval: float = 1.0,
+        close_timeout: int | None = None,
+        close_poll_interval: float | None = None,
+        standby: bool = True,
+    ) -> dict[str, Any]:
+        return self.run_in_session(
+            lambda api: api.get_ir_status(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+            close_timeout=close_timeout,
+            close_poll_interval=close_poll_interval,
+            standby=standby,
         )
 
     def _camera_endpoint_json(self, path: str) -> Any:

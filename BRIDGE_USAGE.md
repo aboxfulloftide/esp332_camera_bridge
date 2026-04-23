@@ -87,8 +87,10 @@ Example:
 ```bash
 python3 /home/matheau/esp32_camera/gardepro_server_control.py status
 python3 /home/matheau/esp32_camera/gardepro_server_control.py bringup --timeout 60 --poll-interval 1
+python3 /home/matheau/esp32_camera/gardepro_server_control.py session-open --timeout 60 --poll-interval 1
 python3 /home/matheau/esp32_camera/gardepro_server_control.py stream-start --timeout 90 --poll-interval 1
 python3 /home/matheau/esp32_camera/gardepro_server_control.py stream-stop --timeout 45 --poll-interval 1
+python3 /home/matheau/esp32_camera/gardepro_server_control.py session-close --timeout 30 --poll-interval 1
 python3 /home/matheau/esp32_camera/gardepro_server_control.py settings
 python3 /home/matheau/esp32_camera/gardepro_server_control.py setting-values
 python3 /home/matheau/esp32_camera/gardepro_server_control.py setting-keys
@@ -201,12 +203,28 @@ Current Python integration surface:
 
 - reusable module:
   - `gardepro_server_api.py`
+- server-facing short-session job layer:
+  - `gardepro_server_jobs.py`
 - CLI wrapper:
   - `gardepro_server_control.py`
+
+Short-lived session helpers now available for server integration:
+
+- `open_session(...)`
+- `close_session(...)`
+- `session(...)` as a context manager for wake -> work -> teardown
+- `run_in_session(...)` for one-shot bounded work inside a short session
+- convenience one-shot wrappers:
+  - `get_settings_in_session(...)`
+  - `get_setting_values_in_session(...)`
+  - `list_media_in_session(...)`
+  - `get_ir_status_in_session(...)`
 
 Candidate camera path inventory:
 
 - `GARDEPRO_CAMERA_HTTP_CANDIDATES.md`
+- camera resume checklist:
+  - `CAMERA_RETURN_CHECKLIST.md`
 
 Recently confirmed through the live board/camera path:
 
@@ -235,9 +253,22 @@ Recently confirmed through the live board/camera path:
 
 Idle session note:
 
-- the ESP32 sketch now sends periodic `GET /cmd/standby/reset` while camera WiFi is up, even without an active stream
-- in live serial observation this held `wifi=up` across repeated keepalive intervals, which is better than the earlier non-stream hotspot expiry behavior
-- with `halow_up` issued on the current local-serial-mode build, remote `/status` polling also stayed healthy while the idle keepalives were running
+- this was useful for diagnosis, but it is not the intended product behavior
+- the intended session model is:
+  - server requests `session-open` or `bringup`
+  - ESP32 wakes and joins the camera
+  - ESP32 performs the requested work quickly
+  - server requests `session-close`
+  - `session-close` stops active live view first, then sends camera standby by default
+  - ESP32 disconnects and lets the camera return to low power
+- do not optimize for permanent WiFi/hotspot uptime; optimize for reliable wake, fast actions, and clean teardown
+
+Session helper behavior:
+
+- `session-open` wraps the “wake and prepare the short-lived work window” step
+- `session-close` wraps the normal teardown step
+- `session-close` returns `before` / `after` status snapshots plus any stream-stop / standby results it invoked
+- pass `--no-standby` to `session-close` when you want to stop streaming but intentionally keep the camera session up for a little longer
 
 Local playback test:
 
@@ -249,23 +280,56 @@ ffplay -protocol_whitelist file,udp,rtp /tmp/gardepro_live.sdp
 
 Prioritized next work from the current live state:
 
-1. keep the HTTP control plane responsive during BLE scan / wake so `bringup` can be observed and polled remotely while it runs
-2. finish long-run hotspot and stream validation now that idle recovery and immediate HaLow boot are in place
-3. validate the newer verified commands against a successfully awake camera:
+1. validate on-demand session behavior end-to-end:
+   - reliable `bringup`
+   - requested work only during the active window
+   - clean disconnect/teardown after work
+2. validate the newer verified commands against a successfully awake camera:
    - `take-picture`
    - `video-stop`
    - `format-start`
    - `setting-set`
    - `setting-update-json`
    - `media-delete`
-4. map the live `/cmd/getSetting` keys and safe values from the real camera
-5. confirm the canonical delete syntax with live camera responses for extension-form and legacy type/id paths
+3. map the live `/cmd/getSetting` keys and safe values from the real camera
+4. confirm the canonical delete syntax with live camera responses for extension-form and legacy type/id paths
+
+Firmware-derived candidate settings to test through `POST /cmd/setSetting` once the camera is powered again:
+
+- `standby_timeout`
+- `wifi`
+- `power_source`
+- `screen_timeout`
+- `cellular_transfer`
+- `instant_upload`
+
+Current firmware clue summary:
+
+- `standby_timeout` appears directly in the newer firmware image
+- `wifi`, `power_source`, and `screen_timeout` also appear in config-like string regions
+- bind / activation / sleep control is explicit in firmware strings:
+  - `bind_success`
+  - `WIFI MCU_SUBRD_INT_EN()`
+  - `WIFI/AH MCU_SUBRD_INT_CLOSE()`
+  - `tc_sleep_ctl(...)`
+- this supports using firmware as a clue source for settings/session behavior, not as a patch target
 
 Current blocker from the latest live validation:
 
+- the attached camera is currently not powered, so the latest BLE wake/discovery conclusions should be treated as provisional until rerun with a valid device state
 - the board now comes up on HaLow immediately after boot and `/status` is reachable before `bringup`
-- `bringup` now fails fast with `control_last_message: "bringup_failed"` when BLE scan/wake does not succeed, instead of falling through into a long hotspot wait
-- `/status` and the Python control path remain usable after that failed `bringup`
+- `/status` now stays responsive while `bringup` is actively running, and the Python control path now gets a board-side `bringup_failed` result instead of timing out waiting for control completion
+- the local serial loop now polls the HTTP server far more frequently, and the long BLE / WiFi waits now yield cooperatively instead of sleeping in large blocking chunks
+- background idle WiFi recovery no longer races with a manual `bringup`; during the latest run `idle_recoveries` stayed at `0` while `control_action` was `bringup`
+- after the failed `bringup`, `/status` remains usable and reports `control_last_message: "bringup_failed"`
+- BLE scan telemetry is now exposed in `/status`:
+  - `ble_scan_mode`
+  - `ble_scan_results`
+  - `ble_scan_attempts`
+  - `ble_target_seen_count`
+  - `ble_last_seen_*`
+  - `ble_best_seen_*`
+- the latest live run saw `30` advertisements during active scan and `56` total after passive fallback, but `ble_target_seen_count` stayed `0` and the final state was still `ble_stage: "scan_not_found"`
 - the remaining live blocker is now narrower:
   - BLE target discovery / wake reliability
   - getting the camera hotspot to appear after wake

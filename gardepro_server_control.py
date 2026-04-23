@@ -18,6 +18,8 @@ def main() -> int:
         choices=[
             "status",
             "bringup",
+            "session-open",
+            "session-close",
             "stream-start",
             "stream-stop",
             "settings",
@@ -70,6 +72,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--no-auto-bringup", action="store_true")
+    parser.add_argument("--no-standby", action="store_true")
     args = parser.parse_args()
 
     api = GardeProServerAPI(
@@ -84,6 +87,18 @@ def main() -> int:
         return 0
     if args.command == "bringup":
         payload = api.bringup(timeout=args.timeout or None, poll_interval=args.poll_interval)
+        print(json.dumps(payload, indent=2))
+        return 0
+    if args.command == "session-open":
+        payload = api.open_session(timeout=args.timeout or None, poll_interval=args.poll_interval)
+        print(json.dumps(payload, indent=2))
+        return 0
+    if args.command == "session-close":
+        payload = api.close_session(
+            timeout=args.timeout or None,
+            poll_interval=args.poll_interval,
+            standby=not args.no_standby,
+        )
         print(json.dumps(payload, indent=2))
         return 0
     if args.command == "stream-start":

@@ -16,6 +16,8 @@ stream_test/local_config.h
 *.pcap
 *.pcap.b64
 *.db
+ROM_APP_*.img
+Screenshot_*.jpg
 photo.jpg
 phone_crack.txt
 
