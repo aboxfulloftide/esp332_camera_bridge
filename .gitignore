@@ -19,6 +19,7 @@ stream_test/local_config.h
 ROM_APP_*.img
 Screenshot_*.jpg
 photo.jpg
+photo_*.jpg
 phone_crack.txt
 
 # Local extracted APK contents

@@ -6,6 +6,8 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
+#include <esp_camera.h>
+#include <esp_heap_caps.h>
 #include <stdint.h>
 
 extern "C" {
@@ -81,6 +83,19 @@ static const char *CAMERA_BLE_NAME = "CAM8Z8_NoName_G_E6";
 static const char *CAMERA_BLE_NAME_PREFIX = "CAM8Z8_";
 static const char *CAMERA_BLE_SERVICE_UUID = "6e000100-b5a3-f393-e0a9-e50e24dcca9e";
 static const size_t BLE_RECENT_DEVICE_SLOTS = 16;
+
+#ifndef ONBOARD_CAPTURE_INTERVAL_MS
+#define ONBOARD_CAPTURE_INTERVAL_MS 60000UL
+#endif
+#ifndef ONBOARD_CAPTURE_ENABLED
+#define ONBOARD_CAPTURE_ENABLED 1
+#endif
+
+static const int BAT_ADC_PIN = 1;
+static const int BAT_ADC_CTRL_PIN = 20;
+static const int BAT_CHRG_PIN = 15;
+static const int BAT_DONE_PIN = 16;
+static const unsigned long WIFI_SCAN_CACHE_MS = 60000UL;
 
 WebServer server(BRIDGE_HTTP_PORT);
 bool httpServerStarted = false;
@@ -174,6 +189,22 @@ uint32_t idleRecoveryAttempts = 0;
 uint32_t httpKeepaliveFailures = 0;
 SemaphoreHandle_t tunnelWriteMutex = nullptr;
 TaskHandle_t controlWorkerTaskHandle = nullptr;
+
+SemaphoreHandle_t onboardFrameMutex = nullptr;
+TaskHandle_t onboardCaptureTaskHandle = nullptr;
+bool onboardCameraReady = false;
+bool onboardCaptureEnabled = ONBOARD_CAPTURE_ENABLED != 0;
+unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
+uint8_t *onboardLatestJpeg = nullptr;
+size_t onboardLatestJpegLen = 0;
+uint32_t onboardCaptureCount = 0;
+uint32_t onboardCaptureFailures = 0;
+unsigned long onboardLastCaptureMs = 0;
+
+String wifiScanLastJson = "{\"networks\":[]}";
+uint16_t wifiScanLastCount = 0;
+unsigned long wifiScanLastMs = 0;
+bool wifiScanBusy = false;
 
 struct CameraProbeTarget {
   const char *label;
@@ -570,6 +601,234 @@ unsigned long msSince(unsigned long timestampMs) {
     return 0;
   }
   return millis() - timestampMs;
+}
+
+uint32_t readBatteryAdcMilliVolts(int samples = 64) {
+  digitalWrite(BAT_ADC_CTRL_PIN, LOW);
+  delay(20);
+  uint64_t total = 0;
+  for (int i = 0; i < samples; ++i) {
+    total += analogReadMilliVolts(BAT_ADC_PIN);
+    delay(2);
+  }
+  return static_cast<uint32_t>(total / samples);
+}
+
+String buildBatteryJson() {
+  const uint32_t adcMv = readBatteryAdcMilliVolts();
+  const float batteryV = (adcMv / 1000.0f) * 2.0f;
+  String payload = "{";
+  payload += "\"adc_pin\":" + String(BAT_ADC_PIN);
+  payload += ",\"adc_ctrl_pin\":" + String(BAT_ADC_CTRL_PIN);
+  payload += ",\"adc_mv\":" + String(adcMv);
+  payload += ",\"battery_est_v\":" + String(batteryV, 3);
+  payload += ",\"charging_gpio15\":" + String(digitalRead(BAT_CHRG_PIN));
+  payload += ",\"done_gpio16\":" + String(digitalRead(BAT_DONE_PIN));
+  payload += "}";
+  return payload;
+}
+
+bool initOnboardCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 8;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  const esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[onboard-camera] init failed err=0x%x\n", err);
+    return false;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s != nullptr) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, 0);
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    camera_fb_t *warmup = esp_camera_fb_get();
+    if (warmup != nullptr) {
+      esp_camera_fb_return(warmup);
+    }
+    delay(150);
+  }
+
+  onboardCameraReady = true;
+  Serial.printf("[onboard-camera] ready psram=%s interval_ms=%lu enabled=%s\n",
+                psramFound() ? "yes" : "no",
+                onboardCaptureIntervalMs,
+                onboardCaptureEnabled ? "yes" : "no");
+  return true;
+}
+
+bool captureOnboardFrame() {
+  if (!onboardCameraReady) {
+    ++onboardCaptureFailures;
+    return false;
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (fb == nullptr || fb->len == 0) {
+    ++onboardCaptureFailures;
+    if (fb != nullptr) {
+      esp_camera_fb_return(fb);
+    }
+    return false;
+  }
+
+  uint8_t *copy = static_cast<uint8_t *>(psramFound() ? ps_malloc(fb->len) : malloc(fb->len));
+  if (copy == nullptr) {
+    ++onboardCaptureFailures;
+    esp_camera_fb_return(fb);
+    return false;
+  }
+  memcpy(copy, fb->buf, fb->len);
+  const size_t copyLen = fb->len;
+  esp_camera_fb_return(fb);
+
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
+  }
+  uint8_t *old = onboardLatestJpeg;
+  onboardLatestJpeg = copy;
+  onboardLatestJpegLen = copyLen;
+  onboardCaptureCount++;
+  onboardLastCaptureMs = millis();
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreGive(onboardFrameMutex);
+  }
+  if (old != nullptr) {
+    free(old);
+  }
+
+  Serial.printf("[onboard-camera] captured bytes=%u count=%u\n",
+                static_cast<unsigned>(copyLen),
+                onboardCaptureCount);
+  return true;
+}
+
+String buildOnboardCameraStatusJson() {
+  size_t latestLen = 0;
+  uint32_t count = 0;
+  uint32_t failures = 0;
+  unsigned long lastMs = 0;
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
+  }
+  latestLen = onboardLatestJpegLen;
+  count = onboardCaptureCount;
+  failures = onboardCaptureFailures;
+  lastMs = onboardLastCaptureMs;
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreGive(onboardFrameMutex);
+  }
+
+  String payload = "{";
+  payload += "\"ready\":" + String(onboardCameraReady ? "true" : "false");
+  payload += ",\"enabled\":" + String(onboardCaptureEnabled ? "true" : "false");
+  payload += ",\"interval_ms\":" + String(onboardCaptureIntervalMs);
+  payload += ",\"latest_bytes\":" + String(static_cast<unsigned>(latestLen));
+  payload += ",\"captures\":" + String(count);
+  payload += ",\"failures\":" + String(failures);
+  payload += ",\"last_capture_age_ms\":" + String(msSince(lastMs));
+  payload += "}";
+  return payload;
+}
+
+void onboardCaptureTask(void *pvParameters) {
+  (void)pvParameters;
+  while (true) {
+    if (onboardCaptureEnabled && onboardCameraReady) {
+      captureOnboardFrame();
+    }
+    const unsigned long delayMs = onboardCaptureIntervalMs < 5000 ? 5000 : onboardCaptureIntervalMs;
+    vTaskDelay(pdMS_TO_TICKS(delayMs));
+  }
+}
+
+String buildWifiScanJson(int scanCount) {
+  String payload = "{";
+  payload += "\"scanner\":\"active_wifi_scan\"";
+  payload += ",\"count\":" + String(scanCount);
+  payload += ",\"age_ms\":0";
+  payload += ",\"networks\":[";
+  for (int i = 0; i < scanCount; ++i) {
+    if (i > 0) {
+      payload += ",";
+    }
+    payload += "{";
+    payload += "\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\"";
+    payload += ",\"bssid\":\"" + WiFi.BSSIDstr(i) + "\"";
+    payload += ",\"rssi\":" + String(WiFi.RSSI(i));
+    payload += ",\"channel\":" + String(WiFi.channel(i));
+    payload += ",\"encryption\":" + String(static_cast<int>(WiFi.encryptionType(i)));
+    payload += "}";
+  }
+  payload += "]}";
+  return payload;
+}
+
+bool runIdleWifiScan(String &payload, String &error) {
+  if (wifiScanBusy) {
+    error = "scan_busy";
+    return false;
+  }
+  if (streamSessionActive || wifiConnected || isControlActionActive()) {
+    error = "camera_wifi_active";
+    return false;
+  }
+
+  wifiScanBusy = true;
+  const wifi_mode_t previousMode = WiFi.getMode();
+  WiFi.mode(WIFI_STA);
+  delay(50);
+  const int count = WiFi.scanNetworks(false, true);
+  if (count < 0) {
+    error = "scan_failed";
+    wifiScanBusy = false;
+    return false;
+  }
+  payload = buildWifiScanJson(count);
+  WiFi.scanDelete();
+  wifiScanLastJson = payload;
+  wifiScanLastCount = count;
+  wifiScanLastMs = millis();
+  WiFi.mode(previousMode);
+  wifiScanBusy = false;
+  return true;
 }
 
 String jsonEscape(const String &input) {
@@ -1095,6 +1354,10 @@ void printSerialHelp() {
   Serial.println("  rtsp_live");
   Serial.println("  stream_start");
   Serial.println("  stream_stop");
+  Serial.println("  battery");
+  Serial.println("  onboard_status");
+  Serial.println("  onboard_capture");
+  Serial.println("  wifi_scan");
   Serial.println("  rtsp <METHOD> <url>");
   Serial.println("  wake");
   Serial.println("  bleclose");
@@ -1964,6 +2227,11 @@ void handleStatus() {
   payload += ",\"media_primary_bytes\":" + String(mediaPrimaryBytes);
   payload += ",\"media_secondary_packets\":" + String(mediaSecondaryPackets);
   payload += ",\"media_secondary_bytes\":" + String(mediaSecondaryBytes);
+  payload += ",\"battery\":" + buildBatteryJson();
+  payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
+  payload += ",\"wifi_scan_busy\":" + String(wifiScanBusy ? "true" : "false");
+  payload += ",\"wifi_scan_last_count\":" + String(wifiScanLastCount);
+  payload += ",\"wifi_scan_last_age_ms\":" + String(msSince(wifiScanLastMs));
   payload += ",\"ble_wake_attempted\":" + String(bleWakeAttempted ? "true" : "false");
   payload += ",\"ble_wake_confirmed\":" + String(bleWakeConfirmed ? "true" : "false");
   payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
@@ -1989,6 +2257,92 @@ void handleStatus() {
   payload += ",\"control_last_finished_ms\":" + String(msSince(controlSnapshot.lastFinishedMs));
   payload += ",\"control_last_message\":\"" + jsonEscape(String(controlSnapshot.lastMessage)) + "\"";
   payload += "}";
+  server.send(200, "application/json", payload);
+}
+
+void handleBatteryStatus() {
+  server.send(200, "application/json", buildBatteryJson());
+}
+
+void handleOnboardCameraStatus() {
+  server.send(200, "application/json", buildOnboardCameraStatusJson());
+}
+
+void handleOnboardCameraLatest() {
+  if (!onboardCameraReady) {
+    server.send(503, "application/json", "{\"error\":\"onboard_camera_not_ready\"}");
+    return;
+  }
+
+  if (server.hasArg("capture") && server.arg("capture") == "1") {
+    captureOnboardFrame();
+  }
+
+  uint8_t *buf = nullptr;
+  size_t len = 0;
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
+  }
+  buf = onboardLatestJpeg;
+  len = onboardLatestJpegLen;
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreGive(onboardFrameMutex);
+  }
+
+  if (buf == nullptr || len == 0) {
+    server.send(404, "application/json", "{\"error\":\"no_onboard_capture\"}");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "image/jpeg", reinterpret_cast<const char *>(buf), len);
+}
+
+void handleOnboardCameraCapture() {
+  if (!onboardCameraReady) {
+    server.send(503, "application/json", "{\"error\":\"onboard_camera_not_ready\"}");
+    return;
+  }
+  const bool ok = captureOnboardFrame();
+  String payload = "{";
+  payload += "\"ok\":" + String(ok ? "true" : "false");
+  payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
+  payload += "}";
+  server.send(ok ? 200 : 500, "application/json", payload);
+}
+
+void handleOnboardCameraConfig() {
+  if (server.hasArg("enabled")) {
+    const String enabled = server.arg("enabled");
+    onboardCaptureEnabled = enabled == "1" || enabled == "true" || enabled == "yes";
+  }
+  if (server.hasArg("interval_ms")) {
+    const unsigned long requested = server.arg("interval_ms").toInt();
+    if (requested >= 5000) {
+      onboardCaptureIntervalMs = requested;
+    }
+  }
+  server.send(200, "application/json", buildOnboardCameraStatusJson());
+}
+
+void handleWifiScan() {
+  const bool force = server.hasArg("force") && server.arg("force") == "1";
+  if (!force && wifiScanLastMs != 0 && millis() - wifiScanLastMs < WIFI_SCAN_CACHE_MS) {
+    String cached = wifiScanLastJson;
+    cached.replace("\"age_ms\":0", "\"age_ms\":" + String(msSince(wifiScanLastMs)));
+    server.send(200, "application/json", cached);
+    return;
+  }
+
+  String payload;
+  String error;
+  if (!runIdleWifiScan(payload, error)) {
+    String body = "{";
+    body += "\"error\":\"" + jsonEscape(error) + "\"";
+    body += ",\"hint\":\"scan requires idle trail-camera WiFi\"";
+    body += "}";
+    server.send(409, "application/json", body);
+    return;
+  }
   server.send(200, "application/json", payload);
 }
 
@@ -2352,6 +2706,12 @@ void startHttpServer() {
   server.on("/control/bringup", HTTP_POST, handleControlBringup);
   server.on("/control/stream_start", HTTP_POST, handleControlStreamStart);
   server.on("/control/stream_stop", HTTP_POST, handleControlStreamStop);
+  server.on("/battery/status", HTTP_GET, handleBatteryStatus);
+  server.on("/onboard/status", HTTP_GET, handleOnboardCameraStatus);
+  server.on("/onboard/latest.jpg", HTTP_GET, handleOnboardCameraLatest);
+  server.on("/onboard/capture", HTTP_POST, handleOnboardCameraCapture);
+  server.on("/onboard/config", HTTP_POST, handleOnboardCameraConfig);
+  server.on("/scan/wifi", HTTP_GET, handleWifiScan);
   server.on("/camera/info/1", HTTP_GET, handleCameraInfo1);
   server.on("/camera/info/2", HTTP_GET, handleCameraInfo2);
   server.on("/camera/info/3", HTTP_GET, handleCameraInfo3);
@@ -2535,6 +2895,33 @@ void handleSerialCommand(const String &line) {
   }
   if (cmd == "status") {
     printRuntimeStatus();
+    Serial.printf("[battery] %s\n", buildBatteryJson().c_str());
+    Serial.printf("[onboard] %s\n", buildOnboardCameraStatusJson().c_str());
+    return;
+  }
+  if (cmd == "battery") {
+    Serial.println(buildBatteryJson());
+    return;
+  }
+  if (cmd == "onboard_status") {
+    Serial.println(buildOnboardCameraStatusJson());
+    return;
+  }
+  if (cmd == "onboard_capture") {
+    const bool ok = captureOnboardFrame();
+    Serial.printf("[onboard-camera] capture=%s %s\n",
+                  ok ? "ok" : "failed",
+                  buildOnboardCameraStatusJson().c_str());
+    return;
+  }
+  if (cmd == "wifi_scan") {
+    String payload;
+    String error;
+    if (runIdleWifiScan(payload, error)) {
+      Serial.println(payload);
+    } else {
+      Serial.printf("[wifi-scan] failed error=%s\n", error.c_str());
+    }
     return;
   }
   if (cmd == "selftest") {
@@ -2633,6 +3020,26 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("GardePro dual-radio bridge starting");
+
+  pinMode(BAT_ADC_CTRL_PIN, OUTPUT);
+  digitalWrite(BAT_ADC_CTRL_PIN, LOW);
+  pinMode(BAT_CHRG_PIN, INPUT_PULLUP);
+  pinMode(BAT_DONE_PIN, INPUT_PULLUP);
+  analogReadResolution(12);
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+  Serial.printf("[battery] %s\n", buildBatteryJson().c_str());
+
+  onboardFrameMutex = xSemaphoreCreateMutex();
+  initOnboardCamera();
+  if (onboardCaptureTaskHandle == nullptr) {
+    xTaskCreatePinnedToCore(onboardCaptureTask,
+                            "onboard-capture",
+                            8192,
+                            nullptr,
+                            1,
+                            &onboardCaptureTaskHandle,
+                            1);
+  }
 
   Serial.println("Pre-initializing HaLow transport");
   HaLow.onEvent(onHaLowEvent);

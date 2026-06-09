@@ -56,6 +56,12 @@ server with the current:
 ## Current HTTP Endpoints
 
 - `/status`
+- `/battery/status`
+- `/onboard/status`
+- `/onboard/latest.jpg`
+- `/onboard/capture`
+- `/onboard/config`
+- `/scan/wifi`
 - `/control/bringup`
 - `/control/stream_start`
 - `/control/stream_stop`
@@ -70,6 +76,19 @@ server with the current:
 - `/camera/getParaSetting`
 - `/camera/gallery`
 - `/camera/standby/reset`
+
+Unified board features:
+
+- onboard ESP camera initializes at boot and captures a JPEG every 60 seconds by default
+- latest onboard JPEG is available at `/onboard/latest.jpg`
+- force a fresh onboard capture with `POST /onboard/capture`
+- change periodic capture with `POST /onboard/config?enabled=true&interval_ms=60000`
+- battery telemetry reads the HT-HC32/33 battery divider (`GPIO1` / `ADC_IN`, controlled by `GPIO20` / `ADC_Ctrl`)
+- idle WiFi scanning is available at `/scan/wifi`
+
+The ESP32-S3 has one 2.4 GHz WiFi radio. Because of that, `/scan/wifi` only runs
+when the trail-camera WiFi session is idle; it returns `camera_wifi_active` while
+the bridge is connected to the trail-camera hotspot or streaming.
 
 Control behavior is now server-oriented rather than console-oriented:
 
