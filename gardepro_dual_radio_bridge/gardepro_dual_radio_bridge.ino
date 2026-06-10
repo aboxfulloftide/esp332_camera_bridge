@@ -8,6 +8,7 @@
 #include <BLEScan.h>
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
+#include <Preferences.h>
 #include <stdint.h>
 
 extern "C" {
@@ -205,6 +206,10 @@ String wifiScanLastJson = "{\"networks\":[]}";
 uint16_t wifiScanLastCount = 0;
 unsigned long wifiScanLastMs = 0;
 bool wifiScanBusy = false;
+
+Preferences runtimePrefs;
+uint32_t persistentBootCount = 0;
+uint32_t bootSessionId = 0;
 
 struct CameraProbeTarget {
   const char *label;
@@ -626,6 +631,23 @@ String buildBatteryJson() {
   payload += ",\"done_gpio16\":" + String(digitalRead(BAT_DONE_PIN));
   payload += "}";
   return payload;
+}
+
+void initBootIdentity() {
+  if (!runtimePrefs.begin("runtime", false)) {
+    Serial.println("[boot] failed to open runtime preferences");
+    persistentBootCount = 0;
+    bootSessionId = millis();
+    return;
+  }
+  persistentBootCount = runtimePrefs.getUInt("boot_count", 0) + 1;
+  runtimePrefs.putUInt("boot_count", persistentBootCount);
+  runtimePrefs.end();
+  bootSessionId = persistentBootCount;
+  Serial.printf("[boot] boot_count=%u boot_session_id=%u uptime_ms=%lu\n",
+                persistentBootCount,
+                bootSessionId,
+                millis());
 }
 
 bool initOnboardCamera() {
@@ -2091,6 +2113,10 @@ bool runBringupSequence() {
 
 void printRuntimeStatus() {
   refreshWifiState();
+  Serial.printf("[status] uptime_ms=%lu boot_count=%u boot_session_id=%u\n",
+                millis(),
+                persistentBootCount,
+                bootSessionId);
   Serial.printf("[status] wifi=%s ip=%s ble_stage=%s ble_ok=%s notify_count=%u last=%s\n",
                 wifiConnected ? "up" : "down",
                 WiFi.localIP().toString().c_str(),
@@ -2209,7 +2235,10 @@ void handleStatus() {
   ControlState controlSnapshot{};
   snapshotControlState(controlSnapshot);
   String payload = "{";
-  payload += "\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  payload += "\"uptime_ms\":" + String(millis());
+  payload += ",\"boot_count\":" + String(persistentBootCount);
+  payload += ",\"boot_session_id\":" + String(bootSessionId);
+  payload += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
   payload += ",\"wifi_ip\":\"" + WiFi.localIP().toString() + "\"";
   payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
@@ -3020,6 +3049,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("GardePro dual-radio bridge starting");
+  initBootIdentity();
 
   pinMode(BAT_ADC_CTRL_PIN, OUTPUT);
   digitalWrite(BAT_ADC_CTRL_PIN, LOW);
