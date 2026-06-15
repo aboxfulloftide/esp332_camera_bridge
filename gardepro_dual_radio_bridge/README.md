@@ -62,6 +62,10 @@ server with the current:
 - `/onboard/capture`
 - `/onboard/config`
 - `/scan/wifi`
+- `/upload/status`
+- `/upload/telemetry`
+- `/upload/events`
+- `/upload/all`
 - `/control/bringup`
 - `/control/stream_start`
 - `/control/stream_stop`
@@ -79,12 +83,53 @@ server with the current:
 
 Unified board features:
 
-- onboard ESP camera initializes at boot and captures a JPEG every 60 seconds by default
+- onboard ESP camera initializes at boot and captures a JPEG every 30 minutes by default
 - latest onboard JPEG is available at `/onboard/latest.jpg`
 - force a fresh onboard capture with `POST /onboard/capture`
-- change periodic capture with `POST /onboard/config?enabled=true&interval_ms=60000`
+- periodic onboard capture now defaults to one JPEG every 30 minutes
+- with `PSRAM=opi` enabled, the onboard camera supports UXGA `1600x1200`
+- scheduled onboard captures run only inside the configured daylight window
+- change the scheduled/default capture profile with `POST /onboard/config`
+  - `enabled=true|false`
+  - `interval_ms=1800000`
+  - `start=06:00` or `start_minute=360`
+  - `end=18:00` or `end_minute=1080`
+  - `tz_offset_min=-240`
+  - `epoch=1718123456` to set the board clock for schedule testing
+  - `framesize=SVGA|XGA|SXGA|UXGA`
+  - `jpeg_quality=4..63`
+  - sensor tuning test fields: `brightness`, `contrast`, `saturation`, `sharpness`, `vflip`, `hmirror`, `awb`, `awb_gain`, `wb_mode`, `aec`, `aec2`, `ae_level`, `aec_value`, `agc`, `agc_gain`, `special_effect`
+- trigger a one-shot web UI capture with temporary settings using `POST /onboard/capture` and the same sensor tuning fields
+  - example: `POST /onboard/capture?framesize=UXGA&jpeg_quality=8&aec=0&aec_value=2300`
+  - one-shot settings are applied for that capture only, then the scheduled/default profile is restored
 - battery telemetry reads the HT-HC32/33 battery divider (`GPIO1` / `ADC_IN`, controlled by `GPIO20` / `ADC_Ctrl`)
 - idle WiFi scanning is available at `/scan/wifi`
+- upstream API upload plumbing is available over HaLow:
+  - `GET /upload/status`
+  - `POST /upload/telemetry` -> `/api/board/telemetry`
+  - `POST /upload/events` -> `/api/board/events`
+  - `POST /upload/all` uploads telemetry, then queued events
+
+Upload configuration is supplied by `local_config.h`:
+
+- `BOARD_HOSTNAME` defaults to `trail_esp32`
+- `SCANNER_HOST`
+- `UPSTREAM_API_HOST` defaults to `192.168.1.42`
+- `UPSTREAM_API_PORT` defaults to `80`
+- `UPSTREAM_API_PREFIX` defaults to `/trail_cam`, making firmware uploads target `http://192.168.1.42/trail_cam/api/...`
+- `UPSTREAM_API_TOKEN`
+
+The firmware sets `BOARD_HOSTNAME` on the ESP32 2.4 GHz WiFi station before
+joining the trail-camera hotspot. The current Heltec HaLow wrapper does not
+expose a DHCP hostname setter, so the same hostname is also included in board
+registration, `/status`, telemetry, and event uploads for server-side identity.
+
+Current upload limitation: `recorded_at` is sent as `null` until the unified
+firmware has a trusted clock source from NTP, RTC, or the server.
+
+Current onboard schedule limitation: automatic scheduled captures also need a
+valid clock. Until the clock is set, scheduled captures are skipped; manual
+`POST /onboard/capture` still works for camera testing.
 
 The ESP32-S3 has one 2.4 GHz WiFi radio. Because of that, `/scan/wifi` only runs
 when the trail-camera WiFi session is idle; it returns `camera_wifi_active` while
@@ -109,7 +154,7 @@ Control behavior is now server-oriented rather than console-oriented:
 
 Local serial mode now proves the camera-side live-view path directly:
 
-- BLE wake brings the hotspot up
+- BLE wake uses NimBLE-Arduino and brings the hotspot up
 - HTTP control on `192.168.8.1:8080` works
 - RTSP `DESCRIBE` works on:
   - `rtsp://192.168.8.1/live.sdp`
@@ -169,7 +214,7 @@ Right now the sketch is set to local serial mode first, not HaLow mode.
 
 In this mode it:
 
-- performs the exact BLE wake replay
+- performs the exact NimBLE wake replay
 - waits for the hotspot to appear
 - joins the camera WiFi
 - runs the HTTP self-test
@@ -186,6 +231,10 @@ In this mode it:
   - `rtsp_live`
   - `stream_start`
   - `stream_stop`
+  - `upload_status`
+  - `upload_telemetry`
+  - `upload_events`
+  - `upload_all`
   - `rtsp <METHOD> <url>`
   - `bleclose`
   - `wake`
@@ -342,15 +391,33 @@ Firmware clue summary:
 
 Latest live validation findings after the current stability patches:
 
-- the attached camera is currently not powered, so the latest BLE wake/discovery failures should be treated as provisional until rechecked against a valid powered state
+- the trail camera was powered on for the latest NimBLE validation
 - the local-serial-mode board now returns to HaLow immediately after boot and `/status` is reachable before `bringup`
 - `/status` now remains reachable while `bringup` is actively running, and the Python control client now gets a board-side `bringup_failed` result instead of timing out waiting for completion
 - the local serial loop now services HTTP much more frequently, and the long BLE / WiFi wait paths now yield cooperatively instead of sleeping in large blocking chunks
 - idle WiFi recovery is now gated off during active control actions, so manual `bringup` no longer races the background recovery path
 - `/status` now also exposes BLE scan telemetry including scan mode, total advertisements seen, target-hit count, and strongest/last seen advertisers
-- in the latest live run, active scan saw `30` advertisements and passive fallback raised that to `56`, but the target MAC was never seen and the final state was still `ble_stage: "scan_not_found"`
-- `bringup` still ends as `bringup_failed`, so the remaining blocker is now primarily BLE target discovery / wake reliability and getting the camera hotspot to appear after wake
-- because the camera still never reached WiFi-up in that validation window, live settings-key mapping and live delete-path confirmation remain incomplete in this round
+- targeted NimBLE validation saw the trail camera advertisement and successfully woke it:
+  - target `a4:6d:d4:9e:47:32`
+  - name `CAM8Z8_NoName_G_E6`
+  - advertised service `6e000100-b5a3-f393-e0a9-e50e24dcca9e`
+  - wake write `AT+WAKEPULSE=10\r\n` to `6e400004`
+  - three `OK` notifications received on `6e400004`
+- unified firmware validation after the NimBLE migration succeeded:
+  - board hostname `trail_esp32`
+  - HaLow IP `192.168.1.160`
+  - NimBLE wake stage `wake_ok`
+  - trail camera hotspot became visible after about `9.8s`
+  - board joined trail-camera WiFi as `192.168.8.30`
+  - camera HTTP keepalive `/cmd/standby/reset` returned `200`
+  - `/status` was reachable over HaLow and reported both HaLow and trail-camera
+    WiFi connected
+  - `/status` reported ESP32 internal `chip_temperature_c`
+  - `POST /upload/all` over board HTTP succeeded against
+    `192.168.1.42/trail_cam/api`, returning `telemetry_id=3`, inserting `2`
+    events, and clearing the board event queue
+- the previous BLE target discovery / wake reliability blocker is cleared for
+  the powered-camera test setup
 
 ## Build
 

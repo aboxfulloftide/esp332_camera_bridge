@@ -61,13 +61,22 @@ Required server update for BLE:
 
 - Accept `device_type: "BLE"`.
 - Preserve these optional BLE fields on each observation:
+  - `is_randomized`
   - `manufacturer_data`
   - `adv_services`
   - `adv_service_data`
   - `tx_power`
-  - `tracker_type`
-- Store BLE device names using `ssid` as the current Pi scanner does, or add a
-  neutral alias/name table if preferred.
+  - `local_name`
+- Store BLE `channel`, `freq_mhz`, and `ssid` as null.
+- Classify `tracker_type` on the server from the raw BLE fields using the
+  existing `air_scan` BLE classifier, rather than duplicating tracker detection
+  rules in ESP32 firmware.
+- For BLE randomized addresses, trust the ESP32 `is_randomized` field or use
+  BLE random-address logic, first address byte `& 0x40`. Do not use the WiFi
+  locally-administered MAC bit for BLE rows.
+- Populate BLE `manufacturer` from Bluetooth SIG company IDs in
+  `manufacturer_data` when available, or leave it null. Do not rely on WiFi OUI
+  lookup for BLE rows.
 
 BLE observation payload:
 
@@ -77,9 +86,11 @@ BLE observation payload:
   "device_type": "BLE",
   "interface": "esp32-ble",
   "signal_dbm": -81,
-  "channel": 37,
-  "freq_mhz": 2402,
-  "ssid": "optional-local-name",
+  "channel": null,
+  "freq_mhz": null,
+  "ssid": null,
+  "local_name": "optional-local-name",
+  "is_randomized": true,
   "ht": false,
   "vht": false,
   "he": false,
@@ -88,7 +99,6 @@ BLE observation payload:
   "adv_services": "0000feaa-0000-1000-8000-00805f9b34fb",
   "adv_service_data": "0000feaa-0000-1000-8000-00805f9b34fb:...",
   "tx_power": -8,
-  "tracker_type": "AirTag",
   "recorded_at": "2026-06-09T23:05:10"
 }
 ```
@@ -309,6 +319,28 @@ The server should make every upload idempotent enough for retry:
 
 - WiFi observations should keep the existing 10-second UTC slot behavior.
 - BLE observations should use the same slot boundary.
+- Firmware should use NimBLE-Arduino for BLE scanning if possible, because it is
+  smaller than the bundled Bluedroid stack.
+- BLE scanning should request duplicates so repeated advertisements can update
+  RSSI/last-seen data.
+- BLE scanner firmware should send raw parsed advertisement fields and should
+  not duplicate `air_scan` tracker-classification logic on-device.
+- HT-HC33 validation on 2026-06-12 confirmed NimBLE-Arduino works on the Heltec
+  `esp_halow` core despite the library architecture warning:
+  - NimBLE init probe: 493397 bytes flash, 24928 bytes globals
+  - Bluedroid init probe: 894569 bytes flash, 39876 bytes globals
+  - targeted `nimble_wake_test`: captured BLE observation-shaped rows including
+    `local_name`, `is_randomized`, `manufacturer_data`, `adv_services`, and
+    `adv_service_data`
+  - the trail camera advertised as public, connectable BLE:
+    `a4:6d:d4:9e:47:32`, name `CAM8Z8_NoName_G_E6`, advertised service
+    `6e000100-b5a3-f393-e0a9-e50e24dcca9e`
+  - NimBLE trail-camera wake succeeded after setting wider connection initiation
+    parameters with `setConnectionParams(24, 40, 0, 400, 160, 120)` and
+    `setConnectTimeout(15000)`
+  - successful wake path subscribed to `6e400003` and `6e400004`, wrote
+    `AT+WAKEPULSE=10\r\n` to `6e400004` three times, and received three `OK`
+    notifications on `6e400004`
 - The ESP32-S3 onboard WiFi radio cannot scan and stay connected to the
   trail-camera hotspot at the same time.
 - HaLow is independent of the 2.4 GHz WiFi radio and is the correct upload path.

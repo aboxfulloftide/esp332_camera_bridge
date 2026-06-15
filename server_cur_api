@@ -1,0 +1,378 @@
+# Trail Cam API
+
+This directory contains the Apache/PHP API implementation for the trail-camera server.
+
+## Deployment
+
+- nginx routes `/trail_cam/` to this directory's `index.php` front controller.
+- The `.htaccess` file is only useful if this directory is later served by Apache.
+- On this server, nginx exposes the API at `http://192.168.1.42/trail_cam/api/...`.
+- The root `/api/...` path is already used by another local service, so trail camera routes are mounted under `/trail_cam/api`.
+- MySQL credentials are read from `mysql`.
+- Firmware upload routes create their tables lazily on first database use.
+- Camera-control routes use `GARDEPRO_BRIDGE_HOST` when set, otherwise `/tmp/gardepro_board_registration.json`.
+
+## Implemented Routes
+
+- `GET /api/status`
+- `POST /api/session/open`
+- `POST /api/session/close`
+- `GET /api/settings`
+- `GET /api/settings/schema`
+- `POST /api/settings`
+- `GET /api/media`
+- `GET /api/media/latest`
+- `GET /api/media/{id}/download`
+- `GET /api/media/{id}/thumb`
+- `DELETE /api/media/{id}`
+- `POST /api/actions/take-picture`
+- `POST /api/actions/video/start`
+- `POST /api/actions/video/stop`
+- `POST /api/live/start`
+- `POST /api/live/stop`
+- `GET /api/live/status`
+- `GET /api/admin/clock`
+- `POST /api/admin/set-clock`
+- `GET /api/admin/format-status`
+- `POST /api/admin/format-sd`
+- `POST /api/observations/upload`
+- `POST /api/board/telemetry`
+- `POST /api/board/media`
+- `PUT /api/board/media/{media_id}/blob`
+- `POST /api/board/events`
+
+## Unified Firmware API Gaps / Confirmations Needed
+
+The unified ESP32 firmware target will use the current API at
+`http://192.168.1.42/trail_cam/api/...`.
+
+Already covered by current routes:
+
+- Onboard/local camera image upload can use:
+  - `POST /api/board/media`
+  - `PUT /api/board/media/{media_id}/blob`
+- WiFi scan result upload can use:
+  - `POST /api/observations/upload`
+- Trail camera media should be uploaded directly when possible. If direct upload
+  fails, the firmware should report the failure and leave the original media on
+  the trail camera instead of spooling trail camera media to ESP32 SD.
+- Board events can use:
+  - `POST /api/board/events`
+
+Needs server confirmation or adjustment:
+
+- `POST /api/observations/upload` should accept BLE observations in the same
+  request shape as WiFi observations, with `device_type: "BLE"` and optional BLE
+  fields when available:
+  - `is_randomized`
+  - `manufacturer_data`
+  - `adv_services`
+  - `adv_service_data`
+  - `tx_power`
+  - `local_name`
+  - `tracker_type` returned/stored after server-side classification
+- BLE observation rows should store `channel`, `freq_mhz`, and `ssid` as null.
+  BLE names should use `local_name`, not the WiFi `ssid` field.
+- The ESP32 should send raw parsed advertisement fields only. The server should
+  classify trackers server-side using the existing `air_scan` BLE classifier so
+  tracker rules can change without reflashing ESP32 boards.
+- BLE randomized address handling differs from WiFi locally-administered MAC
+  handling. The server should trust the firmware's `is_randomized` flag or
+  apply BLE logic: first address byte `& 0x40`.
+- BLE manufacturer names should come from Bluetooth SIG company IDs in
+  `manufacturer_data` when available, not WiFi OUI lookup.
+- `POST /api/board/telemetry` should accept warning/status fields alongside
+  battery and temperature readings. The firmware needs to report:
+  - low SD free space warning when SD free space is below 10%
+  - pending failed uploads / retry queue warning
+  - low battery warning
+  - scanner disabled by battery policy
+  - onboard camera disabled by battery policy
+  - survival mode active
+- `POST /api/board/telemetry` should accept SD queue state, for example:
+  - SD present/ready
+  - SD total/used/free bytes
+  - SD free percent
+  - queued upload count
+  - queued WiFi/BLE scan result count
+  - queued onboard image count
+  - oldest queued item age
+- `POST /api/board/telemetry` should accept ESP32 internal chip temperature.
+  External temperature/humidity probe support is intentionally deferred.
+- The server should treat media uploads as idempotent by `sha256` plus
+  `scanner_host`/`source`/`recorded_at`, so firmware can retry forever after SD
+  spooling without creating duplicate media rows.
+
+Firmware policy decisions this API must support:
+
+- HaLow stays up and uploads immediately whenever possible.
+- SD is fallback spool only:
+  - save data only when immediate upload is unavailable or fails
+  - delete queued files after successful upload
+  - if SD pressure cleanup is needed, delete oldest WiFi/BLE scan result files
+    first, then oldest onboard/local camera image files
+  - do not spool trail camera media to ESP32 SD
+- Scanner schedule defaults:
+  - daytime window `07:00` through `21:00`
+  - WiFi scan every 2 minutes during daytime
+  - BLE scan every 2 minutes during daytime
+  - WiFi scan every 15 minutes at night
+  - BLE scan every 15 minutes at night
+- Onboard/local camera schedule defaults:
+  - enabled
+  - one image every 30 minutes
+  - active from `06:00` through `18:00`
+- Battery policy defaults:
+  - warning at or below 3.70V
+  - disable WiFi/BLE scanners at or below 3.60V
+  - disable scheduled onboard camera captures at or below 3.50V
+  - survival mode at or below 3.40V
+  - survival mode rejects trail-camera bridge requests unless an API call
+    explicitly forces the request.
+
+Board SD hardware found from prior HT-HC33 validation:
+
+- interface: SPI SD, not SD_MMC
+- MOSI: GPIO11
+- CLK/SCK: GPIO15
+- MISO: GPIO16
+- CS: GPIO10
+- validated writable mount frequency: 4 MHz
+
+## Server-to-Board Communication Tests
+
+The server should be able to talk to the ESP32 board over HaLow. The board does
+not have a guaranteed fixed DHCP address, so server code should discover/use the
+latest board registration when available. Current live validation address:
+
+- board hostname: `trail_esp32`
+- latest HaLow IP seen: `192.168.1.156`
+- board HTTP base URL: `http://192.168.1.156:18080`
+
+Minimum server-side health checks:
+
+1. `GET http://<board-ip>:18080/status`
+   - expect HTTP `200`
+   - expect JSON
+   - required fields:
+     - `hostname`
+     - `halow_connected`
+     - `halow_ip`
+     - `wifi_connected`
+     - `battery`
+     - `onboard_camera`
+     - `upload`
+     - `ble_stage`
+   - healthy current powered-camera state should show:
+     - `hostname: "trail_esp32"`
+     - `halow_connected: true`
+     - `ble_wake_confirmed: true` after bringup
+     - `ble_stage: "wake_ok"` after bringup
+
+2. `GET http://<board-ip>:18080/battery/status`
+   - expect HTTP `200`
+   - required fields:
+     - `adc_mv`
+     - `battery_est_v`
+     - `charging_gpio15`
+     - `done_gpio16`
+   - warning/status aggregation should eventually include low-battery, SD, and
+     upload-queue warnings in the telemetry uploaded to the server.
+
+3. `GET http://<board-ip>:18080/onboard/status`
+   - expect HTTP `200`
+   - required fields:
+     - `ready`
+     - `enabled`
+     - `interval_ms`
+     - `window_start`
+     - `window_end`
+     - `framesize`
+     - `jpeg_quality`
+     - `psram_found`
+     - `aec`
+     - `aec_value`
+   - expected default camera state:
+     - `interval_ms: 1800000`
+     - `window_start: "06:00"`
+     - `window_end: "18:00"`
+     - `framesize: "UXGA"`
+     - `jpeg_quality: 8`
+     - `aec: true`
+     - `aec_value: 300`
+
+4. `POST http://<board-ip>:18080/onboard/capture`
+   - expect HTTP `200` with JSON metadata when capture succeeds
+   - server/web GUI may pass one-shot camera tuning query args, for example:
+     - `framesize=UXGA`
+     - `jpeg_quality=8`
+     - `aec=0`
+     - `aec_value=2300`
+   - one-shot settings should be restored after the capture.
+
+5. `GET http://<board-ip>:18080/onboard/latest.jpg`
+   - expect HTTP `200` and `image/jpeg` after at least one successful onboard
+     capture
+   - if no image exists yet, the board may return an error JSON/status.
+
+6. `POST http://<board-ip>:18080/onboard/config`
+   - server/web GUI should be able to update persistent local-camera behavior:
+     - `enabled=true|false`
+     - `interval_ms=1800000`
+     - `start=06:00` or `start_minute=360`
+     - `end=18:00` or `end_minute=1080`
+     - `tz_offset_min=<minutes>`
+     - `epoch=<unix_seconds>` for clock sync/testing
+     - sensor fields: `framesize`, `jpeg_quality`, `brightness`, `contrast`,
+       `saturation`, `sharpness`, `vflip`, `hmirror`, `awb`, `awb_gain`,
+       `wb_mode`, `aec`, `aec2`, `ae_level`, `aec_value`, `agc`, `agc_gain`,
+       `special_effect`
+
+7. `POST http://<board-ip>:18080/control/bringup`
+   - expect a quick accepted/queued JSON response from the board
+   - server should poll `/status` until control is no longer busy
+   - successful current behavior:
+     - NimBLE finds target `a4:6d:d4:9e:47:32`
+     - board receives `OK` notifications from `6e400004`
+     - trail-camera hotspot becomes visible
+     - board joins trail-camera WiFi as `192.168.8.x`
+     - `/status` shows `wifi_connected: true`
+
+8. `POST http://<board-ip>:18080/control/stream_start`
+   - expect quick accepted/queued JSON response
+   - server should poll `/status` and live tunnel status
+   - stream success should eventually show:
+     - `stream_active: true`
+     - increasing `media_primary_packets` / `media_secondary_packets`
+     - tunnel connected if the upstream receiver is running
+
+9. `POST http://<board-ip>:18080/control/stream_stop`
+   - expect quick accepted/queued JSON response
+   - server should poll `/status` until `stream_active: false`
+
+10. `GET http://<board-ip>:18080/camera/request?path=<camera-path>`
+    or `POST http://<board-ip>:18080/camera/request`
+    - use only while the trail-camera session is active
+    - server can proxy camera HTTP reads/settings through the board
+    - examples:
+      - `/cmd/getParaSetting`
+      - `/cmd/info/1`
+      - `/cmd/standby/reset`
+
+11. `GET http://<board-ip>:18080/camera/raw?path=<camera-path>`
+    - use for raw camera file/media fetches when needed
+    - server should prefer direct trail-camera media upload/stream when
+      possible and leave failed trail-camera media on the trail camera.
+
+12. `GET http://<board-ip>:18080/scan/wifi`
+    - expect HTTP `200` only when the trail-camera WiFi session is idle
+    - if camera WiFi/session is active, expect a conflict response such as
+      `camera_wifi_active`
+    - scheduled scanner work should pause during trail-camera bridge activity.
+
+13. `GET http://<board-ip>:18080/upload/status`
+    - expect HTTP `200`
+    - required fields:
+      - `attempts`
+      - `successes`
+      - `failures`
+      - `last_status_code`
+      - `last_message`
+      - `queued_events`
+
+14. `POST http://<board-ip>:18080/upload/all`
+    - asks the board to upload telemetry and queued events to the server
+    - current live validation succeeded against `192.168.1.42/trail_cam/api`:
+      - telemetry inserted as `telemetry_id=2`
+      - events inserted: `2`
+      - upload queue cleared
+
+Server-side timeout guidance:
+
+- `/status`, `/battery/status`, `/onboard/status`, `/upload/status`: 5 seconds
+- `/onboard/capture`: 20 seconds
+- queued control calls: 5 seconds for the initial accepted response, then poll
+  `/status`
+- bringup completion polling: up to 60 seconds
+- stream start polling: up to 60 seconds
+
+## Board-to-Server API Contract
+
+The board currently uploads to:
+
+- host: `192.168.1.42`
+- prefix: `/trail_cam`
+- base API URL: `http://192.168.1.42/trail_cam/api`
+
+Routes the board needs from the server:
+
+1. `POST /api/board/telemetry`
+   - already live-tested from the board through `/upload/all`
+   - must accept:
+     - `scanner_host`
+     - `hostname`
+     - `recorded_at` as nullable until board clock sync is finished
+     - firmware identity
+     - board heap/PSRAM/uptime
+     - battery readings
+     - ESP32 internal chip temperature
+     - radio state
+     - warning/status fields for SD, upload queue, and battery policy
+
+2. `POST /api/board/events`
+   - already live-tested from the board through `/upload/all`
+   - must accept queued event arrays and be safe for retry
+
+3. `POST /api/observations/upload`
+   - required for scheduled WiFi and BLE scanner observations
+   - must accept mixed WiFi and BLE rows
+   - BLE rows should follow the `air_scan` ESP32 integration contract:
+     - `device_type: "BLE"`
+     - `interface: "esp32-ble"`
+     - `signal_dbm`
+     - `recorded_at`
+     - `is_randomized`
+     - `manufacturer_data`
+     - `adv_services`
+     - `adv_service_data`
+     - `tx_power`
+     - `local_name`
+     - `channel: null`
+     - `freq_mhz: null`
+     - `ssid: null`
+   - server should classify `tracker_type` from raw BLE advertisement fields.
+
+4. `POST /api/board/media`
+   - required for onboard/local camera image metadata
+   - source should include `onboard`
+   - server should return either a completed media record or a blob upload URL
+
+5. `PUT /api/board/media/{media_id}/blob`
+   - required for raw onboard/local camera JPEG upload
+   - must be retry-safe/idempotent using `sha256` plus board/source/timestamp
+
+6. Board clock endpoint still needed
+   - firmware currently can accept `epoch=<unix_seconds>` via `/onboard/config`,
+     but the board still needs a clean server-owned clock sync path
+   - recommended server endpoint:
+     - `GET /api/board/time`
+   - recommended response:
+     ```json
+     {
+       "ok": true,
+       "epoch": 1781260800,
+       "tz_offset_min": -240
+     }
+     ```
+   - board should use this to make scheduled daylight behavior work after boot
+     without manual config calls.
+
+7. Behavior/config endpoint still needed
+   - server/web GUI should eventually manage one persisted board behavior model:
+     - scanner day/night schedule
+     - onboard camera schedule/profile
+     - battery policy thresholds
+     - SD spool policy
+     - upload policy
+   - this can either be pushed board-side through board HTTP endpoints or exposed
+     server-side as a desired-config document the board periodically pulls.

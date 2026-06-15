@@ -10,6 +10,7 @@ __pycache__/
 # Local board/network config
 gardepro_dual_radio_bridge/local_config.h
 stream_test/local_config.h
+sd_status_logger/local_config.h
 
 # Large local reverse-engineering artifacts
 *.apk
@@ -21,6 +22,8 @@ Screenshot_*.jpg
 photo.jpg
 photo_*.jpg
 phone_crack.txt
+onboard_camera_tests/
+sd_card_transfer_*/
 
 # Local extracted APK contents
 apk_extract/

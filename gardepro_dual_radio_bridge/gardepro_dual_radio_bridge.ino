@@ -3,13 +3,13 @@
 #include <WebServer.h>
 #include <WiFiUdp.h>
 #include <HaLow.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
+#include <NimBLEDevice.h>
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
 #include <Preferences.h>
 #include <stdint.h>
+#include <time.h>
+#include <sys/time.h>
 
 extern "C" {
 #include <lwip/sockets.h>
@@ -57,6 +57,24 @@ static const uint16_t CAMERA_RTSP_PORT = 554;
 #ifndef HALOW_PASS
 #define HALOW_PASS "your-halow-password"
 #endif
+#ifndef BOARD_HOSTNAME
+#define BOARD_HOSTNAME "trail_esp32"
+#endif
+#ifndef SCANNER_HOST
+#define SCANNER_HOST BOARD_HOSTNAME
+#endif
+#ifndef UPSTREAM_API_HOST
+#define UPSTREAM_API_HOST "192.168.1.42"
+#endif
+#ifndef UPSTREAM_API_PORT
+#define UPSTREAM_API_PORT 80
+#endif
+#ifndef UPSTREAM_API_PREFIX
+#define UPSTREAM_API_PREFIX "/trail_cam"
+#endif
+#ifndef UPSTREAM_API_TOKEN
+#define UPSTREAM_API_TOKEN ""
+#endif
 static const char *HALOW_REGION = "US";
 static const IPAddress HALOW_LOCAL_IP(192, 168, 1, 30);
 static const IPAddress HALOW_GATEWAY_IP(192, 168, 1, 1);
@@ -78,18 +96,30 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 static const IPAddress UPSTREAM_MEDIA_IP(192, 168, 1, 39);
 static const uint16_t UPSTREAM_TUNNEL_PORT = 6000;
 static const bool RUN_LOCAL_SERIAL_TEST = true;
+static const char *FIRMWARE_NAME = "gardepro_unified";
+static const char *FIRMWARE_VERSION = "0.1.0";
+static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
 static const char *CAMERA_BLE_MAC = "a4:6d:d4:9e:47:32";
 static const char *CAMERA_BLE_WAKE = "AT+WAKEPULSE=10\r\n";
 static const char *CAMERA_BLE_NAME = "CAM8Z8_NoName_G_E6";
 static const char *CAMERA_BLE_NAME_PREFIX = "CAM8Z8_";
 static const char *CAMERA_BLE_SERVICE_UUID = "6e000100-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *CAMERA_BLE_GATT_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *CAMERA_BLE_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *CAMERA_BLE_DATA_UUID = "6e400004-b5a3-f393-e0a9-e50e24dcca9e";
 static const size_t BLE_RECENT_DEVICE_SLOTS = 16;
 
 #ifndef ONBOARD_CAPTURE_INTERVAL_MS
-#define ONBOARD_CAPTURE_INTERVAL_MS 60000UL
+#define ONBOARD_CAPTURE_INTERVAL_MS 1800000UL
 #endif
 #ifndef ONBOARD_CAPTURE_ENABLED
 #define ONBOARD_CAPTURE_ENABLED 1
+#endif
+#ifndef ONBOARD_CAPTURE_START_MINUTE
+#define ONBOARD_CAPTURE_START_MINUTE 360
+#endif
+#ifndef ONBOARD_CAPTURE_END_MINUTE
+#define ONBOARD_CAPTURE_END_MINUTE 1080
 #endif
 
 static const int BAT_ADC_PIN = 1;
@@ -177,7 +207,7 @@ static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
 static const unsigned long BLE_SCAN_RETRY_DELAY_MS = 1000;
 static const uint8_t BLE_PASSIVE_SCAN_ATTEMPTS = 2;
 static const uint16_t BLE_PASSIVE_SCAN_WINDOW_SEC = 8;
-static const uint16_t BLE_SCAN_INTERVAL_MS = 80;
+static const uint16_t BLE_SCAN_INTERVAL_MS = 160;
 static const uint16_t BLE_SCAN_WINDOW_MS = 80;
 static const uint8_t BLE_WAKE_PULSE_ATTEMPTS = 3;
 static const unsigned long BLE_WAKE_PULSE_DELAY_MS = 350;
@@ -196,11 +226,54 @@ TaskHandle_t onboardCaptureTaskHandle = nullptr;
 bool onboardCameraReady = false;
 bool onboardCaptureEnabled = ONBOARD_CAPTURE_ENABLED != 0;
 unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
+uint16_t onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
+uint16_t onboardCaptureEndMinute = ONBOARD_CAPTURE_END_MINUTE;
+int16_t onboardCaptureTzOffsetMin = 0;
 uint8_t *onboardLatestJpeg = nullptr;
 size_t onboardLatestJpegLen = 0;
 uint32_t onboardCaptureCount = 0;
 uint32_t onboardCaptureFailures = 0;
+uint32_t onboardCaptureScheduleSkips = 0;
 unsigned long onboardLastCaptureMs = 0;
+framesize_t onboardFrameSize = FRAMESIZE_UXGA;
+int onboardJpegQuality = 8;
+int onboardBrightness = 0;
+int onboardContrast = 1;
+int onboardSaturation = 0;
+int onboardSharpness = 1;
+bool onboardVflip = true;
+bool onboardHmirror = false;
+bool onboardAwb = true;
+bool onboardAwbGain = true;
+int onboardWbMode = 0;
+bool onboardAec = true;
+bool onboardAec2 = true;
+int onboardAeLevel = -1;
+int onboardAecValue = 300;
+bool onboardAgc = true;
+int onboardAgcGain = 0;
+int onboardSpecialEffect = 0;
+
+struct OnboardCameraSettings {
+  framesize_t frameSize;
+  int jpegQuality;
+  int brightness;
+  int contrast;
+  int saturation;
+  int sharpness;
+  bool vflip;
+  bool hmirror;
+  bool awb;
+  bool awbGain;
+  int wbMode;
+  bool aec;
+  bool aec2;
+  int aeLevel;
+  int aecValue;
+  bool agc;
+  int agcGain;
+  int specialEffect;
+};
 
 String wifiScanLastJson = "{\"networks\":[]}";
 uint16_t wifiScanLastCount = 0;
@@ -210,6 +283,18 @@ bool wifiScanBusy = false;
 Preferences runtimePrefs;
 uint32_t persistentBootCount = 0;
 uint32_t bootSessionId = 0;
+
+static const size_t UPLOAD_EVENT_QUEUE_SIZE = 12;
+String uploadEventQueue[UPLOAD_EVENT_QUEUE_SIZE];
+size_t uploadEventHead = 0;
+size_t uploadEventCount = 0;
+uint32_t uploadAttemptCount = 0;
+uint32_t uploadSuccessCount = 0;
+uint32_t uploadFailureCount = 0;
+int uploadLastStatusCode = 0;
+String uploadLastMessage = "idle";
+unsigned long uploadLastAttemptMs = 0;
+unsigned long uploadLastSuccessMs = 0;
 
 struct CameraProbeTarget {
   const char *label;
@@ -239,10 +324,11 @@ struct UdpInspectorStats {
   size_t lastPacketLen;
 };
 
-static BLEAdvertisedDevice *bleTargetDevice = nullptr;
-static BLEClient *bleClient = nullptr;
-static BLERemoteCharacteristic *bleNotifyChar3 = nullptr;
-static BLERemoteCharacteristic *bleDataChar4 = nullptr;
+static NimBLEAdvertisedDevice bleTargetDevice;
+static bool bleTargetDeviceFound = false;
+static NimBLEClient *bleClient = nullptr;
+static NimBLERemoteCharacteristic *bleNotifyChar3 = nullptr;
+static NimBLERemoteCharacteristic *bleDataChar4 = nullptr;
 static UdpInspectorStats udpPrimaryStats = {"primary", LOCAL_MEDIA_PORT_PRIMARY, 0, 0, IPAddress(), 0, 0};
 static UdpInspectorStats udpSecondaryStats = {"secondary", LOCAL_MEDIA_PORT_SECONDARY, 0, 0, IPAddress(), 0, 0};
 static String lastStreamSdp;
@@ -442,6 +528,7 @@ String buildStreamStartMetadata() {
 String buildRegistrationMetadata() {
   String metadata = "{";
   metadata += "\"type\":\"register\"";
+  metadata += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
   metadata += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   metadata += ",\"halow_mac\":\"" + HaLow.macAddress() + "\"";
   metadata += ",\"halow_bssid\":\"" + HaLow.BSSIDstr() + "\"";
@@ -619,6 +706,10 @@ uint32_t readBatteryAdcMilliVolts(int samples = 64) {
   return static_cast<uint32_t>(total / samples);
 }
 
+float readChipTemperatureC() {
+  return temperatureRead();
+}
+
 String buildBatteryJson() {
   const uint32_t adcMv = readBatteryAdcMilliVolts();
   const float batteryV = (adcMv / 1000.0f) * 2.0f;
@@ -650,6 +741,307 @@ void initBootIdentity() {
                 millis());
 }
 
+String minuteOfDayToString(uint16_t minuteOfDay) {
+  minuteOfDay %= 1440;
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02u:%02u", minuteOfDay / 60, minuteOfDay % 60);
+  return String(buf);
+}
+
+bool parseMinuteOfDay(const String &value, uint16_t &minuteOfDay) {
+  const int colon = value.indexOf(':');
+  if (colon < 0) {
+    const int raw = value.toInt();
+    if (raw < 0 || raw > 1439) {
+      return false;
+    }
+    minuteOfDay = static_cast<uint16_t>(raw);
+    return true;
+  }
+  const int hour = value.substring(0, colon).toInt();
+  const int minute = value.substring(colon + 1).toInt();
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return false;
+  }
+  minuteOfDay = static_cast<uint16_t>(hour * 60 + minute);
+  return true;
+}
+
+bool onboardClockValid() {
+  return time(nullptr) >= 1700000000;
+}
+
+int onboardLocalMinuteOfDay() {
+  if (!onboardClockValid()) {
+    return -1;
+  }
+  time_t adjusted = time(nullptr) + static_cast<time_t>(onboardCaptureTzOffsetMin) * 60;
+  struct tm tmValue;
+  gmtime_r(&adjusted, &tmValue);
+  return tmValue.tm_hour * 60 + tmValue.tm_min;
+}
+
+bool onboardCaptureWindowActive() {
+  const int minute = onboardLocalMinuteOfDay();
+  if (minute < 0) {
+    return false;
+  }
+  if (onboardCaptureStartMinute == onboardCaptureEndMinute) {
+    return true;
+  }
+  if (onboardCaptureStartMinute < onboardCaptureEndMinute) {
+    return minute >= onboardCaptureStartMinute && minute < onboardCaptureEndMinute;
+  }
+  return minute >= onboardCaptureStartMinute || minute < onboardCaptureEndMinute;
+}
+
+const char *frameSizeName(framesize_t size) {
+  switch (size) {
+    case FRAMESIZE_QQVGA:
+      return "QQVGA";
+    case FRAMESIZE_QVGA:
+      return "QVGA";
+    case FRAMESIZE_VGA:
+      return "VGA";
+    case FRAMESIZE_SVGA:
+      return "SVGA";
+    case FRAMESIZE_XGA:
+      return "XGA";
+    case FRAMESIZE_SXGA:
+      return "SXGA";
+    case FRAMESIZE_UXGA:
+      return "UXGA";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+bool parseFrameSize(const String &input, framesize_t &size) {
+  String value = input;
+  value.toUpperCase();
+  if (value == "QQVGA") {
+    size = FRAMESIZE_QQVGA;
+  } else if (value == "QVGA") {
+    size = FRAMESIZE_QVGA;
+  } else if (value == "VGA") {
+    size = FRAMESIZE_VGA;
+  } else if (value == "SVGA") {
+    size = FRAMESIZE_SVGA;
+  } else if (value == "XGA") {
+    size = FRAMESIZE_XGA;
+  } else if (value == "SXGA") {
+    size = FRAMESIZE_SXGA;
+  } else if (value == "UXGA") {
+    size = FRAMESIZE_UXGA;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+bool serverHasOnboardSensorArgs() {
+  return server.hasArg("framesize") ||
+         server.hasArg("jpeg_quality") ||
+         server.hasArg("quality") ||
+         server.hasArg("brightness") ||
+         server.hasArg("contrast") ||
+         server.hasArg("saturation") ||
+         server.hasArg("sharpness") ||
+         server.hasArg("vflip") ||
+         server.hasArg("hmirror") ||
+         server.hasArg("awb") ||
+         server.hasArg("awb_gain") ||
+         server.hasArg("wb_mode") ||
+         server.hasArg("aec") ||
+         server.hasArg("aec2") ||
+         server.hasArg("ae_level") ||
+         server.hasArg("aec_value") ||
+         server.hasArg("agc") ||
+         server.hasArg("agc_gain") ||
+         server.hasArg("special_effect");
+}
+
+OnboardCameraSettings snapshotOnboardCameraSettings() {
+  OnboardCameraSettings settings{};
+  settings.frameSize = onboardFrameSize;
+  settings.jpegQuality = onboardJpegQuality;
+  settings.brightness = onboardBrightness;
+  settings.contrast = onboardContrast;
+  settings.saturation = onboardSaturation;
+  settings.sharpness = onboardSharpness;
+  settings.vflip = onboardVflip;
+  settings.hmirror = onboardHmirror;
+  settings.awb = onboardAwb;
+  settings.awbGain = onboardAwbGain;
+  settings.wbMode = onboardWbMode;
+  settings.aec = onboardAec;
+  settings.aec2 = onboardAec2;
+  settings.aeLevel = onboardAeLevel;
+  settings.aecValue = onboardAecValue;
+  settings.agc = onboardAgc;
+  settings.agcGain = onboardAgcGain;
+  settings.specialEffect = onboardSpecialEffect;
+  return settings;
+}
+
+bool applyOnboardCameraSettings(const OnboardCameraSettings &settings, String &error) {
+  sensor_t *s = esp_camera_sensor_get();
+  if (s == nullptr) {
+    error = "sensor_unavailable";
+    return false;
+  }
+
+  if (!psramFound() && settings.frameSize > FRAMESIZE_SVGA) {
+    error = "framesize_requires_psram";
+    return false;
+  }
+
+  onboardFrameSize = settings.frameSize;
+  onboardJpegQuality = settings.jpegQuality;
+  onboardBrightness = settings.brightness;
+  onboardContrast = settings.contrast;
+  onboardSaturation = settings.saturation;
+  onboardSharpness = settings.sharpness;
+  onboardVflip = settings.vflip;
+  onboardHmirror = settings.hmirror;
+  onboardAwb = settings.awb;
+  onboardAwbGain = settings.awbGain;
+  onboardWbMode = settings.wbMode;
+  onboardAec = settings.aec;
+  onboardAec2 = settings.aec2;
+  onboardAeLevel = settings.aeLevel;
+  onboardAecValue = settings.aecValue;
+  onboardAgc = settings.agc;
+  onboardAgcGain = settings.agcGain;
+  onboardSpecialEffect = settings.specialEffect;
+
+  s->set_framesize(s, onboardFrameSize);
+  s->set_quality(s, onboardJpegQuality);
+  s->set_brightness(s, onboardBrightness);
+  s->set_contrast(s, onboardContrast);
+  s->set_saturation(s, onboardSaturation);
+  s->set_sharpness(s, onboardSharpness);
+  s->set_vflip(s, onboardVflip);
+  s->set_hmirror(s, onboardHmirror);
+  s->set_whitebal(s, onboardAwb);
+  s->set_awb_gain(s, onboardAwbGain);
+  s->set_wb_mode(s, onboardWbMode);
+  s->set_exposure_ctrl(s, onboardAec);
+  s->set_aec2(s, onboardAec2);
+  s->set_ae_level(s, onboardAeLevel);
+  s->set_aec_value(s, onboardAecValue);
+  s->set_gain_ctrl(s, onboardAgc);
+  s->set_agc_gain(s, onboardAgcGain);
+  s->set_special_effect(s, onboardSpecialEffect);
+  return true;
+}
+
+bool boolLikeValue(const String &value) {
+  String normalized = value;
+  normalized.toLowerCase();
+  return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
+void clampOnboardConfig() {
+  if (onboardCaptureIntervalMs < 5000UL) {
+    onboardCaptureIntervalMs = 5000UL;
+  }
+  if (onboardCaptureStartMinute > 1439) {
+    onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
+  }
+  if (onboardCaptureEndMinute > 1439) {
+    onboardCaptureEndMinute = ONBOARD_CAPTURE_END_MINUTE;
+  }
+  if (onboardJpegQuality < 4) {
+    onboardJpegQuality = 4;
+  }
+  if (onboardJpegQuality > 63) {
+    onboardJpegQuality = 63;
+  }
+  if (!psramFound() && onboardFrameSize > FRAMESIZE_SVGA) {
+    onboardFrameSize = FRAMESIZE_SVGA;
+    onboardJpegQuality = 10;
+  }
+}
+
+void loadOnboardConfig() {
+  if (!runtimePrefs.begin("onboard", true)) {
+    Serial.println("[onboard-config] failed to open preferences for read");
+    onboardFrameSize = psramFound() ? FRAMESIZE_UXGA : FRAMESIZE_SVGA;
+    onboardJpegQuality = psramFound() ? 8 : 10;
+    clampOnboardConfig();
+    return;
+  }
+  onboardCaptureEnabled = runtimePrefs.getBool("enabled", onboardCaptureEnabled);
+  onboardCaptureIntervalMs = runtimePrefs.getULong("interval", onboardCaptureIntervalMs);
+  onboardCaptureStartMinute = runtimePrefs.getUShort("start", onboardCaptureStartMinute);
+  onboardCaptureEndMinute = runtimePrefs.getUShort("end", onboardCaptureEndMinute);
+  onboardCaptureTzOffsetMin = runtimePrefs.getShort("tz", onboardCaptureTzOffsetMin);
+  onboardFrameSize = static_cast<framesize_t>(runtimePrefs.getUChar("framesize", psramFound() ? FRAMESIZE_UXGA : FRAMESIZE_SVGA));
+  onboardJpegQuality = runtimePrefs.getUChar("quality", psramFound() ? 8 : 10);
+  onboardBrightness = runtimePrefs.getChar("bright", onboardBrightness);
+  onboardContrast = runtimePrefs.getChar("contrast", onboardContrast);
+  onboardSaturation = runtimePrefs.getChar("saturate", onboardSaturation);
+  onboardSharpness = runtimePrefs.getChar("sharp", onboardSharpness);
+  onboardVflip = runtimePrefs.getBool("vflip", onboardVflip);
+  onboardHmirror = runtimePrefs.getBool("hmirror", onboardHmirror);
+  onboardAwb = runtimePrefs.getBool("awb", onboardAwb);
+  onboardAwbGain = runtimePrefs.getBool("awb_gain", onboardAwbGain);
+  onboardWbMode = runtimePrefs.getChar("wb_mode", onboardWbMode);
+  onboardAec = runtimePrefs.getBool("aec", onboardAec);
+  onboardAec2 = runtimePrefs.getBool("aec2", onboardAec2);
+  onboardAeLevel = runtimePrefs.getChar("ae_level", onboardAeLevel);
+  onboardAecValue = runtimePrefs.getUShort("aec_value", onboardAecValue);
+  onboardAgc = runtimePrefs.getBool("agc", onboardAgc);
+  onboardAgcGain = runtimePrefs.getUChar("agc_gain", onboardAgcGain);
+  onboardSpecialEffect = runtimePrefs.getUChar("effect", onboardSpecialEffect);
+  runtimePrefs.end();
+  clampOnboardConfig();
+  Serial.printf("[onboard-config] enabled=%s interval_ms=%lu window=%s-%s tz_offset_min=%d framesize=%s quality=%d brightness=%d contrast=%d sharpness=%d ae_level=%d\n",
+                onboardCaptureEnabled ? "yes" : "no",
+                onboardCaptureIntervalMs,
+                minuteOfDayToString(onboardCaptureStartMinute).c_str(),
+                minuteOfDayToString(onboardCaptureEndMinute).c_str(),
+                onboardCaptureTzOffsetMin,
+                frameSizeName(onboardFrameSize),
+                onboardJpegQuality,
+                onboardBrightness,
+                onboardContrast,
+                onboardSharpness,
+                onboardAeLevel);
+}
+
+void saveOnboardConfig() {
+  if (!runtimePrefs.begin("onboard", false)) {
+    Serial.println("[onboard-config] failed to open preferences for write");
+    return;
+  }
+  runtimePrefs.putBool("enabled", onboardCaptureEnabled);
+  runtimePrefs.putULong("interval", onboardCaptureIntervalMs);
+  runtimePrefs.putUShort("start", onboardCaptureStartMinute);
+  runtimePrefs.putUShort("end", onboardCaptureEndMinute);
+  runtimePrefs.putShort("tz", onboardCaptureTzOffsetMin);
+  runtimePrefs.putUChar("framesize", static_cast<uint8_t>(onboardFrameSize));
+  runtimePrefs.putUChar("quality", static_cast<uint8_t>(onboardJpegQuality));
+  runtimePrefs.putChar("bright", static_cast<int8_t>(onboardBrightness));
+  runtimePrefs.putChar("contrast", static_cast<int8_t>(onboardContrast));
+  runtimePrefs.putChar("saturate", static_cast<int8_t>(onboardSaturation));
+  runtimePrefs.putChar("sharp", static_cast<int8_t>(onboardSharpness));
+  runtimePrefs.putBool("vflip", onboardVflip);
+  runtimePrefs.putBool("hmirror", onboardHmirror);
+  runtimePrefs.putBool("awb", onboardAwb);
+  runtimePrefs.putBool("awb_gain", onboardAwbGain);
+  runtimePrefs.putChar("wb_mode", static_cast<int8_t>(onboardWbMode));
+  runtimePrefs.putBool("aec", onboardAec);
+  runtimePrefs.putBool("aec2", onboardAec2);
+  runtimePrefs.putChar("ae_level", static_cast<int8_t>(onboardAeLevel));
+  runtimePrefs.putUShort("aec_value", static_cast<uint16_t>(onboardAecValue));
+  runtimePrefs.putBool("agc", onboardAgc);
+  runtimePrefs.putUChar("agc_gain", static_cast<uint8_t>(onboardAgcGain));
+  runtimePrefs.putUChar("effect", static_cast<uint8_t>(onboardSpecialEffect));
+  runtimePrefs.end();
+}
+
 bool initOnboardCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -674,15 +1066,16 @@ bool initOnboardCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
+  clampOnboardConfig();
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 8;
+    config.frame_size = onboardFrameSize;
+    config.jpeg_quality = onboardJpegQuality;
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 10;
+    config.frame_size = onboardFrameSize;
+    config.jpeg_quality = onboardJpegQuality;
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
@@ -695,9 +1088,24 @@ bool initOnboardCamera() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s != nullptr) {
-    s->set_vflip(s, 1);
-    s->set_brightness(s, 1);
-    s->set_saturation(s, 0);
+    s->set_framesize(s, onboardFrameSize);
+    s->set_quality(s, onboardJpegQuality);
+    s->set_brightness(s, onboardBrightness);
+    s->set_contrast(s, onboardContrast);
+    s->set_saturation(s, onboardSaturation);
+    s->set_sharpness(s, onboardSharpness);
+    s->set_vflip(s, onboardVflip);
+    s->set_hmirror(s, onboardHmirror);
+    s->set_whitebal(s, onboardAwb);
+    s->set_awb_gain(s, onboardAwbGain);
+    s->set_wb_mode(s, onboardWbMode);
+    s->set_exposure_ctrl(s, onboardAec);
+    s->set_aec2(s, onboardAec2);
+    s->set_ae_level(s, onboardAeLevel);
+    s->set_aec_value(s, onboardAecValue);
+    s->set_gain_ctrl(s, onboardAgc);
+    s->set_agc_gain(s, onboardAgcGain);
+    s->set_special_effect(s, onboardSpecialEffect);
   }
 
   for (int i = 0; i < 3; ++i) {
@@ -766,6 +1174,7 @@ String buildOnboardCameraStatusJson() {
   size_t latestLen = 0;
   uint32_t count = 0;
   uint32_t failures = 0;
+  uint32_t scheduleSkips = 0;
   unsigned long lastMs = 0;
   if (onboardFrameMutex != nullptr) {
     xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
@@ -773,28 +1182,375 @@ String buildOnboardCameraStatusJson() {
   latestLen = onboardLatestJpegLen;
   count = onboardCaptureCount;
   failures = onboardCaptureFailures;
+  scheduleSkips = onboardCaptureScheduleSkips;
   lastMs = onboardLastCaptureMs;
   if (onboardFrameMutex != nullptr) {
     xSemaphoreGive(onboardFrameMutex);
   }
 
+  const int localMinute = onboardLocalMinuteOfDay();
   String payload = "{";
   payload += "\"ready\":" + String(onboardCameraReady ? "true" : "false");
   payload += ",\"enabled\":" + String(onboardCaptureEnabled ? "true" : "false");
   payload += ",\"interval_ms\":" + String(onboardCaptureIntervalMs);
+  payload += ",\"window_start\":\"" + minuteOfDayToString(onboardCaptureStartMinute) + "\"";
+  payload += ",\"window_end\":\"" + minuteOfDayToString(onboardCaptureEndMinute) + "\"";
+  payload += ",\"window_start_minute\":" + String(onboardCaptureStartMinute);
+  payload += ",\"window_end_minute\":" + String(onboardCaptureEndMinute);
+  payload += ",\"tz_offset_min\":" + String(onboardCaptureTzOffsetMin);
+  payload += ",\"clock_valid\":" + String(onboardClockValid() ? "true" : "false");
+  payload += ",\"local_minute\":" + String(localMinute);
+  payload += ",\"window_active\":" + String(onboardCaptureWindowActive() ? "true" : "false");
+  payload += ",\"framesize\":\"" + String(frameSizeName(onboardFrameSize)) + "\"";
+  payload += ",\"jpeg_quality\":" + String(onboardJpegQuality);
+  payload += ",\"psram_found\":" + String(psramFound() ? "true" : "false");
+  payload += ",\"psram_size\":" + String(ESP.getPsramSize());
+  payload += ",\"psram_free\":" + String(ESP.getFreePsram());
+  payload += ",\"brightness\":" + String(onboardBrightness);
+  payload += ",\"contrast\":" + String(onboardContrast);
+  payload += ",\"saturation\":" + String(onboardSaturation);
+  payload += ",\"sharpness\":" + String(onboardSharpness);
+  payload += ",\"vflip\":" + String(onboardVflip ? "true" : "false");
+  payload += ",\"hmirror\":" + String(onboardHmirror ? "true" : "false");
+  payload += ",\"awb\":" + String(onboardAwb ? "true" : "false");
+  payload += ",\"awb_gain\":" + String(onboardAwbGain ? "true" : "false");
+  payload += ",\"wb_mode\":" + String(onboardWbMode);
+  payload += ",\"aec\":" + String(onboardAec ? "true" : "false");
+  payload += ",\"aec2\":" + String(onboardAec2 ? "true" : "false");
+  payload += ",\"ae_level\":" + String(onboardAeLevel);
+  payload += ",\"aec_value\":" + String(onboardAecValue);
+  payload += ",\"agc\":" + String(onboardAgc ? "true" : "false");
+  payload += ",\"agc_gain\":" + String(onboardAgcGain);
+  payload += ",\"special_effect\":" + String(onboardSpecialEffect);
   payload += ",\"latest_bytes\":" + String(static_cast<unsigned>(latestLen));
   payload += ",\"captures\":" + String(count);
   payload += ",\"failures\":" + String(failures);
+  payload += ",\"schedule_skips\":" + String(scheduleSkips);
   payload += ",\"last_capture_age_ms\":" + String(msSince(lastMs));
   payload += "}";
   return payload;
+}
+
+bool applyOnboardCameraSensorArgs(String &error, bool persist) {
+  if (!serverHasOnboardSensorArgs()) {
+    return true;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s == nullptr) {
+    error = "sensor_unavailable";
+    return false;
+  }
+
+  if (server.hasArg("framesize")) {
+    framesize_t requested;
+    if (!parseFrameSize(server.arg("framesize"), requested)) {
+      error = "invalid_framesize";
+      return false;
+    }
+    if (!psramFound() && requested > FRAMESIZE_SVGA) {
+      error = "framesize_requires_psram";
+      return false;
+    }
+    if (s->set_framesize(s, requested) == 0) {
+      onboardFrameSize = requested;
+    }
+  }
+  if (server.hasArg("jpeg_quality") || server.hasArg("quality")) {
+    const int requested = server.hasArg("jpeg_quality") ? server.arg("jpeg_quality").toInt() : server.arg("quality").toInt();
+    if (requested < 4 || requested > 63) {
+      error = "invalid_jpeg_quality";
+      return false;
+    }
+    if (s->set_quality(s, requested) == 0) {
+      onboardJpegQuality = requested;
+    }
+  }
+  if (server.hasArg("brightness")) {
+    onboardBrightness = server.arg("brightness").toInt();
+    s->set_brightness(s, onboardBrightness);
+  }
+  if (server.hasArg("contrast")) {
+    onboardContrast = server.arg("contrast").toInt();
+    s->set_contrast(s, onboardContrast);
+  }
+  if (server.hasArg("saturation")) {
+    onboardSaturation = server.arg("saturation").toInt();
+    s->set_saturation(s, onboardSaturation);
+  }
+  if (server.hasArg("sharpness")) {
+    onboardSharpness = server.arg("sharpness").toInt();
+    s->set_sharpness(s, onboardSharpness);
+  }
+  if (server.hasArg("vflip")) {
+    onboardVflip = boolLikeValue(server.arg("vflip"));
+    s->set_vflip(s, onboardVflip);
+  }
+  if (server.hasArg("hmirror")) {
+    onboardHmirror = boolLikeValue(server.arg("hmirror"));
+    s->set_hmirror(s, onboardHmirror);
+  }
+  if (server.hasArg("awb")) {
+    onboardAwb = boolLikeValue(server.arg("awb"));
+    s->set_whitebal(s, onboardAwb);
+  }
+  if (server.hasArg("awb_gain")) {
+    onboardAwbGain = boolLikeValue(server.arg("awb_gain"));
+    s->set_awb_gain(s, onboardAwbGain);
+  }
+  if (server.hasArg("wb_mode")) {
+    onboardWbMode = server.arg("wb_mode").toInt();
+    s->set_wb_mode(s, onboardWbMode);
+  }
+  if (server.hasArg("aec")) {
+    onboardAec = boolLikeValue(server.arg("aec"));
+    s->set_exposure_ctrl(s, onboardAec);
+  }
+  if (server.hasArg("aec2")) {
+    onboardAec2 = boolLikeValue(server.arg("aec2"));
+    s->set_aec2(s, onboardAec2);
+  }
+  if (server.hasArg("ae_level")) {
+    onboardAeLevel = server.arg("ae_level").toInt();
+    s->set_ae_level(s, onboardAeLevel);
+  }
+  if (server.hasArg("aec_value")) {
+    onboardAecValue = server.arg("aec_value").toInt();
+    s->set_aec_value(s, onboardAecValue);
+  }
+  if (server.hasArg("agc")) {
+    onboardAgc = boolLikeValue(server.arg("agc"));
+    s->set_gain_ctrl(s, onboardAgc);
+  }
+  if (server.hasArg("agc_gain")) {
+    onboardAgcGain = server.arg("agc_gain").toInt();
+    s->set_agc_gain(s, onboardAgcGain);
+  }
+  if (server.hasArg("special_effect")) {
+    onboardSpecialEffect = server.arg("special_effect").toInt();
+    s->set_special_effect(s, onboardSpecialEffect);
+  }
+  if (persist) {
+    saveOnboardConfig();
+  }
+  return true;
+}
+
+bool serialBoolValue(const String &value) {
+  return boolLikeValue(value);
+}
+
+bool applyOnboardCameraSetting(const String &key, const String &value, String &error) {
+  if (key == "enabled") {
+    onboardCaptureEnabled = serialBoolValue(value);
+    saveOnboardConfig();
+    return true;
+  }
+  if (key == "interval_ms") {
+    const unsigned long requested = value.toInt();
+    if (requested < 5000UL) {
+      error = "invalid_interval_ms";
+      return false;
+    }
+    onboardCaptureIntervalMs = requested;
+    saveOnboardConfig();
+    return true;
+  }
+  if (key == "start" || key == "start_minute") {
+    uint16_t requested = 0;
+    if (!parseMinuteOfDay(value, requested)) {
+      error = "invalid_start";
+      return false;
+    }
+    onboardCaptureStartMinute = requested;
+    saveOnboardConfig();
+    return true;
+  }
+  if (key == "end" || key == "end_minute") {
+    uint16_t requested = 0;
+    if (!parseMinuteOfDay(value, requested)) {
+      error = "invalid_end";
+      return false;
+    }
+    onboardCaptureEndMinute = requested;
+    saveOnboardConfig();
+    return true;
+  }
+  if (key == "tz_offset_min") {
+    onboardCaptureTzOffsetMin = static_cast<int16_t>(value.toInt());
+    saveOnboardConfig();
+    return true;
+  }
+  if (key == "epoch") {
+    const time_t epoch = static_cast<time_t>(value.toInt());
+    if (epoch < 1700000000) {
+      error = "invalid_epoch";
+      return false;
+    }
+    timeval tv{};
+    tv.tv_sec = epoch;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    return true;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s == nullptr) {
+    error = "sensor_unavailable";
+    return false;
+  }
+  if (key == "framesize") {
+    framesize_t requested;
+    if (!parseFrameSize(value, requested)) {
+      error = "invalid_framesize";
+      return false;
+    }
+    if (!psramFound() && requested > FRAMESIZE_SVGA) {
+      error = "framesize_requires_psram";
+      return false;
+    }
+    if (s->set_framesize(s, requested) == 0) {
+      onboardFrameSize = requested;
+      saveOnboardConfig();
+    }
+    return true;
+  }
+  if (key == "jpeg_quality" || key == "quality") {
+    const int requested = value.toInt();
+    if (requested < 4 || requested > 63) {
+      error = "invalid_jpeg_quality";
+      return false;
+    }
+    if (s->set_quality(s, requested) == 0) {
+      onboardJpegQuality = requested;
+      saveOnboardConfig();
+    }
+    return true;
+  }
+  if (key == "brightness") {
+    onboardBrightness = value.toInt();
+    s->set_brightness(s, onboardBrightness);
+  } else if (key == "contrast") {
+    onboardContrast = value.toInt();
+    s->set_contrast(s, onboardContrast);
+  } else if (key == "saturation") {
+    onboardSaturation = value.toInt();
+    s->set_saturation(s, onboardSaturation);
+  } else if (key == "sharpness") {
+    onboardSharpness = value.toInt();
+    s->set_sharpness(s, onboardSharpness);
+  } else if (key == "vflip") {
+    onboardVflip = serialBoolValue(value);
+    s->set_vflip(s, onboardVflip);
+  } else if (key == "hmirror") {
+    onboardHmirror = serialBoolValue(value);
+    s->set_hmirror(s, onboardHmirror);
+  } else if (key == "awb") {
+    onboardAwb = serialBoolValue(value);
+    s->set_whitebal(s, onboardAwb);
+  } else if (key == "awb_gain") {
+    onboardAwbGain = serialBoolValue(value);
+    s->set_awb_gain(s, onboardAwbGain);
+  } else if (key == "wb_mode") {
+    onboardWbMode = value.toInt();
+    s->set_wb_mode(s, onboardWbMode);
+  } else if (key == "aec") {
+    onboardAec = serialBoolValue(value);
+    s->set_exposure_ctrl(s, onboardAec);
+  } else if (key == "aec2") {
+    onboardAec2 = serialBoolValue(value);
+    s->set_aec2(s, onboardAec2);
+  } else if (key == "ae_level") {
+    onboardAeLevel = value.toInt();
+    s->set_ae_level(s, onboardAeLevel);
+  } else if (key == "aec_value") {
+    onboardAecValue = value.toInt();
+    s->set_aec_value(s, onboardAecValue);
+  } else if (key == "agc") {
+    onboardAgc = serialBoolValue(value);
+    s->set_gain_ctrl(s, onboardAgc);
+  } else if (key == "agc_gain") {
+    onboardAgcGain = value.toInt();
+    s->set_agc_gain(s, onboardAgcGain);
+  } else if (key == "special_effect") {
+    onboardSpecialEffect = value.toInt();
+    s->set_special_effect(s, onboardSpecialEffect);
+  } else {
+    error = "unknown_setting";
+    return false;
+  }
+  saveOnboardConfig();
+  return true;
+}
+
+void printBase64Bytes(const uint8_t *data, size_t len) {
+  static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t lineChars = 0;
+  for (size_t i = 0; i < len; i += 3) {
+    const uint32_t octetA = data[i];
+    const uint32_t octetB = (i + 1 < len) ? data[i + 1] : 0;
+    const uint32_t octetC = (i + 2 < len) ? data[i + 2] : 0;
+    const uint32_t triple = (octetA << 16) | (octetB << 8) | octetC;
+    char out[4];
+    out[0] = alphabet[(triple >> 18) & 0x3F];
+    out[1] = alphabet[(triple >> 12) & 0x3F];
+    out[2] = (i + 1 < len) ? alphabet[(triple >> 6) & 0x3F] : '=';
+    out[3] = (i + 2 < len) ? alphabet[triple & 0x3F] : '=';
+    Serial.write(reinterpret_cast<const uint8_t *>(out), sizeof(out));
+    lineChars += 4;
+    if (lineChars >= 76) {
+      Serial.println();
+      lineChars = 0;
+    }
+  }
+  if (lineChars > 0) {
+    Serial.println();
+  }
+}
+
+void dumpOnboardJpegBase64(bool freshCapture) {
+  if (freshCapture) {
+    if (!captureOnboardFrame()) {
+      Serial.println("ONBOARD_JPEG_ERROR capture_failed");
+      return;
+    }
+  }
+  uint8_t *buf = nullptr;
+  size_t len = 0;
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
+  }
+  buf = onboardLatestJpeg;
+  len = onboardLatestJpegLen;
+  if (buf == nullptr || len == 0) {
+    if (onboardFrameMutex != nullptr) {
+      xSemaphoreGive(onboardFrameMutex);
+    }
+    Serial.println("ONBOARD_JPEG_ERROR no_capture");
+    return;
+  }
+  Serial.printf("BEGIN_ONBOARD_JPEG_BASE64 bytes=%u\n", static_cast<unsigned>(len));
+  printBase64Bytes(buf, len);
+  Serial.println("END_ONBOARD_JPEG_BASE64");
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreGive(onboardFrameMutex);
+  }
 }
 
 void onboardCaptureTask(void *pvParameters) {
   (void)pvParameters;
   while (true) {
     if (onboardCaptureEnabled && onboardCameraReady) {
-      captureOnboardFrame();
+      if (onboardCaptureWindowActive()) {
+        captureOnboardFrame();
+      } else {
+        ++onboardCaptureScheduleSkips;
+        Serial.printf("[onboard-camera] scheduled capture skipped clock_valid=%s local_minute=%d window=%s-%s\n",
+                      onboardClockValid() ? "yes" : "no",
+                      onboardLocalMinuteOfDay(),
+                      minuteOfDayToString(onboardCaptureStartMinute).c_str(),
+                      minuteOfDayToString(onboardCaptureEndMinute).c_str());
+      }
     }
     const unsigned long delayMs = onboardCaptureIntervalMs < 5000 ? 5000 : onboardCaptureIntervalMs;
     vTaskDelay(pdMS_TO_TICKS(delayMs));
@@ -870,6 +1626,138 @@ String jsonEscape(const String &input) {
     }
   }
   return output;
+}
+
+String jsonNullableString(const String &value) {
+  if (value.isEmpty()) {
+    return "null";
+  }
+  return "\"" + jsonEscape(value) + "\"";
+}
+
+String buildRecordedAtJsonValue() {
+  return "null";
+}
+
+void setUploadResult(bool ok, int statusCode, const String &message) {
+  uploadLastStatusCode = statusCode;
+  uploadLastMessage = message;
+  uploadLastAttemptMs = millis();
+  if (ok) {
+    ++uploadSuccessCount;
+    uploadLastSuccessMs = millis();
+  } else {
+    ++uploadFailureCount;
+  }
+}
+
+void enqueueUploadEvent(const String &type, const String &reason, const String &detailsJson, bool ok = true) {
+  String event = "{";
+  event += "\"type\":\"" + jsonEscape(type) + "\"";
+  event += ",\"ok\":" + String(ok ? "true" : "false");
+  if (!reason.isEmpty()) {
+    event += ",\"reason\":\"" + jsonEscape(reason) + "\"";
+  }
+  event += ",\"uptime_ms\":" + String(millis());
+  event += ",\"details\":" + (detailsJson.isEmpty() ? String("{}") : detailsJson);
+  event += "}";
+
+  const size_t slot = (uploadEventHead + uploadEventCount) % UPLOAD_EVENT_QUEUE_SIZE;
+  uploadEventQueue[slot] = event;
+  if (uploadEventCount < UPLOAD_EVENT_QUEUE_SIZE) {
+    ++uploadEventCount;
+  } else {
+    uploadEventHead = (uploadEventHead + 1) % UPLOAD_EVENT_QUEUE_SIZE;
+  }
+}
+
+String buildBoardTelemetryJson() {
+  const uint32_t adcMv = readBatteryAdcMilliVolts();
+  const float batteryV = (adcMv / 1000.0f) * 2.0f;
+  const float chipTemperatureC = readChipTemperatureC();
+  String payload = "{";
+  payload += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
+  payload += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
+  payload += ",\"recorded_at\":" + buildRecordedAtJsonValue();
+  payload += ",\"firmware\":{";
+  payload += "\"name\":\"" + jsonEscape(FIRMWARE_NAME) + "\"";
+  payload += ",\"version\":\"" + jsonEscape(FIRMWARE_VERSION) + "\"";
+  payload += ",\"build\":\"" + jsonEscape(FIRMWARE_BUILD) + "\"";
+  payload += "}";
+  payload += ",\"board\":{";
+  payload += "\"mac\":\"" + jsonEscape(WiFi.macAddress()) + "\"";
+  payload += ",\"uptime_ms\":" + String(millis());
+  payload += ",\"boot_count\":" + String(persistentBootCount);
+  payload += ",\"boot_session_id\":" + String(bootSessionId);
+  payload += ",\"free_heap\":" + String(ESP.getFreeHeap());
+  payload += ",\"min_free_heap\":" + String(ESP.getMinFreeHeap());
+  payload += ",\"psram_free\":" + String(heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  payload += ",\"chip_temperature_c\":" + String(chipTemperatureC, 1);
+  payload += "}";
+  payload += ",\"battery\":{";
+  payload += "\"adc_mv\":" + String(adcMv);
+  payload += ",\"battery_est_v\":" + String(batteryV, 3);
+  payload += ",\"charging_gpio15\":" + String(digitalRead(BAT_CHRG_PIN));
+  payload += ",\"done_gpio16\":" + String(digitalRead(BAT_DONE_PIN));
+  payload += "}";
+  payload += ",\"temperature\":{";
+  payload += "\"probe_attached\":false";
+  payload += ",\"sensor\":null";
+  payload += ",\"temperature_c\":null";
+  payload += ",\"chip_temperature_c\":" + String(chipTemperatureC, 1);
+  payload += "}";
+  payload += ",\"radio\":{";
+  payload += "\"halow_connected\":" + String(halowConnected ? "true" : "false");
+  payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
+  payload += ",\"halow_rssi\":" + String(static_cast<int>(HaLow.RSSI()));
+  payload += ",\"trail_wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  payload += "}";
+  payload += "}";
+  return payload;
+}
+
+String buildEventsUploadJson() {
+  String payload = "{";
+  payload += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
+  payload += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
+  payload += ",\"recorded_at\":" + buildRecordedAtJsonValue();
+  payload += ",\"events\":[";
+  for (size_t i = 0; i < uploadEventCount; ++i) {
+    if (i > 0) {
+      payload += ",";
+    }
+    const size_t slot = (uploadEventHead + i) % UPLOAD_EVENT_QUEUE_SIZE;
+    payload += uploadEventQueue[slot];
+  }
+  payload += "]}";
+  return payload;
+}
+
+void clearUploadedEvents() {
+  for (size_t i = 0; i < uploadEventCount; ++i) {
+    const size_t slot = (uploadEventHead + i) % UPLOAD_EVENT_QUEUE_SIZE;
+    uploadEventQueue[slot] = "";
+  }
+  uploadEventHead = 0;
+  uploadEventCount = 0;
+}
+
+String buildUploadStatusJson() {
+  String payload = "{";
+  payload += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
+  payload += ",\"api_host\":\"" + jsonEscape(UPSTREAM_API_HOST) + "\"";
+  payload += ",\"api_port\":" + String(UPSTREAM_API_PORT);
+  payload += ",\"api_prefix\":\"" + jsonEscape(UPSTREAM_API_PREFIX) + "\"";
+  payload += ",\"attempts\":" + String(uploadAttemptCount);
+  payload += ",\"successes\":" + String(uploadSuccessCount);
+  payload += ",\"failures\":" + String(uploadFailureCount);
+  payload += ",\"last_status_code\":" + String(uploadLastStatusCode);
+  payload += ",\"last_message\":\"" + jsonEscape(uploadLastMessage) + "\"";
+  payload += ",\"last_attempt_age_ms\":" + String(msSince(uploadLastAttemptMs));
+  payload += ",\"last_success_age_ms\":" + String(msSince(uploadLastSuccessMs));
+  payload += ",\"queued_events\":" + String(static_cast<unsigned>(uploadEventCount));
+  payload += "}";
+  return payload;
 }
 
 const char *controlActionName(ControlAction action) {
@@ -951,6 +1839,15 @@ void finishControlAction(ControlAction action, bool ok, const char *message) {
            "%s",
            message == nullptr ? "" : message);
   portEXIT_CRITICAL(&controlState.lock);
+
+  String details = "{";
+  details += "\"action\":\"" + String(controlActionName(action)) + "\"";
+  details += ",\"message\":\"" + jsonEscape(message == nullptr ? String("") : String(message)) + "\"";
+  details += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
+  details += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  details += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
+  details += "}";
+  enqueueUploadEvent("control_action_finished", controlActionName(action), details, ok);
 }
 
 bool sendRtspKeepalive() {
@@ -991,7 +1888,7 @@ bool sendBleWakePulse() {
   }
 
   Serial.println("[BLE] keepalive wake pulse");
-  bleDataChar4->writeValue(reinterpret_cast<uint8_t *>(const_cast<char *>(CAMERA_BLE_WAKE)),
+  bleDataChar4->writeValue(reinterpret_cast<const uint8_t *>(CAMERA_BLE_WAKE),
                            strlen(CAMERA_BLE_WAKE),
                            true);
   lastBleKeepaliveMs = millis();
@@ -1127,15 +2024,18 @@ void closeBleWakeSession() {
       Serial.println("[BLE] closing wake session");
       bleClient->disconnect();
     }
+    NimBLEDevice::deleteClient(bleClient);
     bleClient = nullptr;
   }
+  bleNotifyChar3 = nullptr;
+  bleDataChar4 = nullptr;
 }
 
 void refreshWifiState() {
   wifiConnected = (WiFi.status() == WL_CONNECTED) && (WiFi.localIP() != IPAddress((uint32_t)0));
 }
 
-static void bleNotifyCallback(BLERemoteCharacteristic *characteristic,
+static void bleNotifyCallback(NimBLERemoteCharacteristic *characteristic,
                               uint8_t *data,
                               size_t length,
                               bool isNotify) {
@@ -1156,29 +2056,30 @@ static void bleNotifyCallback(BLERemoteCharacteristic *characteristic,
   }
 }
 
-class BridgeBleClientCallbacks : public BLEClientCallbacks {
-  void onConnect(BLEClient *client) override {
+class BridgeBleClientCallbacks : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient *client) override {
     Serial.printf("[BLE] connected to %s\n", client->getPeerAddress().toString().c_str());
   }
 
-  void onDisconnect(BLEClient *client) override {
-    Serial.printf("[BLE] disconnected from %s\n", client->getPeerAddress().toString().c_str());
+  void onDisconnect(NimBLEClient *client, int reason) override {
+    Serial.printf("[BLE] disconnected from %s reason=%d\n", client->getPeerAddress().toString().c_str(), reason);
   }
 };
 
-class BridgeBleAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    const String mac = advertisedDevice.getAddress().toString().c_str();
+class BridgeBleAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *advertisedDevice) override {
+    String mac = advertisedDevice->getAddress().toString().c_str();
+    mac.toLowerCase();
     String name = "";
-    if (advertisedDevice.haveName()) {
-      name = advertisedDevice.getName().c_str();
+    if (advertisedDevice->haveName()) {
+      name = advertisedDevice->getName().c_str();
     }
     String serviceUuid = "";
-    if (advertisedDevice.haveServiceUUID()) {
-      serviceUuid = advertisedDevice.getServiceUUID().toString().c_str();
+    if (advertisedDevice->haveServiceUUID()) {
+      serviceUuid = advertisedDevice->getServiceUUID().toString().c_str();
       serviceUuid.toLowerCase();
     }
-    const int rssi = advertisedDevice.getRSSI();
+    const int rssi = advertisedDevice->getRSSI();
     ++bleScanResultCount;
     bleLastSeenMac = mac;
     bleLastSeenName = name;
@@ -1200,8 +2101,9 @@ class BridgeBleAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
       }
       Serial.printf(" rssi=%d", rssi);
       Serial.println();
-      BLEDevice::getScan()->stop();
-      bleTargetDevice = new BLEAdvertisedDevice(advertisedDevice);
+      bleTargetDevice = *advertisedDevice;
+      bleTargetDeviceFound = true;
+      NimBLEDevice::getScan()->stop();
     } else if (bleScanResultCount <= 5 || (bleScanResultCount % 25) == 0) {
       Serial.printf("[BLE] saw advertisement mac=%s rssi=%d", mac.c_str(), rssi);
       if (!name.isEmpty()) {
@@ -1215,14 +2117,17 @@ class BridgeBleAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
-bool runBleDiscoveryPass(BLEScan *scan,
+static BridgeBleClientCallbacks bridgeBleClientCallbacks;
+static BridgeBleAdvertisedDeviceCallbacks bridgeBleScanCallbacks;
+
+bool runBleDiscoveryPass(NimBLEScan *scan,
                          bool activeScan,
                          uint8_t attempts,
                          uint16_t windowSec,
                          const char *modeLabel) {
   bleScanMode = modeLabel;
   scan->setActiveScan(activeScan);
-  for (uint8_t attempt = 1; attempt <= attempts && bleTargetDevice == nullptr; ++attempt) {
+  for (uint8_t attempt = 1; attempt <= attempts && !bleTargetDeviceFound; ++attempt) {
     ++bleScanAttemptCounter;
     Serial.printf("[BLE] %s scan attempt %u/%u window=%us results=%u best_mac=%s best_rssi=%d\n",
                   modeLabel,
@@ -1232,8 +2137,13 @@ bool runBleDiscoveryPass(BLEScan *scan,
                   static_cast<unsigned>(bleScanResultCount),
                   bleBestSeenMac.c_str(),
                   bleBestSeenRssi);
-    scan->start(windowSec, false);
-    if (bleTargetDevice == nullptr) {
+    scan->start(static_cast<uint32_t>(windowSec) * 1000UL, false, true);
+    const unsigned long startedMs = millis();
+    while (!bleTargetDeviceFound && millis() - startedMs < static_cast<unsigned long>(windowSec) * 1000UL + 250UL) {
+      cooperativeDelay(50);
+    }
+    scan->stop();
+    if (!bleTargetDeviceFound) {
       Serial.printf("[BLE] target not found in %s scan window results=%u best_mac=%s best_rssi=%d\n",
                     modeLabel,
                     static_cast<unsigned>(bleScanResultCount),
@@ -1242,7 +2152,7 @@ bool runBleDiscoveryPass(BLEScan *scan,
       cooperativeDelay(BLE_SCAN_RETRY_DELAY_MS);
     }
   }
-  return bleTargetDevice != nullptr;
+  return bleTargetDeviceFound;
 }
 
 bool runExactBleWake() {
@@ -1257,18 +2167,19 @@ bool runExactBleWake() {
   Serial.printf("[BLE] scanning for target %s\n", CAMERA_BLE_MAC);
   Serial.println("[BLE] warmup before BLE init");
   cooperativeDelay(5000);
-  BLEDevice::init("");
-  BLEScan *scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new BridgeBleAdvertisedDeviceCallbacks(), true, true);
+  NimBLEDevice::init(BOARD_HOSTNAME);
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(&bridgeBleScanCallbacks, true);
   scan->setInterval(BLE_SCAN_INTERVAL_MS);
   scan->setWindow(BLE_SCAN_WINDOW_MS);
-  bleTargetDevice = nullptr;
+  scan->setMaxResults(0);
+  bleTargetDeviceFound = false;
   runBleDiscoveryPass(scan, true, BLE_SCAN_ATTEMPTS, BLE_SCAN_WINDOW_SEC, "active");
-  if (bleTargetDevice == nullptr) {
+  if (!bleTargetDeviceFound) {
     runBleDiscoveryPass(scan, false, BLE_PASSIVE_SCAN_ATTEMPTS, BLE_PASSIVE_SCAN_WINDOW_SEC, "passive");
   }
 
-  if (bleTargetDevice == nullptr) {
+  if (!bleTargetDeviceFound) {
     Serial.printf("[BLE] target advertisement not found results=%u best_mac=%s best_name=%s best_rssi=%d attempts=%u\n",
                   static_cast<unsigned>(bleScanResultCount),
                   bleBestSeenMac.c_str(),
@@ -1280,41 +2191,37 @@ bool runExactBleWake() {
   }
 
   bleStage = "connect";
-  bleClient = BLEDevice::createClient();
-  bleClient->setClientCallbacks(new BridgeBleClientCallbacks());
-  if (!bleClient->connect(bleTargetDevice)) {
-    Serial.println("[BLE] connect failed");
+  bleClient = NimBLEDevice::createClient();
+  bleClient->setClientCallbacks(&bridgeBleClientCallbacks, false);
+  bleClient->setConnectTimeout(15000);
+  bleClient->setConnectionParams(24, 40, 0, 400, 160, 120);
+  if (!bleClient->connect(&bleTargetDevice, true, false, false)) {
+    Serial.printf("[BLE] connect failed last_error=%d\n", bleClient->getLastError());
     bleStage = "connect_failed";
+    NimBLEDevice::deleteClient(bleClient);
+    bleClient = nullptr;
     return false;
   }
 
-  bleClient->setMTU(517);
   bleStage = "enumerate";
 
-  auto *services = bleClient->getServices();
-  Serial.printf("[BLE] discovered %u services\n", static_cast<unsigned>(services->size()));
-  for (auto it = services->begin(); it != services->end(); ++it) {
-    BLERemoteService *service = it->second;
-    auto *chars = service->getCharacteristics();
-    for (auto cit = chars->begin(); cit != chars->end(); ++cit) {
-      BLERemoteCharacteristic *ch = cit->second;
-      String uuid = ch->getUUID().toString().c_str();
-      uuid.toLowerCase();
-      if (uuid == "6e400003-b5a3-f393-e0a9-e50e24dcca9e") {
-        bleNotifyChar3 = ch;
-      } else if (uuid == "6e400004-b5a3-f393-e0a9-e50e24dcca9e") {
-        bleDataChar4 = ch;
-      }
-    }
+  NimBLERemoteService *service = bleClient->getService(CAMERA_BLE_GATT_SERVICE_UUID);
+  if (service == nullptr) {
+    Serial.println("[BLE] GATT service unavailable");
+    bleStage = "service_missing";
+    closeBleWakeSession();
+    return false;
   }
+  bleNotifyChar3 = service->getCharacteristic(CAMERA_BLE_NOTIFY_UUID);
+  bleDataChar4 = service->getCharacteristic(CAMERA_BLE_DATA_UUID);
 
   if (bleNotifyChar3 != nullptr && bleNotifyChar3->canNotify()) {
     Serial.println("[BLE] register notify on 6e400003");
-    bleNotifyChar3->registerForNotify(bleNotifyCallback);
+    bleNotifyChar3->subscribe(true, bleNotifyCallback);
   }
   if (bleDataChar4 != nullptr && (bleDataChar4->canNotify() || bleDataChar4->canIndicate())) {
     Serial.println("[BLE] register notify on 6e400004");
-    bleDataChar4->registerForNotify(bleNotifyCallback);
+    bleDataChar4->subscribe(bleDataChar4->canNotify(), bleNotifyCallback);
   }
 
   if (bleDataChar4 == nullptr || !(bleDataChar4->canWrite() || bleDataChar4->canWriteNoResponse())) {
@@ -1328,7 +2235,7 @@ bool runExactBleWake() {
   cooperativeDelay(150);
   for (int attempt = 1; attempt <= 3; ++attempt) {
     Serial.printf("[BLE] wake attempt %d/3 -> 6e400004 payload=%s", attempt, CAMERA_BLE_WAKE);
-    bleDataChar4->writeValue(reinterpret_cast<uint8_t *>(const_cast<char *>(CAMERA_BLE_WAKE)),
+    bleDataChar4->writeValue(reinterpret_cast<const uint8_t *>(CAMERA_BLE_WAKE),
                              strlen(CAMERA_BLE_WAKE),
                              true);
     lastBleKeepaliveMs = millis();
@@ -1379,7 +2286,13 @@ void printSerialHelp() {
   Serial.println("  battery");
   Serial.println("  onboard_status");
   Serial.println("  onboard_capture");
+  Serial.println("  onboard_config key=value [key=value...]");
+  Serial.println("  onboard_dump [fresh]");
   Serial.println("  wifi_scan");
+  Serial.println("  upload_status");
+  Serial.println("  upload_telemetry");
+  Serial.println("  upload_events");
+  Serial.println("  upload_all");
   Serial.println("  rtsp <METHOD> <url>");
   Serial.println("  wake");
   Serial.println("  bleclose");
@@ -1389,6 +2302,7 @@ void connectCameraWifi() {
   Serial.printf("Connecting camera WiFi SSID %s\n", CAMERA_WIFI_SSID);
   WiFi.persistent(false);
   WiFi.mode(WIFI_MODE_STA);
+  WiFi.setHostname(BOARD_HOSTNAME);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.disconnect(true, true);
@@ -1585,6 +2499,157 @@ void connectHaLow() {
   } else {
     Serial.println("HaLow connect timed out");
   }
+}
+
+String normalizeApiPath(const String &path) {
+  String prefix = UPSTREAM_API_PREFIX;
+  if (!prefix.isEmpty() && !prefix.startsWith("/")) {
+    prefix = "/" + prefix;
+  }
+  if (prefix.endsWith("/")) {
+    prefix.remove(prefix.length() - 1);
+  }
+  if (path.startsWith("/")) {
+    return prefix + path;
+  }
+  return prefix + "/" + path;
+}
+
+bool postJsonToUpstream(const String &path,
+                        const String &requestBody,
+                        String &responseBody,
+                        int &statusCode) {
+  if (!halowConnected || HaLow.status() != WL_CONNECTED) {
+    connectHaLow();
+  }
+  if (!halowConnected) {
+    statusCode = 0;
+    responseBody = "{\"error\":\"halow_down\"}";
+    return false;
+  }
+
+  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) {
+    statusCode = 0;
+    responseBody = "{\"error\":\"socket_create_failed\"}";
+    return false;
+  }
+  timeval receiveTimeout{};
+  receiveTimeout.tv_sec = 10;
+  receiveTimeout.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, sizeof(receiveTimeout));
+
+  sockaddr_in upstreamAddr{};
+  upstreamAddr.sin_family = AF_INET;
+  upstreamAddr.sin_addr.s_addr = inet_addr(UPSTREAM_API_HOST);
+  upstreamAddr.sin_port = htons(UPSTREAM_API_PORT);
+
+  if (connect(sock, reinterpret_cast<sockaddr *>(&upstreamAddr), sizeof(upstreamAddr)) != 0) {
+    close(sock);
+    statusCode = 0;
+    responseBody = "{\"error\":\"api_connect_failed\"}";
+    return false;
+  }
+
+  const String requestPath = normalizeApiPath(path);
+  String request = "POST " + requestPath + " HTTP/1.1\r\n";
+  request += "Host: " + String(UPSTREAM_API_HOST) + ":" + String(UPSTREAM_API_PORT) + "\r\n";
+  request += "User-Agent: esp32-gardepro-unified/0.1\r\n";
+  request += "Content-Type: application/json\r\n";
+  request += "Accept: application/json\r\n";
+  if (strlen(UPSTREAM_API_TOKEN) > 0) {
+    request += "Authorization: Bearer " + String(UPSTREAM_API_TOKEN) + "\r\n";
+  }
+  request += "Content-Length: " + String(requestBody.length()) + "\r\n";
+  request += "Connection: close\r\n\r\n";
+  request += requestBody;
+
+  if (!sendAll(sock,
+               reinterpret_cast<const uint8_t *>(request.c_str()),
+               request.length())) {
+    close(sock);
+    statusCode = 0;
+    responseBody = "{\"error\":\"api_send_failed\"}";
+    return false;
+  }
+
+  String raw;
+  uint8_t buf[512];
+  const unsigned long start = millis();
+  while (millis() - start < 10000) {
+    const int n = recv(sock, buf, sizeof(buf), 0);
+    if (n > 0) {
+      raw.concat(reinterpret_cast<const char *>(buf), n);
+      continue;
+    }
+    if (n == 0) {
+      break;
+    }
+    cooperativeDelay(5);
+  }
+  close(sock);
+
+  if (raw.isEmpty()) {
+    statusCode = 0;
+    responseBody = "{\"error\":\"api_empty_response\"}";
+    return false;
+  }
+
+  const int headerEnd = raw.indexOf("\r\n\r\n");
+  const String headers = headerEnd >= 0 ? raw.substring(0, headerEnd) : raw;
+  responseBody = headerEnd >= 0 ? raw.substring(headerEnd + 4) : "";
+  const int firstLineEnd = headers.indexOf("\r\n");
+  const String statusLine = firstLineEnd >= 0 ? headers.substring(0, firstLineEnd) : headers;
+  const int firstSpace = statusLine.indexOf(' ');
+  const int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
+  if (firstSpace > 0 && secondSpace > firstSpace) {
+    statusCode = statusLine.substring(firstSpace + 1, secondSpace).toInt();
+  } else {
+    statusCode = 0;
+  }
+
+  Serial.printf("[upload] POST %s -> %d bytes=%u\n",
+                requestPath.c_str(),
+                statusCode,
+                static_cast<unsigned>(responseBody.length()));
+  return statusCode >= 200 && statusCode < 300;
+}
+
+bool uploadTelemetryNow(String &responseBody, int &statusCode) {
+  ++uploadAttemptCount;
+  const String payload = buildBoardTelemetryJson();
+  const bool ok = postJsonToUpstream("/api/board/telemetry", payload, responseBody, statusCode);
+  setUploadResult(ok, statusCode, ok ? "telemetry_uploaded" : responseBody);
+  enqueueUploadEvent("telemetry_upload", ok ? "manual_or_api" : "upload_failed", "{\"status_code\":" + String(statusCode) + "}", ok);
+  return ok;
+}
+
+bool uploadQueuedEventsNow(String &responseBody, int &statusCode) {
+  if (uploadEventCount == 0) {
+    statusCode = 200;
+    responseBody = "{\"ok\":true,\"inserted\":0}";
+    setUploadResult(true, statusCode, "no_events_to_upload");
+    return true;
+  }
+
+  ++uploadAttemptCount;
+  const String payload = buildEventsUploadJson();
+  const bool ok = postJsonToUpstream("/api/board/events", payload, responseBody, statusCode);
+  setUploadResult(ok, statusCode, ok ? "events_uploaded" : responseBody);
+  if (ok) {
+    clearUploadedEvents();
+  }
+  return ok;
+}
+
+String buildUploadResultJson(bool ok, int statusCode, const String &responseBody) {
+  String payload = "{";
+  payload += "\"ok\":" + String(ok ? "true" : "false");
+  payload += ",\"status_code\":" + String(statusCode);
+  payload += ",\"response\":" + jsonNullableString(responseBody);
+  payload += ",\"upload\":" + buildUploadStatusJson();
+  payload += "}";
+  return payload;
 }
 
 bool proxyCameraRequest(const String &method,
@@ -2236,6 +3301,7 @@ void handleStatus() {
   snapshotControlState(controlSnapshot);
   String payload = "{";
   payload += "\"uptime_ms\":" + String(millis());
+  payload += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
   payload += ",\"boot_count\":" + String(persistentBootCount);
   payload += ",\"boot_session_id\":" + String(bootSessionId);
   payload += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
@@ -2243,6 +3309,10 @@ void handleStatus() {
   payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   payload += ",\"halow_mac\":\"" + HaLow.macAddress() + "\"";
+  payload += ",\"psram_found\":" + String(psramFound() ? "true" : "false");
+  payload += ",\"psram_size\":" + String(ESP.getPsramSize());
+  payload += ",\"psram_free\":" + String(ESP.getFreePsram());
+  payload += ",\"chip_temperature_c\":" + String(readChipTemperatureC(), 1);
   payload += ",\"camera_ip\":\"" + CAMERA_IP.toString() + "\"";
   payload += ",\"camera_wifi_ever_connected\":" + String(cameraWifiEverConnected ? "true" : "false");
   payload += ",\"standby_requested\":" + String(standbyRequested ? "true" : "false");
@@ -2258,6 +3328,7 @@ void handleStatus() {
   payload += ",\"media_secondary_bytes\":" + String(mediaSecondaryBytes);
   payload += ",\"battery\":" + buildBatteryJson();
   payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
+  payload += ",\"upload\":" + buildUploadStatusJson();
   payload += ",\"wifi_scan_busy\":" + String(wifiScanBusy ? "true" : "false");
   payload += ",\"wifi_scan_last_count\":" + String(wifiScanLastCount);
   payload += ",\"wifi_scan_last_age_ms\":" + String(msSince(wifiScanLastMs));
@@ -2331,24 +3402,98 @@ void handleOnboardCameraCapture() {
     server.send(503, "application/json", "{\"error\":\"onboard_camera_not_ready\"}");
     return;
   }
+
+  const bool hasOneShotSettings = serverHasOnboardSensorArgs();
+  const OnboardCameraSettings scheduledSettings = snapshotOnboardCameraSettings();
+  if (hasOneShotSettings) {
+    String sensorError;
+    if (!applyOnboardCameraSensorArgs(sensorError, false)) {
+      server.send(400, "application/json", "{\"error\":\"" + jsonEscape(sensorError) + "\"}");
+      return;
+    }
+    cooperativeDelay(150);
+  }
+
   const bool ok = captureOnboardFrame();
+  bool settingsRestored = !hasOneShotSettings;
+  if (hasOneShotSettings) {
+    String restoreError;
+    settingsRestored = applyOnboardCameraSettings(scheduledSettings, restoreError);
+    if (!settingsRestored) {
+      Serial.printf("[onboard-camera] failed to restore scheduled settings: %s\n", restoreError.c_str());
+    }
+  }
+
   String payload = "{";
   payload += "\"ok\":" + String(ok ? "true" : "false");
+  payload += ",\"one_shot_settings\":" + String(hasOneShotSettings ? "true" : "false");
+  payload += ",\"settings_restored\":" + String(settingsRestored ? "true" : "false");
   payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
   payload += "}";
   server.send(ok ? 200 : 500, "application/json", payload);
 }
 
 void handleOnboardCameraConfig() {
+  bool configChanged = false;
   if (server.hasArg("enabled")) {
     const String enabled = server.arg("enabled");
     onboardCaptureEnabled = enabled == "1" || enabled == "true" || enabled == "yes";
+    configChanged = true;
   }
   if (server.hasArg("interval_ms")) {
     const unsigned long requested = server.arg("interval_ms").toInt();
     if (requested >= 5000) {
       onboardCaptureIntervalMs = requested;
+      configChanged = true;
+    } else {
+      server.send(400, "application/json", "{\"error\":\"invalid_interval_ms\"}");
+      return;
     }
+  }
+  if (server.hasArg("start") || server.hasArg("start_minute")) {
+    uint16_t requested = 0;
+    const String value = server.hasArg("start") ? server.arg("start") : server.arg("start_minute");
+    if (!parseMinuteOfDay(value, requested)) {
+      server.send(400, "application/json", "{\"error\":\"invalid_start\"}");
+      return;
+    }
+    onboardCaptureStartMinute = requested;
+    configChanged = true;
+  }
+  if (server.hasArg("end") || server.hasArg("end_minute")) {
+    uint16_t requested = 0;
+    const String value = server.hasArg("end") ? server.arg("end") : server.arg("end_minute");
+    if (!parseMinuteOfDay(value, requested)) {
+      server.send(400, "application/json", "{\"error\":\"invalid_end\"}");
+      return;
+    }
+    onboardCaptureEndMinute = requested;
+    configChanged = true;
+  }
+  if (server.hasArg("tz_offset_min")) {
+    onboardCaptureTzOffsetMin = static_cast<int16_t>(server.arg("tz_offset_min").toInt());
+    configChanged = true;
+  }
+  if (server.hasArg("epoch")) {
+    const time_t epoch = static_cast<time_t>(server.arg("epoch").toInt());
+    if (epoch < 1700000000) {
+      server.send(400, "application/json", "{\"error\":\"invalid_epoch\"}");
+      return;
+    }
+    timeval tv{};
+    tv.tv_sec = epoch;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    configChanged = true;
+  }
+  String sensorError;
+  if (!applyOnboardCameraSensorArgs(sensorError, true)) {
+    server.send(400, "application/json", "{\"error\":\"" + jsonEscape(sensorError) + "\"}");
+    return;
+  }
+  if (configChanged) {
+    clampOnboardConfig();
+    saveOnboardConfig();
   }
   server.send(200, "application/json", buildOnboardCameraStatusJson());
 }
@@ -2373,6 +3518,43 @@ void handleWifiScan() {
     return;
   }
   server.send(200, "application/json", payload);
+}
+
+void handleUploadStatus() {
+  server.send(200, "application/json", buildUploadStatusJson());
+}
+
+void handleUploadTelemetry() {
+  String body;
+  int statusCode = 0;
+  const bool ok = uploadTelemetryNow(body, statusCode);
+  server.send(ok ? 200 : 502, "application/json", buildUploadResultJson(ok, statusCode, body));
+}
+
+void handleUploadEvents() {
+  String body;
+  int statusCode = 0;
+  const bool ok = uploadQueuedEventsNow(body, statusCode);
+  server.send(ok ? 200 : 502, "application/json", buildUploadResultJson(ok, statusCode, body));
+}
+
+void handleUploadAll() {
+  String telemetryBody;
+  int telemetryStatus = 0;
+  const bool telemetryOk = uploadTelemetryNow(telemetryBody, telemetryStatus);
+
+  String eventsBody;
+  int eventsStatus = 0;
+  const bool eventsOk = uploadQueuedEventsNow(eventsBody, eventsStatus);
+
+  String payload = "{";
+  payload += "\"ok\":" + String((telemetryOk && eventsOk) ? "true" : "false");
+  payload += ",\"telemetry\":";
+  payload += buildUploadResultJson(telemetryOk, telemetryStatus, telemetryBody);
+  payload += ",\"events\":";
+  payload += buildUploadResultJson(eventsOk, eventsStatus, eventsBody);
+  payload += "}";
+  server.send((telemetryOk && eventsOk) ? 200 : 502, "application/json", payload);
 }
 
 void handleCameraRawGet() {
@@ -2741,6 +3923,10 @@ void startHttpServer() {
   server.on("/onboard/capture", HTTP_POST, handleOnboardCameraCapture);
   server.on("/onboard/config", HTTP_POST, handleOnboardCameraConfig);
   server.on("/scan/wifi", HTTP_GET, handleWifiScan);
+  server.on("/upload/status", HTTP_GET, handleUploadStatus);
+  server.on("/upload/telemetry", HTTP_POST, handleUploadTelemetry);
+  server.on("/upload/events", HTTP_POST, handleUploadEvents);
+  server.on("/upload/all", HTTP_POST, handleUploadAll);
   server.on("/camera/info/1", HTTP_GET, handleCameraInfo1);
   server.on("/camera/info/2", HTTP_GET, handleCameraInfo2);
   server.on("/camera/info/3", HTTP_GET, handleCameraInfo3);
@@ -2943,6 +4129,53 @@ void handleSerialCommand(const String &line) {
                   buildOnboardCameraStatusJson().c_str());
     return;
   }
+  if (cmd.startsWith("onboard_config")) {
+    String args = cmd.substring(strlen("onboard_config"));
+    args.trim();
+    if (args.isEmpty()) {
+      Serial.println(buildOnboardCameraStatusJson());
+      return;
+    }
+    bool allOk = true;
+    while (!args.isEmpty()) {
+      int space = args.indexOf(' ');
+      String token = space >= 0 ? args.substring(0, space) : args;
+      args = space >= 0 ? args.substring(space + 1) : "";
+      args.trim();
+      token.trim();
+      if (token.isEmpty()) {
+        continue;
+      }
+      const int equals = token.indexOf('=');
+      if (equals <= 0) {
+        Serial.printf("[onboard-config] invalid token=%s\n", token.c_str());
+        allOk = false;
+        continue;
+      }
+      String key = token.substring(0, equals);
+      String value = token.substring(equals + 1);
+      key.toLowerCase();
+      String error;
+      const bool ok = applyOnboardCameraSetting(key, value, error);
+      if (!ok) {
+        Serial.printf("[onboard-config] %s=%s failed error=%s\n",
+                      key.c_str(),
+                      value.c_str(),
+                      error.c_str());
+        allOk = false;
+      } else {
+        Serial.printf("[onboard-config] %s=%s ok\n", key.c_str(), value.c_str());
+      }
+    }
+    Serial.printf("[onboard-config] result=%s %s\n",
+                  allOk ? "ok" : "partial_failure",
+                  buildOnboardCameraStatusJson().c_str());
+    return;
+  }
+  if (cmd == "onboard_dump" || cmd == "onboard_dump fresh") {
+    dumpOnboardJpegBase64(cmd.endsWith("fresh"));
+    return;
+  }
   if (cmd == "wifi_scan") {
     String payload;
     String error;
@@ -2951,6 +4184,38 @@ void handleSerialCommand(const String &line) {
     } else {
       Serial.printf("[wifi-scan] failed error=%s\n", error.c_str());
     }
+    return;
+  }
+  if (cmd == "upload_status") {
+    Serial.println(buildUploadStatusJson());
+    return;
+  }
+  if (cmd == "upload_telemetry") {
+    String body;
+    int statusCode = 0;
+    const bool ok = uploadTelemetryNow(body, statusCode);
+    Serial.println(buildUploadResultJson(ok, statusCode, body));
+    return;
+  }
+  if (cmd == "upload_events") {
+    String body;
+    int statusCode = 0;
+    const bool ok = uploadQueuedEventsNow(body, statusCode);
+    Serial.println(buildUploadResultJson(ok, statusCode, body));
+    return;
+  }
+  if (cmd == "upload_all") {
+    String telemetryBody;
+    int telemetryStatus = 0;
+    const bool telemetryOk = uploadTelemetryNow(telemetryBody, telemetryStatus);
+    String eventsBody;
+    int eventsStatus = 0;
+    const bool eventsOk = uploadQueuedEventsNow(eventsBody, eventsStatus);
+    Serial.printf("[upload-all] telemetry=%s status=%d events=%s status=%d\n",
+                  telemetryOk ? "ok" : "failed",
+                  telemetryStatus,
+                  eventsOk ? "ok" : "failed",
+                  eventsStatus);
     return;
   }
   if (cmd == "selftest") {
@@ -3049,7 +4314,10 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("GardePro dual-radio bridge starting");
+  WiFi.setHostname(BOARD_HOSTNAME);
+  Serial.printf("[network] hostname=%s\n", BOARD_HOSTNAME);
   initBootIdentity();
+  enqueueUploadEvent("boot", "startup", "{\"firmware\":\"" + jsonEscape(FIRMWARE_VERSION) + "\"}", true);
 
   pinMode(BAT_ADC_CTRL_PIN, OUTPUT);
   digitalWrite(BAT_ADC_CTRL_PIN, LOW);
@@ -3060,6 +4328,7 @@ void setup() {
   Serial.printf("[battery] %s\n", buildBatteryJson().c_str());
 
   onboardFrameMutex = xSemaphoreCreateMutex();
+  loadOnboardConfig();
   initOnboardCamera();
   if (onboardCaptureTaskHandle == nullptr) {
     xTaskCreatePinnedToCore(onboardCaptureTask,
