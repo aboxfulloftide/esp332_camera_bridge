@@ -1,6 +1,6 @@
 # Server-Side Plan
 
-This document defines the next implementation phase on top of the validated bridge and camera-control layer.
+This document tracks the browser/API server that sits on top of the validated bridge and camera-control layer.
 
 ## Goal
 
@@ -14,6 +14,12 @@ Build a local web service that hosts a page where a user can:
 - browse and download photos/videos
 
 The intended runtime model remains short-lived sessions, not permanent camera connectivity.
+
+Current status:
+
+- `gardepro_web_server.py` is the first Flask implementation of this server
+- it serves the browser UI from `templates/` and `static/`
+- it uses `gardepro_server_api.py` and `gardepro_server_jobs.py` for bridge/session work
 
 ## Product Shape
 
@@ -68,7 +74,7 @@ Exceptions:
 
 ## Server API Surface
 
-Recommended first-pass routes:
+Implemented/current first-pass routes:
 
 ### Health / Status
 
@@ -91,6 +97,12 @@ Recommended first-pass routes:
 
 - `GET /api/live/status`
   Returns whether live view is active and whether the tunnel is up.
+
+Current Flask behavior:
+
+- `POST /api/live/start` returns `stream_active` and `tunnel_connected`
+- `GET /api/live/status` returns `stream_active`, `tunnel_connected`, and `session_open`
+- the browser currently uses the tunnel receiver's local SDP/player path for preview and playback
 
 ### Settings
 
@@ -120,6 +132,12 @@ Recommended first-pass routes:
 - `DELETE /api/media/:id`
   Optional admin-only delete route.
 
+Current Flask behavior:
+
+- download/thumb routes require a `type=photo|video` query argument so the server can resolve the correct file extension
+- downloads are streamed through a temporary file on the server
+- current media delete and gallery helpers still rely on the bridge gallery listing and verified delete path
+
 ### Actions
 
 - `POST /api/actions/take-picture`
@@ -138,6 +156,11 @@ Recommended first-pass routes:
 
 - `POST /api/admin/format-sd`
   Explicit destructive admin-only route.
+
+Current Flask behavior:
+
+- `GET /api/admin/clock` is implemented and reads the direct camera clock via `get_info(4)`
+- `POST /api/admin/set-clock` and the format routes are still planned in the Flask server
 
 ## Response Normalization
 

@@ -23,6 +23,7 @@ This matches your stated board usage:
 - exposes a small local HTTP bridge on port `18080`
 - proxies confirmed camera HTTP routes to `192.168.8.1:8080`
 - listens for UDP media on local ports `25748/25749`
+- reads a DHT11 temperature/humidity sensor on `GPIO13`
 - can open a single outbound TCP tunnel to the upstream receiver:
   - `192.168.1.39:6000`
   - protocol magic: `GPRT`
@@ -159,8 +160,9 @@ In this mode it:
   - `25749`
 - exposes a serial console with:
   - `help`
-  - `status`
-  - `selftest`
+- `status`
+- `dht`
+- `selftest`
   - `http <path>`
   - `httpm <METHOD> <path>`
   - `rtsp_probe`

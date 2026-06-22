@@ -70,6 +70,8 @@ static const uint16_t BRIDGE_HTTP_PORT = 18080;
 // live-view negotiation behavior for your deployment.
 static const uint16_t LOCAL_MEDIA_PORT_PRIMARY = 25748;
 static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
+static const uint8_t DHT11_DATA_PIN = 13;
+static const unsigned long DHT11_MIN_SAMPLE_INTERVAL_MS = 2500;
 
 // Upstream relay target on the HaLow network.
 static const IPAddress UPSTREAM_MEDIA_IP(192, 168, 1, 39);
@@ -211,6 +213,20 @@ static UdpInspectorStats udpPrimaryStats = {"primary", LOCAL_MEDIA_PORT_PRIMARY,
 static UdpInspectorStats udpSecondaryStats = {"secondary", LOCAL_MEDIA_PORT_SECONDARY, 0, 0, IPAddress(), 0, 0};
 static String lastStreamSdp;
 static String lastRtspSessionId;
+
+struct Dht11Reading {
+  bool valid;
+  bool attached;
+  float temperatureC;
+  float humidityPercent;
+  unsigned long lastReadMs;
+  unsigned long lastAttemptMs;
+  uint32_t samples;
+  uint32_t failures;
+  char lastError[48];
+};
+
+static Dht11Reading dht11Reading = {false, false, 0.0f, 0.0f, 0, 0, 0, 0, "not_read"};
 
 struct TunnelFrameHeader {
   char magic[4];
@@ -589,6 +605,118 @@ String jsonEscape(const String &input) {
     }
   }
   return output;
+}
+
+String jsonBool(bool value) {
+  return value ? "true" : "false";
+}
+
+String jsonNumber(float value, uint8_t decimals = 1) {
+  char buffer[24];
+  snprintf(buffer, sizeof(buffer), "%.*f", decimals, static_cast<double>(value));
+  return String(buffer);
+}
+
+String jsonMaybeNumber(bool enabled, float value, uint8_t decimals = 1) {
+  return enabled ? jsonNumber(value, decimals) : "null";
+}
+
+void dht11SetError(const char *message) {
+  snprintf(dht11Reading.lastError,
+           sizeof(dht11Reading.lastError),
+           "%s",
+           message == nullptr ? "" : message);
+}
+
+bool dht11ReadFrame(uint8_t data[5], char *error, size_t errorSize) {
+  memset(data, 0, 5);
+
+  pinMode(DHT11_DATA_PIN, OUTPUT);
+  digitalWrite(DHT11_DATA_PIN, HIGH);
+  cooperativeDelay(2);
+
+  digitalWrite(DHT11_DATA_PIN, LOW);
+  delay(18);
+  digitalWrite(DHT11_DATA_PIN, HIGH);
+  delayMicroseconds(30);
+  pinMode(DHT11_DATA_PIN, INPUT_PULLUP);
+  delayMicroseconds(40);
+
+  if (pulseIn(DHT11_DATA_PIN, LOW, 150) == 0) {
+    snprintf(error, errorSize, "no_response_low");
+    return false;
+  }
+  if (pulseIn(DHT11_DATA_PIN, HIGH, 150) == 0) {
+    snprintf(error, errorSize, "no_response_high");
+    return false;
+  }
+
+  for (int bit = 0; bit < 40; ++bit) {
+    if (pulseIn(DHT11_DATA_PIN, LOW, 150) == 0) {
+      snprintf(error, errorSize, "bit_low_timeout");
+      return false;
+    }
+    const unsigned long highWidth = pulseIn(DHT11_DATA_PIN, HIGH, 150);
+    if (highWidth == 0) {
+      snprintf(error, errorSize, "bit_high_timeout");
+      return false;
+    }
+    data[bit / 8] <<= 1;
+    if (highWidth > 45) {
+      data[bit / 8] |= 1;
+    }
+  }
+
+  const uint8_t checksum = static_cast<uint8_t>(data[0] + data[1] + data[2] + data[3]);
+  if (checksum != data[4]) {
+    snprintf(error, errorSize, "checksum_mismatch");
+    return false;
+  }
+
+  return true;
+}
+
+bool refreshDht11Reading(bool force = false) {
+  const unsigned long now = millis();
+  if (!force && dht11Reading.valid && dht11Reading.lastReadMs != 0 &&
+      (now - dht11Reading.lastReadMs) < DHT11_MIN_SAMPLE_INTERVAL_MS) {
+    return true;
+  }
+
+  dht11Reading.lastAttemptMs = now;
+  uint8_t data[5];
+  char error[48];
+  if (!dht11ReadFrame(data, error, sizeof(error))) {
+    dht11Reading.failures++;
+    dht11Reading.attached = dht11Reading.samples > 0;
+    dht11SetError(error);
+    return false;
+  }
+
+  dht11Reading.temperatureC = static_cast<float>(data[2]) + (static_cast<float>(data[3]) / 10.0f);
+  dht11Reading.humidityPercent = static_cast<float>(data[0]) + (static_cast<float>(data[1]) / 10.0f);
+  dht11Reading.valid = true;
+  dht11Reading.attached = true;
+  dht11Reading.samples++;
+  dht11Reading.lastReadMs = now;
+  dht11SetError("ok");
+  return true;
+}
+
+String buildTemperatureStatusJson() {
+  refreshDht11Reading(false);
+  String payload = "\"temperature\":{";
+  payload += "\"probe_attached\":" + jsonBool(dht11Reading.attached);
+  payload += ",\"sensor\":" + String(dht11Reading.valid ? "\"DHT11\"" : "null");
+  payload += ",\"temperature_c\":" + jsonMaybeNumber(dht11Reading.valid, dht11Reading.temperatureC);
+  payload += ",\"humidity_percent\":" + jsonMaybeNumber(dht11Reading.valid, dht11Reading.humidityPercent);
+  payload += ",\"last_read_ms\":" + String(msSince(dht11Reading.lastReadMs));
+  payload += ",\"last_attempt_ms\":" + String(msSince(dht11Reading.lastAttemptMs));
+  payload += ",\"samples\":" + String(dht11Reading.samples);
+  payload += ",\"failures\":" + String(dht11Reading.failures);
+  payload += ",\"last_error\":\"" + jsonEscape(String(dht11Reading.lastError)) + "\"";
+  payload += "}";
+  return payload;
 }
 
 const char *controlActionName(ControlAction action) {
@@ -1088,6 +1216,7 @@ void printSerialHelp() {
   Serial.println("  bringup");
   Serial.println("  halow_up");
   Serial.println("  status");
+  Serial.println("  dht");
   Serial.println("  selftest");
   Serial.println("  http <path>");
   Serial.println("  httpm <METHOD> <path>");
@@ -1828,6 +1957,7 @@ bool runBringupSequence() {
 
 void printRuntimeStatus() {
   refreshWifiState();
+  refreshDht11Reading(false);
   Serial.printf("[status] wifi=%s ip=%s ble_stage=%s ble_ok=%s notify_count=%u last=%s\n",
                 wifiConnected ? "up" : "down",
                 WiFi.localIP().toString().c_str(),
@@ -1876,6 +2006,16 @@ void printRuntimeStatus() {
                 idleRecoveryAttempts,
                 httpKeepaliveFailures,
                 msSince(lastIdleRecoveryMs));
+  Serial.printf("[status] dht11 pin=%u attached=%s temp=%sC humidity=%s%% last_read_ms=%lu last_attempt_ms=%lu samples=%u failures=%u last_error=%s\n",
+                DHT11_DATA_PIN,
+                dht11Reading.attached ? "yes" : "no",
+                dht11Reading.valid ? jsonNumber(dht11Reading.temperatureC).c_str() : "-",
+                dht11Reading.valid ? jsonNumber(dht11Reading.humidityPercent, 0).c_str() : "-",
+                msSince(dht11Reading.lastReadMs),
+                msSince(dht11Reading.lastAttemptMs),
+                dht11Reading.samples,
+                dht11Reading.failures,
+                dht11Reading.lastError);
 }
 
 void runHttpPathFromSerial(const String &path) {
@@ -1980,6 +2120,8 @@ void handleStatus() {
   payload += ",\"ble_recent_devices\":" + buildBleRecentDevicesJson();
   payload += ",\"ble_notify_count\":" + String(bleNotifyCount);
   payload += ",\"ble_last_notify\":\"" + jsonEscape(bleLastNotifyText) + "\"";
+  payload += ",";
+  payload += buildTemperatureStatusJson();
   payload += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
   payload += ",\"control_pending\":\"" + String(controlActionName(controlSnapshot.pendingAction)) + "\"";
   payload += ",\"control_action\":\"" + String(controlActionName(controlSnapshot.activeAction)) + "\"";
@@ -2537,6 +2679,17 @@ void handleSerialCommand(const String &line) {
     printRuntimeStatus();
     return;
   }
+  if (cmd == "dht") {
+    const bool ok = refreshDht11Reading(true);
+    Serial.printf("[dht11] pin=%u ok=%s attached=%s temp=%sC humidity=%s%% last_error=%s\n",
+                  DHT11_DATA_PIN,
+                  ok ? "yes" : "no",
+                  dht11Reading.attached ? "yes" : "no",
+                  dht11Reading.valid ? jsonNumber(dht11Reading.temperatureC).c_str() : "-",
+                  dht11Reading.valid ? jsonNumber(dht11Reading.humidityPercent, 0).c_str() : "-",
+                  dht11Reading.lastError);
+    return;
+  }
   if (cmd == "selftest") {
     runCameraHttpSelfTest();
     return;
@@ -2633,6 +2786,9 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("GardePro dual-radio bridge starting");
+  pinMode(DHT11_DATA_PIN, INPUT_PULLUP);
+  Serial.printf("[dht11] data_pin=%u\n", DHT11_DATA_PIN);
+  refreshDht11Reading(true);
 
   Serial.println("Pre-initializing HaLow transport");
   HaLow.onEvent(onHaLowEvent);
