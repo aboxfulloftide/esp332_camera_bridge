@@ -14,6 +14,9 @@
 #define UPSTREAM_API_PREFIX "/trail_cam"
 // Optional bearer token. Leave empty when the local API does not require auth.
 #define UPSTREAM_API_TOKEN ""
+// Optional live media tunnel override. Defaults to UPSTREAM_API_HOST.
+#define UPSTREAM_TUNNEL_HOST UPSTREAM_API_HOST
+#define UPSTREAM_TUNNEL_PORT 6000
 
 // Onboard local ESP camera defaults. Runtime updates through /onboard/config
 // persist in NVS after first boot.

@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/time.h>
+#include <errno.h>
+#include <fcntl.h>
 
 extern "C" {
 #include <lwip/sockets.h>
@@ -75,12 +77,13 @@ static const uint16_t CAMERA_RTSP_PORT = 554;
 #ifndef UPSTREAM_API_TOKEN
 #define UPSTREAM_API_TOKEN ""
 #endif
+#ifndef UPSTREAM_TUNNEL_HOST
+#define UPSTREAM_TUNNEL_HOST UPSTREAM_API_HOST
+#endif
+#ifndef UPSTREAM_TUNNEL_PORT
+#define UPSTREAM_TUNNEL_PORT 6000
+#endif
 static const char *HALOW_REGION = "US";
-static const IPAddress HALOW_LOCAL_IP(192, 168, 1, 30);
-static const IPAddress HALOW_GATEWAY_IP(192, 168, 1, 1);
-static const IPAddress HALOW_SUBNET_MASK(255, 255, 255, 0);
-static const IPAddress HALOW_DNS1(192, 168, 1, 1);
-static const IPAddress HALOW_DNS2(8, 8, 8, 8);
 
 // HTTP proxy served locally on the board.
 static const uint16_t BRIDGE_HTTP_PORT = 18080;
@@ -92,9 +95,8 @@ static const uint16_t BRIDGE_HTTP_PORT = 18080;
 static const uint16_t LOCAL_MEDIA_PORT_PRIMARY = 25748;
 static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 
-// Upstream relay target on the HaLow network.
-static const IPAddress UPSTREAM_MEDIA_IP(192, 168, 1, 39);
-static const uint16_t UPSTREAM_TUNNEL_PORT = 6000;
+// Upstream relay target on the HaLow network. Defaults to the same host as the
+// API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
 static const char *FIRMWARE_VERSION = "0.1.0";
@@ -179,6 +181,7 @@ uint32_t tunnelBytesSent = 0;
 uint32_t tunnelSendFailures = 0;
 unsigned long tunnelLastConnectMs = 0;
 bool halowInitialized = false;
+bool bleInitialized = false;
 static WiFiClient cameraRtspClient;
 bool rtspSessionOpen = false;
 String rtspPlayUrl;
@@ -194,12 +197,16 @@ unsigned long lastIdleRecoveryMs = 0;
 unsigned long streamSessionStartedMs = 0;
 unsigned long lastStreamStopMs = 0;
 static const unsigned long RTSP_KEEPALIVE_INTERVAL_MS = 5000;
+static const unsigned long TUNNEL_CONNECT_TIMEOUT_MS = 3000;
 static const unsigned long BLE_KEEPALIVE_INTERVAL_MS = 20000;
 static const unsigned long HTTP_KEEPALIVE_INTERVAL_MS = 15000;
 static const unsigned long TUNNEL_RECONNECT_INTERVAL_MS = 2000;
 static const unsigned long STREAM_STALL_TIMEOUT_MS = 4000;
 static const unsigned long STREAM_RECOVERY_COOLDOWN_MS = 10000;
 static const unsigned long IDLE_WIFI_RECOVERY_COOLDOWN_MS = 30000;
+static const unsigned long CAMERA_SESSION_DEFAULT_LEASE_MS = 120000;
+static const unsigned long CAMERA_SESSION_MAX_LEASE_MS = 600000;
+static const unsigned long CAMERA_IDLE_HOLD_MS = 120000;
 static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
 static const BaseType_t CONTROL_WORKER_CORE = 0;
 static const uint8_t BLE_SCAN_ATTEMPTS = 3;
@@ -209,15 +216,46 @@ static const uint8_t BLE_PASSIVE_SCAN_ATTEMPTS = 2;
 static const uint16_t BLE_PASSIVE_SCAN_WINDOW_SEC = 8;
 static const uint16_t BLE_SCAN_INTERVAL_MS = 160;
 static const uint16_t BLE_SCAN_WINDOW_MS = 80;
+static const unsigned long BLE_INIT_WARMUP_MS = 5000;
+static const unsigned long BLE_REUSE_WARMUP_MS = 750;
+static const unsigned long BLE_SCAN_CONNECT_SETTLE_MS = 500;
+static const unsigned long BLE_CONNECT_RETRY_DELAY_MS = 1000;
+static const uint8_t BLE_CONNECT_ATTEMPTS = 3;
+static const uint16_t BLE_CONNECT_TIMEOUT_MS = 15000;
 static const uint8_t BLE_WAKE_PULSE_ATTEMPTS = 3;
 static const unsigned long BLE_WAKE_PULSE_DELAY_MS = 350;
 static const unsigned long BRINGUP_HOTSPOT_WAIT_MS = 20000;
 static const unsigned long BRINGUP_HOTSPOT_POLL_MS = 3000;
+static const unsigned long BRINGUP_HOTSPOT_FAST_WINDOW_MS = 10000;
+static const unsigned long BRINGUP_HOTSPOT_FAST_POLL_MS = 1000;
 static const uint32_t UDP_LOG_FIRST_PACKETS = 8;
 static const uint32_t UDP_LOG_EVERY_N_PACKETS = 120;
 uint32_t streamRecoveryAttempts = 0;
 uint32_t idleRecoveryAttempts = 0;
 uint32_t httpKeepaliveFailures = 0;
+String lastStreamStartStage = "idle";
+String lastStreamStartMessage = "";
+String lastStreamPlayUrl = "";
+unsigned long lastStreamStartElapsedMs = 0;
+unsigned long lastStreamStartMs = 0;
+int lastStreamDescribeStatus = 0;
+int lastStreamSetupStatus = 0;
+int lastStreamPlayStatus = 0;
+int lastTunnelConnectError = 0;
+int bleLastConnectError = 0;
+uint8_t bleConnectAttempts = 0;
+bool cameraSessionLeaseActive = false;
+bool cameraSessionLeaseStandbyOnExpire = true;
+bool cameraSessionLeaseExpiredStandbySent = false;
+unsigned long cameraSessionLeaseStartedMs = 0;
+unsigned long cameraSessionLeaseExpiresMs = 0;
+unsigned long cameraSessionLeaseDurationMs = 0;
+unsigned long lastCameraRequestMs = 0;
+unsigned long lastBringupElapsedMs = 0;
+unsigned long lastBleWakeElapsedMs = 0;
+unsigned long lastHotspotWaitElapsedMs = 0;
+unsigned long lastWifiJoinElapsedMs = 0;
+unsigned long lastCameraHttpElapsedMs = 0;
 SemaphoreHandle_t tunnelWriteMutex = nullptr;
 TaskHandle_t controlWorkerTaskHandle = nullptr;
 
@@ -229,12 +267,25 @@ unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
 uint16_t onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
 uint16_t onboardCaptureEndMinute = ONBOARD_CAPTURE_END_MINUTE;
 int16_t onboardCaptureTzOffsetMin = 0;
+static const unsigned long ONBOARD_SCHEDULER_TICK_MS = 1000;
+static const unsigned long ONBOARD_TIMELAPSE_DEFAULT_INTERVAL_MS = 300000;
+static const unsigned long ONBOARD_TIMELAPSE_MIN_INTERVAL_MS = 5000;
+static const unsigned long ONBOARD_TIMELAPSE_MAX_DURATION_MS = 7UL * 24UL * 60UL * 60UL * 1000UL;
+bool onboardTimelapseActive = false;
+unsigned long onboardTimelapseStartedMs = 0;
+unsigned long onboardTimelapseDurationMs = 0;
+unsigned long onboardTimelapseIntervalMs = ONBOARD_TIMELAPSE_DEFAULT_INTERVAL_MS;
+unsigned long onboardTimelapseLastCaptureMs = 0;
+uint32_t onboardTimelapseCaptureCount = 0;
+uint32_t onboardTimelapseCompletedCount = 0;
+String onboardTimelapseLastState = "idle";
 uint8_t *onboardLatestJpeg = nullptr;
 size_t onboardLatestJpegLen = 0;
 uint32_t onboardCaptureCount = 0;
 uint32_t onboardCaptureFailures = 0;
 uint32_t onboardCaptureScheduleSkips = 0;
 unsigned long onboardLastCaptureMs = 0;
+unsigned long onboardLastScheduleAttemptMs = 0;
 framesize_t onboardFrameSize = FRAMESIZE_UXGA;
 int onboardJpegQuality = 8;
 int onboardBrightness = 0;
@@ -412,6 +463,68 @@ int getTunnelSocketSnapshot() {
   return fd;
 }
 
+bool connectSocketWithTimeout(int sock, const sockaddr_in &addr, unsigned long timeoutMs, int &errorCode) {
+  errorCode = 0;
+  const int flags = fcntl(sock, F_GETFL, 0);
+  if (flags >= 0) {
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  const int rc = connect(sock,
+                         reinterpret_cast<const sockaddr *>(&addr),
+                         sizeof(addr));
+  if (rc == 0) {
+    if (flags >= 0) {
+      fcntl(sock, F_SETFL, flags);
+    }
+    return true;
+  }
+  if (errno != EINPROGRESS) {
+    errorCode = errno;
+    if (flags >= 0) {
+      fcntl(sock, F_SETFL, flags);
+    }
+    return false;
+  }
+
+  fd_set writeSet;
+  FD_ZERO(&writeSet);
+  FD_SET(sock, &writeSet);
+  timeval timeout{};
+  timeout.tv_sec = timeoutMs / 1000UL;
+  timeout.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000UL) * 1000UL);
+  const int selected = select(sock + 1, nullptr, &writeSet, nullptr, &timeout);
+  if (selected <= 0) {
+    errorCode = selected == 0 ? ETIMEDOUT : errno;
+    if (flags >= 0) {
+      fcntl(sock, F_SETFL, flags);
+    }
+    return false;
+  }
+
+  int socketError = 0;
+  socklen_t socketErrorLen = sizeof(socketError);
+  if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLen) != 0) {
+    errorCode = errno;
+    if (flags >= 0) {
+      fcntl(sock, F_SETFL, flags);
+    }
+    return false;
+  }
+  if (socketError != 0) {
+    errorCode = socketError;
+    if (flags >= 0) {
+      fcntl(sock, F_SETFL, flags);
+    }
+    return false;
+  }
+
+  if (flags >= 0) {
+    fcntl(sock, F_SETFL, flags);
+  }
+  return true;
+}
+
 void setTunnelSocketState(int fd, bool connected) {
   portENTER_CRITICAL(&tunnelState.lock);
   tunnelState.socketFd = fd;
@@ -552,7 +665,7 @@ bool sendBoardRegistration() {
 
   sockaddr_in upstreamAddr{};
   upstreamAddr.sin_family = AF_INET;
-  upstreamAddr.sin_addr.s_addr = inet_addr(UPSTREAM_MEDIA_IP.toString().c_str());
+  upstreamAddr.sin_addr.s_addr = inet_addr(UPSTREAM_TUNNEL_HOST);
   upstreamAddr.sin_port = htons(UPSTREAM_TUNNEL_PORT);
 
   if (connect(sock, reinterpret_cast<sockaddr *>(&upstreamAddr), sizeof(upstreamAddr)) != 0) {
@@ -574,23 +687,27 @@ bool sendBoardRegistration() {
 
 bool connectTunnelSocket() {
   closeTunnelSocket();
+  lastTunnelConnectError = 0;
 
   int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock < 0) {
     Serial.println("[tunnel] socket create failed");
+    lastTunnelConnectError = errno;
     return false;
   }
 
   sockaddr_in upstreamAddr{};
   upstreamAddr.sin_family = AF_INET;
-  upstreamAddr.sin_addr.s_addr = inet_addr(UPSTREAM_MEDIA_IP.toString().c_str());
+  upstreamAddr.sin_addr.s_addr = inet_addr(UPSTREAM_TUNNEL_HOST);
   upstreamAddr.sin_port = htons(UPSTREAM_TUNNEL_PORT);
 
   Serial.printf("[tunnel] connecting to %s:%u\n",
-                UPSTREAM_MEDIA_IP.toString().c_str(),
+                UPSTREAM_TUNNEL_HOST,
                 UPSTREAM_TUNNEL_PORT);
-  if (connect(sock, reinterpret_cast<sockaddr *>(&upstreamAddr), sizeof(upstreamAddr)) != 0) {
-    Serial.println("[tunnel] connect failed");
+  if (!connectSocketWithTimeout(sock, upstreamAddr, TUNNEL_CONNECT_TIMEOUT_MS, lastTunnelConnectError)) {
+    Serial.printf("[tunnel] connect failed error=%d timeout_ms=%lu\n",
+                  lastTunnelConnectError,
+                  TUNNEL_CONNECT_TIMEOUT_MS);
     close(sock);
     return false;
   }
@@ -695,6 +812,125 @@ unsigned long msSince(unsigned long timestampMs) {
   return millis() - timestampMs;
 }
 
+bool cameraSessionLeaseExpired(unsigned long nowMs = millis()) {
+  return cameraSessionLeaseActive &&
+         cameraSessionLeaseExpiresMs > 0 &&
+         static_cast<long>(nowMs - cameraSessionLeaseExpiresMs) >= 0;
+}
+
+unsigned long cameraSessionLeaseRemainingMs(unsigned long nowMs = millis()) {
+  if (!cameraSessionLeaseActive || cameraSessionLeaseExpiresMs == 0 ||
+      cameraSessionLeaseExpired(nowMs)) {
+    return 0;
+  }
+  return cameraSessionLeaseExpiresMs - nowMs;
+}
+
+bool cameraIdleHoldActive(unsigned long nowMs = millis()) {
+  return lastCameraRequestMs > 0 && nowMs - lastCameraRequestMs < CAMERA_IDLE_HOLD_MS;
+}
+
+void refreshCameraSessionLease() {
+  if (cameraSessionLeaseExpired()) {
+    cameraSessionLeaseActive = false;
+    cameraSessionLeaseExpiredStandbySent = false;
+  }
+}
+
+void markCameraActivity() {
+  lastCameraRequestMs = millis();
+  if (cameraSessionLeaseActive) {
+    cameraSessionLeaseExpiresMs = lastCameraRequestMs + cameraSessionLeaseDurationMs;
+    cameraSessionLeaseExpiredStandbySent = false;
+  }
+}
+
+void startCameraSessionLease(unsigned long durationMs, bool standbyOnExpire) {
+  if (durationMs == 0) {
+    durationMs = CAMERA_SESSION_DEFAULT_LEASE_MS;
+  }
+  if (durationMs > CAMERA_SESSION_MAX_LEASE_MS) {
+    durationMs = CAMERA_SESSION_MAX_LEASE_MS;
+  }
+  const unsigned long nowMs = millis();
+  cameraSessionLeaseActive = true;
+  cameraSessionLeaseStandbyOnExpire = standbyOnExpire;
+  cameraSessionLeaseExpiredStandbySent = false;
+  cameraSessionLeaseStartedMs = nowMs;
+  cameraSessionLeaseDurationMs = durationMs;
+  cameraSessionLeaseExpiresMs = nowMs + durationMs;
+  lastCameraRequestMs = nowMs;
+  standbyRequested = false;
+}
+
+void releaseCameraSessionLease() {
+  cameraSessionLeaseActive = false;
+  cameraSessionLeaseExpiresMs = 0;
+  cameraSessionLeaseDurationMs = 0;
+  cameraSessionLeaseExpiredStandbySent = false;
+}
+
+String buildCameraSessionJson() {
+  refreshCameraSessionLease();
+  String payload = "{";
+  payload += "\"lease_active\":" + String(cameraSessionLeaseActive ? "true" : "false");
+  payload += ",\"lease_remaining_ms\":" + String(cameraSessionLeaseRemainingMs());
+  payload += ",\"lease_duration_ms\":" + String(cameraSessionLeaseDurationMs);
+  payload += ",\"lease_started_age_ms\":" + String(msSince(cameraSessionLeaseStartedMs));
+  payload += ",\"lease_standby_on_expire\":" + String(cameraSessionLeaseStandbyOnExpire ? "true" : "false");
+  payload += ",\"idle_hold_active\":" + String(cameraIdleHoldActive() ? "true" : "false");
+  payload += ",\"idle_hold_ms\":" + String(CAMERA_IDLE_HOLD_MS);
+  payload += ",\"last_camera_request_age_ms\":" + String(msSince(lastCameraRequestMs));
+  payload += "}";
+  return payload;
+}
+
+String buildTimingJson() {
+  String payload = "{";
+  payload += "\"last_bringup_elapsed_ms\":" + String(lastBringupElapsedMs);
+  payload += ",\"last_ble_wake_elapsed_ms\":" + String(lastBleWakeElapsedMs);
+  payload += ",\"last_hotspot_wait_elapsed_ms\":" + String(lastHotspotWaitElapsedMs);
+  payload += ",\"last_wifi_join_elapsed_ms\":" + String(lastWifiJoinElapsedMs);
+  payload += ",\"last_camera_http_elapsed_ms\":" + String(lastCameraHttpElapsedMs);
+  payload += "}";
+  return payload;
+}
+
+String buildStreamStatusJson() {
+  String payload = "{";
+  payload += "\"last_stage\":\"" + jsonEscape(lastStreamStartStage) + "\"";
+  payload += ",\"last_message\":\"" + jsonEscape(lastStreamStartMessage) + "\"";
+  payload += ",\"last_elapsed_ms\":" + String(lastStreamStartElapsedMs);
+  payload += ",\"last_started_age_ms\":" + String(msSince(lastStreamStartMs));
+  payload += ",\"describe_status\":" + String(lastStreamDescribeStatus);
+  payload += ",\"setup_status\":" + String(lastStreamSetupStatus);
+  payload += ",\"play_status\":" + String(lastStreamPlayStatus);
+  payload += ",\"play_url\":\"" + jsonEscape(lastStreamPlayUrl) + "\"";
+  payload += ",\"tunnel_target\":\"" + jsonEscape(String(UPSTREAM_TUNNEL_HOST) + ":" + String(UPSTREAM_TUNNEL_PORT)) + "\"";
+  payload += ",\"tunnel_connect_error\":" + String(lastTunnelConnectError);
+  payload += ",\"tunnel_packets_sent\":" + String(tunnelPacketsSent);
+  payload += ",\"tunnel_bytes_sent\":" + String(tunnelBytesSent);
+  payload += ",\"tunnel_send_failures\":" + String(tunnelSendFailures);
+  payload += ",\"udp_primary\":{";
+  payload += "\"port\":" + String(udpPrimaryStats.localPort);
+  payload += ",\"packets\":" + String(udpPrimaryStats.packets);
+  payload += ",\"bytes\":" + String(udpPrimaryStats.bytes);
+  payload += ",\"last_source\":\"" + udpPrimaryStats.lastSourceIp.toString() + ":" + String(udpPrimaryStats.lastSourcePort) + "\"";
+  payload += ",\"last_packet_len\":" + String(static_cast<unsigned>(udpPrimaryStats.lastPacketLen));
+  payload += ",\"last_packet_age_ms\":" + String(msSince(lastPrimaryPacketMs));
+  payload += "}";
+  payload += ",\"udp_secondary\":{";
+  payload += "\"port\":" + String(udpSecondaryStats.localPort);
+  payload += ",\"packets\":" + String(udpSecondaryStats.packets);
+  payload += ",\"bytes\":" + String(udpSecondaryStats.bytes);
+  payload += ",\"last_source\":\"" + udpSecondaryStats.lastSourceIp.toString() + ":" + String(udpSecondaryStats.lastSourcePort) + "\"";
+  payload += ",\"last_packet_len\":" + String(static_cast<unsigned>(udpSecondaryStats.lastPacketLen));
+  payload += ",\"last_packet_age_ms\":" + String(msSince(lastSecondaryPacketMs));
+  payload += "}";
+  payload += "}";
+  return payload;
+}
+
 uint32_t readBatteryAdcMilliVolts(int samples = 64) {
   digitalWrite(BAT_ADC_CTRL_PIN, LOW);
   delay(20);
@@ -720,6 +956,29 @@ String buildBatteryJson() {
   payload += ",\"battery_est_v\":" + String(batteryV, 3);
   payload += ",\"charging_gpio15\":" + String(digitalRead(BAT_CHRG_PIN));
   payload += ",\"done_gpio16\":" + String(digitalRead(BAT_DONE_PIN));
+  payload += "}";
+  return payload;
+}
+
+String buildHaLowStatusJson() {
+  halowConnected = (HaLow.status() == WL_CONNECTED);
+  String payload = "{";
+  payload += "\"connected\":" + String(halowConnected ? "true" : "false");
+  payload += ",\"status\":" + String(static_cast<int>(HaLow.status()));
+  payload += ",\"ssid\":\"" + jsonEscape(HaLow.SSID()) + "\"";
+  payload += ",\"bssid\":\"" + jsonEscape(HaLow.BSSIDstr()) + "\"";
+  payload += ",\"mac\":\"" + jsonEscape(HaLow.macAddress()) + "\"";
+  payload += ",\"ip\":\"" + HaLow.localIP().toString() + "\"";
+  payload += ",\"gateway\":\"" + HaLow.gatewayIP().toString() + "\"";
+  payload += ",\"rssi_dbm\":" + String(static_cast<int>(HaLow.RSSI()));
+  payload += ",\"last_event\":" + String(halowLastEventId);
+  payload += ",\"last_event_age_ms\":" + String(msSince(halowLastEventMs));
+  payload += ",\"event_count\":" + String(halowEventCount);
+  payload += ",\"snr_db\":null";
+  payload += ",\"noise_dbm\":null";
+  payload += ",\"snr_note\":\"not_exposed_by_current_halow_wrapper\"";
+  payload += ",\"rate_control\":null";
+  payload += ",\"rate_control_note\":\"not_exposed_by_current_halow_wrapper\"";
   payload += "}";
   return payload;
 }
@@ -793,6 +1052,57 @@ bool onboardCaptureWindowActive() {
     return minute >= onboardCaptureStartMinute && minute < onboardCaptureEndMinute;
   }
   return minute >= onboardCaptureStartMinute || minute < onboardCaptureEndMinute;
+}
+
+unsigned long onboardTimelapseElapsedMs(unsigned long nowMs = millis()) {
+  if (!onboardTimelapseActive || onboardTimelapseStartedMs == 0) {
+    return 0;
+  }
+  return nowMs - onboardTimelapseStartedMs;
+}
+
+unsigned long onboardTimelapseRemainingMs(unsigned long nowMs = millis()) {
+  if (!onboardTimelapseActive || onboardTimelapseDurationMs == 0) {
+    return 0;
+  }
+  const unsigned long elapsed = onboardTimelapseElapsedMs(nowMs);
+  if (elapsed >= onboardTimelapseDurationMs) {
+    return 0;
+  }
+  return onboardTimelapseDurationMs - elapsed;
+}
+
+void stopOnboardTimelapse(const char *state) {
+  if (onboardTimelapseActive) {
+    ++onboardTimelapseCompletedCount;
+    Serial.printf("[onboard-timelapse] stopped state=%s captures=%u\n",
+                  state,
+                  onboardTimelapseCaptureCount);
+  }
+  onboardTimelapseActive = false;
+  onboardTimelapseLastState = state;
+}
+
+void refreshOnboardTimelapseState() {
+  if (!onboardTimelapseActive) {
+    return;
+  }
+  if (onboardTimelapseDurationMs > 0 && onboardTimelapseElapsedMs() >= onboardTimelapseDurationMs) {
+    stopOnboardTimelapse("complete");
+  }
+}
+
+void startOnboardTimelapse(unsigned long durationMs, unsigned long intervalMs) {
+  onboardTimelapseDurationMs = durationMs;
+  onboardTimelapseIntervalMs = intervalMs < ONBOARD_TIMELAPSE_MIN_INTERVAL_MS ? ONBOARD_TIMELAPSE_MIN_INTERVAL_MS : intervalMs;
+  onboardTimelapseStartedMs = millis();
+  onboardTimelapseLastCaptureMs = 0;
+  onboardTimelapseCaptureCount = 0;
+  onboardTimelapseActive = true;
+  onboardTimelapseLastState = "active";
+  Serial.printf("[onboard-timelapse] started duration_ms=%lu interval_ms=%lu\n",
+                onboardTimelapseDurationMs,
+                onboardTimelapseIntervalMs);
 }
 
 const char *frameSizeName(framesize_t size) {
@@ -1171,6 +1481,7 @@ bool captureOnboardFrame() {
 }
 
 String buildOnboardCameraStatusJson() {
+  refreshOnboardTimelapseState();
   size_t latestLen = 0;
   uint32_t count = 0;
   uint32_t failures = 0;
@@ -1227,6 +1538,18 @@ String buildOnboardCameraStatusJson() {
   payload += ",\"failures\":" + String(failures);
   payload += ",\"schedule_skips\":" + String(scheduleSkips);
   payload += ",\"last_capture_age_ms\":" + String(msSince(lastMs));
+  payload += ",\"timelapse\":{";
+  payload += "\"active\":" + String(onboardTimelapseActive ? "true" : "false");
+  payload += ",\"state\":\"" + jsonEscape(onboardTimelapseLastState) + "\"";
+  payload += ",\"interval_ms\":" + String(onboardTimelapseIntervalMs);
+  payload += ",\"duration_ms\":" + String(onboardTimelapseDurationMs);
+  payload += ",\"elapsed_ms\":" + String(onboardTimelapseElapsedMs());
+  payload += ",\"remaining_ms\":" + String(onboardTimelapseRemainingMs());
+  payload += ",\"captures\":" + String(onboardTimelapseCaptureCount);
+  payload += ",\"completed_count\":" + String(onboardTimelapseCompletedCount);
+  payload += ",\"started_age_ms\":" + String(msSince(onboardTimelapseStartedMs));
+  payload += ",\"last_capture_age_ms\":" + String(msSince(onboardTimelapseLastCaptureMs));
+  payload += "}";
   payload += "}";
   return payload;
 }
@@ -1483,6 +1806,41 @@ bool applyOnboardCameraSetting(const String &key, const String &value, String &e
   return true;
 }
 
+bool applyOnboardTimelapseSerialArg(const String &key, const String &value, unsigned long &durationMs, unsigned long &intervalMs, String &error) {
+  if (key == "interval_ms") {
+    intervalMs = strtoul(value.c_str(), nullptr, 10);
+    if (intervalMs < ONBOARD_TIMELAPSE_MIN_INTERVAL_MS) {
+      error = "invalid_interval_ms";
+      return false;
+    }
+    return true;
+  }
+  if (key == "duration_ms") {
+    durationMs = strtoul(value.c_str(), nullptr, 10);
+    return true;
+  }
+  if (key == "duration_minutes" || key == "minutes") {
+    const float minutes = value.toFloat();
+    if (minutes <= 0) {
+      error = "invalid_duration";
+      return false;
+    }
+    durationMs = static_cast<unsigned long>(minutes * 60.0f * 1000.0f);
+    return true;
+  }
+  if (key == "duration_hours" || key == "hours") {
+    const float hours = value.toFloat();
+    if (hours <= 0) {
+      error = "invalid_duration";
+      return false;
+    }
+    durationMs = static_cast<unsigned long>(hours * 60.0f * 60.0f * 1000.0f);
+    return true;
+  }
+  error = "unknown_timelapse_arg";
+  return false;
+}
+
 void printBase64Bytes(const uint8_t *data, size_t len) {
   static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   size_t lineChars = 0;
@@ -1540,20 +1898,36 @@ void dumpOnboardJpegBase64(bool freshCapture) {
 void onboardCaptureTask(void *pvParameters) {
   (void)pvParameters;
   while (true) {
-    if (onboardCaptureEnabled && onboardCameraReady) {
-      if (onboardCaptureWindowActive()) {
-        captureOnboardFrame();
-      } else {
-        ++onboardCaptureScheduleSkips;
-        Serial.printf("[onboard-camera] scheduled capture skipped clock_valid=%s local_minute=%d window=%s-%s\n",
-                      onboardClockValid() ? "yes" : "no",
-                      onboardLocalMinuteOfDay(),
-                      minuteOfDayToString(onboardCaptureStartMinute).c_str(),
-                      minuteOfDayToString(onboardCaptureEndMinute).c_str());
+    refreshOnboardTimelapseState();
+    if (onboardCameraReady) {
+      const unsigned long nowMs = millis();
+      if (onboardTimelapseActive) {
+        if (onboardTimelapseLastCaptureMs == 0 ||
+            nowMs - onboardTimelapseLastCaptureMs >= onboardTimelapseIntervalMs) {
+          if (captureOnboardFrame()) {
+            onboardTimelapseLastCaptureMs = millis();
+            ++onboardTimelapseCaptureCount;
+          }
+        }
+      } else if (onboardCaptureEnabled) {
+        const unsigned long normalIntervalMs = onboardCaptureIntervalMs < 5000UL ? 5000UL : onboardCaptureIntervalMs;
+        if (onboardLastScheduleAttemptMs == 0 ||
+            nowMs - onboardLastScheduleAttemptMs >= normalIntervalMs) {
+          onboardLastScheduleAttemptMs = nowMs;
+          if (onboardCaptureWindowActive()) {
+            captureOnboardFrame();
+          } else {
+            ++onboardCaptureScheduleSkips;
+            Serial.printf("[onboard-camera] scheduled capture skipped clock_valid=%s local_minute=%d window=%s-%s\n",
+                          onboardClockValid() ? "yes" : "no",
+                          onboardLocalMinuteOfDay(),
+                          minuteOfDayToString(onboardCaptureStartMinute).c_str(),
+                          minuteOfDayToString(onboardCaptureEndMinute).c_str());
+          }
+        }
       }
     }
-    const unsigned long delayMs = onboardCaptureIntervalMs < 5000 ? 5000 : onboardCaptureIntervalMs;
-    vTaskDelay(pdMS_TO_TICKS(delayMs));
+    vTaskDelay(pdMS_TO_TICKS(ONBOARD_SCHEDULER_TICK_MS));
   }
 }
 
@@ -1710,6 +2084,7 @@ String buildBoardTelemetryJson() {
   payload += "\"halow_connected\":" + String(halowConnected ? "true" : "false");
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   payload += ",\"halow_rssi\":" + String(static_cast<int>(HaLow.RSSI()));
+  payload += ",\"halow\":" + buildHaLowStatusJson();
   payload += ",\"trail_wifi_connected\":" + String(wifiConnected ? "true" : "false");
   payload += "}";
   payload += "}";
@@ -1792,8 +2167,17 @@ bool queueControlAction(ControlAction action, String &message) {
   ControlAction messageAction = action;
   portENTER_CRITICAL(&controlState.lock);
   if (controlState.busy) {
-    messageType = "busy";
-    messageAction = controlState.activeAction;
+    if (controlState.activeAction == CONTROL_ACTION_BRINGUP &&
+        action == CONTROL_ACTION_STREAM_START &&
+        controlState.pendingAction == CONTROL_ACTION_NONE) {
+      controlState.pendingAction = action;
+      accepted = true;
+      messageType = "queued_after";
+      messageAction = controlState.activeAction;
+    } else {
+      messageType = "busy";
+      messageAction = controlState.activeAction;
+    }
   } else if (controlState.pendingAction != CONTROL_ACTION_NONE) {
     if (controlState.pendingAction == action) {
       accepted = true;
@@ -1973,7 +2357,9 @@ bool advertisedDeviceLooksLikeCamera(const String &mac, const String &name, cons
 }
 
 bool tryExistingBleWakeSession() {
+  const unsigned long wakeStartedMs = millis();
   if (bleClient == nullptr || !bleClient->isConnected() || bleDataChar4 == nullptr) {
+    lastBleWakeElapsedMs = millis() - wakeStartedMs;
     return false;
   }
 
@@ -1993,6 +2379,7 @@ bool tryExistingBleWakeSession() {
                 sent ? "yes" : "no",
                 bleWakeSawOk ? "yes" : "no",
                 bleLastNotifyText.c_str());
+  lastBleWakeElapsedMs = millis() - wakeStartedMs;
   return sent;
 }
 
@@ -2120,6 +2507,44 @@ class BridgeBleAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
 static BridgeBleClientCallbacks bridgeBleClientCallbacks;
 static BridgeBleAdvertisedDeviceCallbacks bridgeBleScanCallbacks;
 
+bool connectBleTargetWithRetries() {
+  bleLastConnectError = 0;
+  bleConnectAttempts = 0;
+  bleStage = "connect";
+  cooperativeDelay(BLE_SCAN_CONNECT_SETTLE_MS);
+
+  for (uint8_t attempt = 1; attempt <= BLE_CONNECT_ATTEMPTS; ++attempt) {
+    bleConnectAttempts = attempt;
+    if (bleClient != nullptr) {
+      NimBLEDevice::deleteClient(bleClient);
+      bleClient = nullptr;
+    }
+
+    Serial.printf("[BLE] connect attempt %u/%u\n",
+                  static_cast<unsigned>(attempt),
+                  static_cast<unsigned>(BLE_CONNECT_ATTEMPTS));
+    bleClient = NimBLEDevice::createClient();
+    bleClient->setClientCallbacks(&bridgeBleClientCallbacks, false);
+    bleClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+    bleClient->setConnectionParams(24, 40, 0, 400, 160, 120);
+    if (bleClient->connect(&bleTargetDevice, true, false, false)) {
+      bleLastConnectError = 0;
+      return true;
+    }
+
+    bleLastConnectError = bleClient->getLastError();
+    Serial.printf("[BLE] connect attempt %u failed last_error=%d\n",
+                  static_cast<unsigned>(attempt),
+                  bleLastConnectError);
+    NimBLEDevice::deleteClient(bleClient);
+    bleClient = nullptr;
+    cooperativeDelay(BLE_CONNECT_RETRY_DELAY_MS);
+  }
+
+  bleStage = "connect_failed";
+  return false;
+}
+
 bool runBleDiscoveryPass(NimBLEScan *scan,
                          bool activeScan,
                          uint8_t attempts,
@@ -2161,13 +2586,21 @@ bool runExactBleWake() {
   bleLastNotifyText = "";
   bleNotifyChar3 = nullptr;
   bleDataChar4 = nullptr;
+  bleLastConnectError = 0;
+  bleConnectAttempts = 0;
   bleStage = "scan";
   resetBleScanStats();
 
   Serial.printf("[BLE] scanning for target %s\n", CAMERA_BLE_MAC);
-  Serial.println("[BLE] warmup before BLE init");
-  cooperativeDelay(5000);
-  NimBLEDevice::init(BOARD_HOSTNAME);
+  const unsigned long warmupMs = bleInitialized ? BLE_REUSE_WARMUP_MS : BLE_INIT_WARMUP_MS;
+  Serial.printf("[BLE] warmup before BLE init %lu ms initialized=%s\n",
+                warmupMs,
+                bleInitialized ? "yes" : "no");
+  cooperativeDelay(warmupMs);
+  if (!bleInitialized) {
+    NimBLEDevice::init(BOARD_HOSTNAME);
+    bleInitialized = true;
+  }
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&bridgeBleScanCallbacks, true);
   scan->setInterval(BLE_SCAN_INTERVAL_MS);
@@ -2190,16 +2623,10 @@ bool runExactBleWake() {
     return false;
   }
 
-  bleStage = "connect";
-  bleClient = NimBLEDevice::createClient();
-  bleClient->setClientCallbacks(&bridgeBleClientCallbacks, false);
-  bleClient->setConnectTimeout(15000);
-  bleClient->setConnectionParams(24, 40, 0, 400, 160, 120);
-  if (!bleClient->connect(&bleTargetDevice, true, false, false)) {
-    Serial.printf("[BLE] connect failed last_error=%d\n", bleClient->getLastError());
-    bleStage = "connect_failed";
-    NimBLEDevice::deleteClient(bleClient);
-    bleClient = nullptr;
+  if (!connectBleTargetWithRetries()) {
+    Serial.printf("[BLE] connect failed after %u attempts last_error=%d\n",
+                  static_cast<unsigned>(bleConnectAttempts),
+                  bleLastConnectError);
     return false;
   }
 
@@ -2275,6 +2702,7 @@ void printSerialHelp() {
   Serial.println("  help");
   Serial.println("  bringup");
   Serial.println("  halow_up");
+  Serial.println("  halow_status");
   Serial.println("  status");
   Serial.println("  selftest");
   Serial.println("  http <path>");
@@ -2287,6 +2715,8 @@ void printSerialHelp() {
   Serial.println("  onboard_status");
   Serial.println("  onboard_capture");
   Serial.println("  onboard_config key=value [key=value...]");
+  Serial.println("  onboard_timelapse hours=<value> [interval_ms=300000]");
+  Serial.println("  onboard_timelapse_stop");
   Serial.println("  onboard_dump [fresh]");
   Serial.println("  wifi_scan");
   Serial.println("  upload_status");
@@ -2299,6 +2729,7 @@ void printSerialHelp() {
 }
 
 void connectCameraWifi() {
+  const unsigned long connectStartedMs = millis();
   Serial.printf("Connecting camera WiFi SSID %s\n", CAMERA_WIFI_SSID);
   WiFi.persistent(false);
   WiFi.mode(WIFI_MODE_STA);
@@ -2333,6 +2764,7 @@ void connectCameraWifi() {
   Serial.println();
 
   wifiConnected = (WiFi.status() == WL_CONNECTED);
+  lastWifiJoinElapsedMs = millis() - connectStartedMs;
   if (wifiConnected) {
     cameraWifiEverConnected = true;
     standbyRequested = false;
@@ -2445,10 +2877,12 @@ void scanCameraWifiPresence() {
 bool waitForCameraWifiPresence(unsigned long timeoutMs, unsigned long intervalMs) {
   const unsigned long start = millis();
   while (millis() - start < timeoutMs) {
+    const unsigned long elapsedMs = millis() - start;
     const int count = WiFi.scanNetworks();
     for (int i = 0; i < count; ++i) {
       const String ssid = WiFi.SSID(i);
       if (ssid == CAMERA_WIFI_SSID) {
+        lastHotspotWaitElapsedMs = millis() - start;
         Serial.printf("Target SSID %s became visible RSSI=%d channel=%d after %lu ms\n",
                       ssid.c_str(),
                       WiFi.RSSI(i),
@@ -2460,8 +2894,13 @@ bool waitForCameraWifiPresence(unsigned long timeoutMs, unsigned long intervalMs
     Serial.printf("Target SSID %s not visible yet after %lu ms\n",
                   CAMERA_WIFI_SSID,
                   millis() - start);
-    cooperativeDelay(intervalMs);
+    const unsigned long pollMs = elapsedMs < BRINGUP_HOTSPOT_FAST_WINDOW_MS
+                                   ? BRINGUP_HOTSPOT_FAST_POLL_MS
+                                   : intervalMs;
+    const unsigned long remainingMs = timeoutMs - (millis() - start);
+    cooperativeDelay(pollMs < remainingMs ? pollMs : remainingMs);
   }
+  lastHotspotWaitElapsedMs = millis() - start;
   return false;
 }
 
@@ -2473,14 +2912,7 @@ void connectHaLow() {
     halowInitialized = true;
     Serial.printf("HaLow initialized for region %s\n", HALOW_REGION);
   }
-  if (!HaLow.config(HALOW_LOCAL_IP, HALOW_GATEWAY_IP, HALOW_SUBNET_MASK, HALOW_DNS1, HALOW_DNS2)) {
-    Serial.println("HaLow static IP config failed");
-  } else {
-    Serial.printf("HaLow static IP configured: ip=%s gateway=%s subnet=%s\n",
-                  HALOW_LOCAL_IP.toString().c_str(),
-                  HALOW_GATEWAY_IP.toString().c_str(),
-                  HALOW_SUBNET_MASK.toString().c_str());
-  }
+  Serial.println("HaLow using network-assigned IP");
   HaLow.begin(HALOW_SSID, HALOW_PASS);
 
   unsigned long start = millis();
@@ -2658,8 +3090,18 @@ bool proxyCameraRequest(const String &method,
                        const String &contentType,
                        String &responseBody,
                        int &statusCode) {
+  refreshCameraSessionLease();
+  if (path == "/cmd/standby/now" && cameraSessionLeaseActive) {
+    statusCode = 200;
+    responseBody = "{\"code\":0,\"desc\":\"standby_deferred_by_lease\"}";
+    Serial.println("[session] deferred standby because lease is active");
+    return true;
+  }
+
+  const unsigned long httpStartedMs = millis();
   WiFiClient client;
   if (!client.connect(CAMERA_IP, CAMERA_HTTP_PORT)) {
+    lastCameraHttpElapsedMs = millis() - httpStartedMs;
     Serial.printf("Failed to connect camera for %s %s\n", method.c_str(), path.c_str());
     statusCode = 502;
     responseBody = "{\"error\":\"camera_connect_failed\"}";
@@ -2682,6 +3124,7 @@ bool proxyCameraRequest(const String &method,
   while (client.connected() && !client.available()) {
     if (millis() - timeout > 5000) {
       client.stop();
+      lastCameraHttpElapsedMs = millis() - httpStartedMs;
       statusCode = 504;
       responseBody = "{\"error\":\"camera_timeout\"}";
       return false;
@@ -2711,11 +3154,16 @@ bool proxyCameraRequest(const String &method,
 
   Serial.printf("Camera %s %s -> %d, %u bytes\n",
                 method.c_str(), path.c_str(), statusCode, (unsigned)responseBody.length());
+  lastCameraHttpElapsedMs = millis() - httpStartedMs;
   if (statusCode >= 200 && statusCode < 300) {
     if (path == "/cmd/standby/now") {
       standbyRequested = true;
+      releaseCameraSessionLease();
     } else if (path == "/cmd/standby/reset") {
       standbyRequested = false;
+      markCameraActivity();
+    } else {
+      markCameraActivity();
     }
   }
   return true;
@@ -2728,6 +3176,28 @@ bool proxyCameraRequest(const String &method,
   const String emptyBody = "";
   const String emptyContentType = "";
   return proxyCameraRequest(method, path, emptyBody, emptyContentType, responseBody, statusCode);
+}
+
+void processCameraSessionLeaseExpiry() {
+  if (!cameraSessionLeaseActive || !cameraSessionLeaseExpired()) {
+    return;
+  }
+
+  const bool sendStandby = cameraSessionLeaseStandbyOnExpire &&
+                           wifiConnected &&
+                           !streamSessionActive &&
+                           !cameraSessionLeaseExpiredStandbySent;
+  cameraSessionLeaseActive = false;
+  cameraSessionLeaseExpiresMs = 0;
+  cameraSessionLeaseDurationMs = 0;
+
+  if (sendStandby) {
+    String body;
+    int statusCode = 500;
+    cameraSessionLeaseExpiredStandbySent = true;
+    Serial.println("[session] lease expired, requesting standby");
+    proxyCameraRequest("GET", "/cmd/standby/now", body, statusCode);
+  }
 }
 
 bool exchangeCameraRtspRequest(WiFiClient &client,
@@ -2932,6 +3402,8 @@ bool parseRtspDescribe(const String &describeUrl, const String &responseText, Rt
 }
 
 bool runRtspLiveSequence(RtspSessionInfo &info) {
+  lastStreamStartStage = "rtsp_init";
+  lastStreamStartMessage = "";
   info.describeStatus = 0;
   info.setupStatus = 0;
   info.playStatus = 0;
@@ -2945,15 +3417,20 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
 
   if (!wifiConnected) {
     Serial.println("[rtsp-live] camera WiFi is down");
+    lastStreamStartStage = "camera_wifi_down";
+    lastStreamStartMessage = "camera_wifi_down";
     return false;
   }
 
   closeRtspSession();
   if (!cameraRtspClient.connect(CAMERA_IP, CAMERA_RTSP_PORT)) {
     Serial.println("[rtsp-live] failed to connect RTSP socket");
+    lastStreamStartStage = "rtsp_socket_connect_failed";
+    lastStreamStartMessage = "rtsp_socket_connect_failed";
     return false;
   }
 
+  lastStreamStartStage = "rtsp_describe";
   if (!exchangeCameraRtspRequest(cameraRtspClient,
                                  "DESCRIBE",
                                  info.describeUrl,
@@ -2961,13 +3438,19 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
                                  info.describeResponse,
                                  info.describeStatus)) {
     Serial.println("[rtsp-live] DESCRIBE failed");
+    lastStreamDescribeStatus = info.describeStatus;
+    lastStreamStartStage = "rtsp_describe_failed";
+    lastStreamStartMessage = "rtsp_describe_failed";
     closeRtspSession();
     return false;
   }
+  lastStreamDescribeStatus = info.describeStatus;
   printBodySnippet(info.describeResponse);
   printFullTextBlock("RTSP DESCRIBE", info.describeResponse);
   if (info.describeStatus != 200) {
     Serial.printf("[rtsp-live] DESCRIBE status=%d\n", info.describeStatus);
+    lastStreamStartStage = "rtsp_describe_status";
+    lastStreamStartMessage = "rtsp_describe_status_" + String(info.describeStatus);
     return false;
   }
 
@@ -2982,6 +3465,7 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
   setupHeaders += "-";
   setupHeaders += String(LOCAL_MEDIA_PORT_SECONDARY);
   setupHeaders += "\r\n";
+  lastStreamStartStage = "rtsp_setup";
   if (!exchangeCameraRtspRequest(cameraRtspClient,
                                  "SETUP",
                                  info.mediaControlUrl,
@@ -2989,13 +3473,19 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
                                  info.setupResponse,
                                  info.setupStatus)) {
     Serial.println("[rtsp-live] SETUP failed");
+    lastStreamSetupStatus = info.setupStatus;
+    lastStreamStartStage = "rtsp_setup_failed";
+    lastStreamStartMessage = "rtsp_setup_failed";
     closeRtspSession();
     return false;
   }
+  lastStreamSetupStatus = info.setupStatus;
   printBodySnippet(info.setupResponse);
   printFullTextBlock("RTSP SETUP", info.setupResponse);
   if (info.setupStatus != 200) {
     Serial.printf("[rtsp-live] SETUP status=%d\n", info.setupStatus);
+    lastStreamStartStage = "rtsp_setup_status";
+    lastStreamStartMessage = "rtsp_setup_status_" + String(info.setupStatus);
     return false;
   }
 
@@ -3007,6 +3497,8 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
   info.sessionHeader.trim();
   if (info.sessionHeader.isEmpty()) {
     Serial.println("[rtsp-live] SETUP missing Session header");
+    lastStreamStartStage = "rtsp_setup_missing_session";
+    lastStreamStartMessage = "rtsp_setup_missing_session";
     return false;
   }
   lastRtspSessionId = info.sessionHeader;
@@ -3015,6 +3507,8 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
   String playHeaders = "Session: " + info.sessionHeader + "\r\n";
   playHeaders += "Range: npt=0.000-\r\n";
   String playUrl = info.aggregateControlUrl;
+  lastStreamStartStage = "rtsp_play";
+  lastStreamPlayUrl = playUrl;
   if (!exchangeCameraRtspRequest(cameraRtspClient,
                                  "PLAY",
                                  playUrl,
@@ -3022,14 +3516,19 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
                                  info.playResponse,
                                  info.playStatus)) {
     Serial.println("[rtsp-live] PLAY failed");
+    lastStreamPlayStatus = info.playStatus;
+    lastStreamStartStage = "rtsp_play_failed";
+    lastStreamStartMessage = "rtsp_play_failed";
     closeRtspSession();
     return false;
   }
+  lastStreamPlayStatus = info.playStatus;
   printBodySnippet(info.playResponse);
   printFullTextBlock("RTSP PLAY", info.playResponse);
   if (info.playStatus == 455 && info.mediaControlUrl != info.aggregateControlUrl) {
     Serial.printf("[rtsp-live] retry PLAY on media URL %s\n", info.mediaControlUrl.c_str());
     playUrl = info.mediaControlUrl;
+    lastStreamPlayUrl = playUrl;
     info.playResponse = "";
     if (!exchangeCameraRtspRequest(cameraRtspClient,
                                    "PLAY",
@@ -3038,9 +3537,13 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
                                    info.playResponse,
                                    info.playStatus)) {
       Serial.println("[rtsp-live] PLAY retry failed");
+      lastStreamPlayStatus = info.playStatus;
+      lastStreamStartStage = "rtsp_play_retry_failed";
+      lastStreamStartMessage = "rtsp_play_retry_failed";
       closeRtspSession();
       return false;
     }
+    lastStreamPlayStatus = info.playStatus;
     printBodySnippet(info.playResponse);
     printFullTextBlock("RTSP PLAY RETRY", info.playResponse);
   }
@@ -3053,7 +3556,11 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
     lastHttpKeepaliveMs = millis();
     lastPrimaryPacketMs = millis();
     lastSecondaryPacketMs = millis();
+    lastStreamStartStage = "rtsp_play_ok";
+    lastStreamStartMessage = "rtsp_play_ok";
   } else {
+    lastStreamStartStage = "rtsp_play_status";
+    lastStreamStartMessage = "rtsp_play_status_" + String(info.playStatus);
     closeRtspSession();
   }
   Serial.printf("[rtsp-live] PLAY status=%d url=%s\n", info.playStatus, playUrl.c_str());
@@ -3061,37 +3568,69 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
 }
 
 bool startStreamSession() {
+  const unsigned long startedMs = millis();
+  lastStreamStartMs = startedMs;
+  lastStreamStartElapsedMs = 0;
+  lastStreamStartStage = "start";
+  lastStreamStartMessage = "";
+  lastStreamDescribeStatus = 0;
+  lastStreamSetupStatus = 0;
+  lastStreamPlayStatus = 0;
+  lastTunnelConnectError = 0;
+  lastStreamPlayUrl = "";
   if (streamSessionActive) {
     Serial.println("[stream] session already active");
+    lastStreamStartStage = "already_active";
+    lastStreamStartMessage = "stream_active";
+    lastStreamStartElapsedMs = millis() - startedMs;
     return true;
   }
   if (!halowConnected) {
+    lastStreamStartStage = "halow_connect";
     Serial.println("[stream] HaLow is down, connecting now");
     connectHaLow();
   }
   if (!halowConnected) {
     Serial.println("[stream] HaLow connect failed");
+    lastStreamStartStage = "halow_down";
+    lastStreamStartMessage = "stream_halow_down";
+    lastStreamStartElapsedMs = millis() - startedMs;
     return false;
   }
   if (!wifiConnected) {
     Serial.println("[stream] camera WiFi is down");
+    lastStreamStartStage = "camera_wifi_down";
+    lastStreamStartMessage = "stream_camera_wifi_down";
+    lastStreamStartElapsedMs = millis() - startedMs;
     return false;
   }
 
   RtspSessionInfo info{};
   if (!runRtspLiveSequence(info)) {
     Serial.println("[stream] RTSP live sequence failed");
+    if (lastStreamStartMessage.isEmpty()) {
+      lastStreamStartMessage = "stream_rtsp_failed";
+    }
+    lastStreamStartElapsedMs = millis() - startedMs;
     return false;
   }
 
+  lastStreamStartStage = "tunnel_connect";
   if (!connectTunnelSocket()) {
     Serial.println("[stream] tunnel connect failed");
+    lastStreamStartStage = "tunnel_connect_failed";
+    lastStreamStartMessage = "stream_tunnel_connect_failed";
+    lastStreamStartElapsedMs = millis() - startedMs;
+    closeRtspSession();
     return false;
   }
 
   startHttpServer();
   streamSessionActive = true;
   streamSessionStartedMs = millis();
+  lastStreamStartStage = "stream_active";
+  lastStreamStartMessage = "stream_active";
+  lastStreamStartElapsedMs = millis() - startedMs;
   Serial.printf("[stream] session active started_ms=%lu\n", streamSessionStartedMs);
   return true;
 }
@@ -3128,6 +3667,14 @@ void runCameraHttpSelfTest() {
 }
 
 bool runBringupSequence() {
+  const unsigned long bringupStartedMs = millis();
+  refreshWifiState();
+  if (wifiConnected) {
+    lastBringupElapsedMs = millis() - bringupStartedMs;
+    Serial.println("[bringup] camera WiFi already connected");
+    return true;
+  }
+
   WiFi.disconnect(true, true);
   cooperativeDelay(250);
   refreshWifiState();
@@ -3135,8 +3682,10 @@ bool runBringupSequence() {
   bool hotspotVisible = false;
 
   if (tryExistingBleWakeSession()) {
+    const unsigned long hotspotStartedMs = millis();
     hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
                                                BRINGUP_HOTSPOT_POLL_MS);
+    lastHotspotWaitElapsedMs = millis() - hotspotStartedMs;
     Serial.printf("[WiFi] hotspot visibility after cached BLE wake: %s\n",
                   hotspotVisible ? "yes" : "no");
     if (hotspotVisible) {
@@ -3148,22 +3697,28 @@ bool runBringupSequence() {
 
   if (!hotspotVisible) {
     closeBleWakeSession();
+    const unsigned long bleStartedMs = millis();
     bleWakeConfirmed = runExactBleWake();
+    lastBleWakeElapsedMs = millis() - bleStartedMs;
     Serial.printf("[BLE] exact wake result: %s stage=%s\n",
                   bleWakeConfirmed ? "success" : "no-confirmation",
                   bleStage.c_str());
     if (!bleWakeConfirmed) {
       Serial.println("[bringup] aborting after BLE wake failure");
       refreshWifiState();
+      lastBringupElapsedMs = millis() - bringupStartedMs;
       return false;
     }
+    const unsigned long hotspotStartedMs = millis();
     hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
                                                BRINGUP_HOTSPOT_POLL_MS);
+    lastHotspotWaitElapsedMs = millis() - hotspotStartedMs;
     Serial.printf("[WiFi] hotspot visibility after BLE wake: %s\n", hotspotVisible ? "yes" : "no");
   }
   if (!hotspotVisible) {
     Serial.println("[bringup] aborting because camera hotspot did not appear");
     refreshWifiState();
+    lastBringupElapsedMs = millis() - bringupStartedMs;
     return false;
   }
   connectCameraWifi();
@@ -3173,6 +3728,7 @@ bool runBringupSequence() {
     closeBleWakeSession();
   }
   refreshWifiState();
+  lastBringupElapsedMs = millis() - bringupStartedMs;
   return wifiConnected;
 }
 
@@ -3309,6 +3865,7 @@ void handleStatus() {
   payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   payload += ",\"halow_mac\":\"" + HaLow.macAddress() + "\"";
+  payload += ",\"halow\":" + buildHaLowStatusJson();
   payload += ",\"psram_found\":" + String(psramFound() ? "true" : "false");
   payload += ",\"psram_size\":" + String(ESP.getPsramSize());
   payload += ",\"psram_free\":" + String(ESP.getFreePsram());
@@ -3316,6 +3873,9 @@ void handleStatus() {
   payload += ",\"camera_ip\":\"" + CAMERA_IP.toString() + "\"";
   payload += ",\"camera_wifi_ever_connected\":" + String(cameraWifiEverConnected ? "true" : "false");
   payload += ",\"standby_requested\":" + String(standbyRequested ? "true" : "false");
+  payload += ",\"camera_session\":" + buildCameraSessionJson();
+  payload += ",\"timing\":" + buildTimingJson();
+  payload += ",\"stream_status\":" + buildStreamStatusJson();
   payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
   payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
   payload += ",\"recoveries\":" + String(streamRecoveryAttempts);
@@ -3339,6 +3899,8 @@ void handleStatus() {
   payload += ",\"ble_scan_results\":" + String(bleScanResultCount);
   payload += ",\"ble_scan_attempts\":" + String(bleScanAttemptCounter);
   payload += ",\"ble_target_seen_count\":" + String(bleTargetSeenCount);
+  payload += ",\"ble_connect_attempts\":" + String(bleConnectAttempts);
+  payload += ",\"ble_last_connect_error\":" + String(bleLastConnectError);
   payload += ",\"ble_last_seen_mac\":\"" + jsonEscape(bleLastSeenMac) + "\"";
   payload += ",\"ble_last_seen_name\":\"" + jsonEscape(bleLastSeenName) + "\"";
   payload += ",\"ble_last_seen_rssi\":" + String(bleLastSeenRssi);
@@ -3431,6 +3993,79 @@ void handleOnboardCameraCapture() {
   payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
   payload += "}";
   server.send(ok ? 200 : 500, "application/json", payload);
+}
+
+bool parseOnboardTimelapseArgs(unsigned long &durationMs, unsigned long &intervalMs, String &error) {
+  durationMs = 0;
+  intervalMs = ONBOARD_TIMELAPSE_DEFAULT_INTERVAL_MS;
+
+  if (server.hasArg("interval_ms")) {
+    intervalMs = strtoul(server.arg("interval_ms").c_str(), nullptr, 10);
+    if (intervalMs < ONBOARD_TIMELAPSE_MIN_INTERVAL_MS) {
+      error = "invalid_interval_ms";
+      return false;
+    }
+  }
+
+  if (server.hasArg("duration_ms")) {
+    durationMs = strtoul(server.arg("duration_ms").c_str(), nullptr, 10);
+  } else if (server.hasArg("duration_minutes")) {
+    const float minutes = server.arg("duration_minutes").toFloat();
+    if (minutes > 0) {
+      durationMs = static_cast<unsigned long>(minutes * 60.0f * 1000.0f);
+    }
+  } else if (server.hasArg("minutes")) {
+    const float minutes = server.arg("minutes").toFloat();
+    if (minutes > 0) {
+      durationMs = static_cast<unsigned long>(minutes * 60.0f * 1000.0f);
+    }
+  } else if (server.hasArg("duration_hours")) {
+    const float hours = server.arg("duration_hours").toFloat();
+    if (hours > 0) {
+      durationMs = static_cast<unsigned long>(hours * 60.0f * 60.0f * 1000.0f);
+    }
+  } else if (server.hasArg("hours")) {
+    const float hours = server.arg("hours").toFloat();
+    if (hours > 0) {
+      durationMs = static_cast<unsigned long>(hours * 60.0f * 60.0f * 1000.0f);
+    }
+  }
+
+  if (durationMs < ONBOARD_TIMELAPSE_MIN_INTERVAL_MS) {
+    error = "invalid_duration";
+    return false;
+  }
+  if (durationMs > ONBOARD_TIMELAPSE_MAX_DURATION_MS) {
+    error = "duration_too_long";
+    return false;
+  }
+  return true;
+}
+
+void handleOnboardTimelapseStart() {
+  if (!onboardCameraReady) {
+    server.send(503, "application/json", "{\"error\":\"onboard_camera_not_ready\"}");
+    return;
+  }
+
+  unsigned long durationMs = 0;
+  unsigned long intervalMs = 0;
+  String error;
+  if (!parseOnboardTimelapseArgs(durationMs, intervalMs, error)) {
+    String payload = "{\"error\":\"" + jsonEscape(error) + "\"";
+    payload += ",\"hint\":\"send hours, duration_hours, duration_minutes, minutes, or duration_ms; optional interval_ms defaults to 300000\"";
+    payload += "}";
+    server.send(400, "application/json", payload);
+    return;
+  }
+
+  startOnboardTimelapse(durationMs, intervalMs);
+  server.send(200, "application/json", buildOnboardCameraStatusJson());
+}
+
+void handleOnboardTimelapseStop() {
+  stopOnboardTimelapse("stopped");
+  server.send(200, "application/json", buildOnboardCameraStatusJson());
 }
 
 void handleOnboardCameraConfig() {
@@ -3558,6 +4193,7 @@ void handleUploadAll() {
 }
 
 void handleCameraRawGet() {
+  const unsigned long httpStartedMs = millis();
   if (!wifiConnected) {
     server.send(503, "application/json", "{\"error\":\"camera_wifi_down\"}");
     return;
@@ -3571,6 +4207,7 @@ void handleCameraRawGet() {
 
   WiFiClient client;
   if (!client.connect(CAMERA_IP, CAMERA_HTTP_PORT)) {
+    lastCameraHttpElapsedMs = millis() - httpStartedMs;
     server.send(502, "application/json", "{\"error\":\"camera_connect_failed\"}");
     return;
   }
@@ -3584,6 +4221,7 @@ void handleCameraRawGet() {
   while (client.connected() && !client.available()) {
     if (millis() - timeout > 5000) {
       client.stop();
+      lastCameraHttpElapsedMs = millis() - httpStartedMs;
       Serial.printf("[raw] timeout waiting for headers path=%s\n", path.c_str());
       server.send(504, "application/json", "{\"error\":\"camera_timeout\"}");
       return;
@@ -3756,6 +4394,10 @@ void handleCameraRawGet() {
                 contentType.c_str(),
                 contentLength,
                 static_cast<unsigned>(totalWritten));
+  lastCameraHttpElapsedMs = millis() - httpStartedMs;
+  if (statusCode >= 200 && statusCode < 300) {
+    markCameraActivity();
+  }
   client.stop();
 }
 
@@ -3795,6 +4437,34 @@ void handleControlStreamStop() {
   server.send(accepted ? 202 : 409, "application/json", payload);
 }
 
+void handleSessionLease() {
+  unsigned long ttlMs = CAMERA_SESSION_DEFAULT_LEASE_MS;
+  if (server.hasArg("ttl_ms")) {
+    ttlMs = strtoul(server.arg("ttl_ms").c_str(), nullptr, 10);
+  } else if (server.hasArg("seconds")) {
+    ttlMs = strtoul(server.arg("seconds").c_str(), nullptr, 10) * 1000UL;
+  }
+  const bool standbyOnExpire = !server.hasArg("standby_on_expire") ||
+                               server.arg("standby_on_expire") != "0";
+  startCameraSessionLease(ttlMs, standbyOnExpire);
+  server.send(200, "application/json", buildCameraSessionJson());
+}
+
+void handleSessionRelease() {
+  const bool requestStandby = !server.hasArg("standby") || server.arg("standby") != "0";
+  releaseCameraSessionLease();
+  if (requestStandby && wifiConnected) {
+    String body;
+    int statusCode = 500;
+    proxyCameraRequest("GET", "/cmd/standby/now", body, statusCode);
+  }
+  server.send(200, "application/json", buildCameraSessionJson());
+}
+
+void handleSessionStatus() {
+  server.send(200, "application/json", buildCameraSessionJson());
+}
+
 void handleCameraRequest() {
   const String method = server.arg("method").isEmpty() ? "GET" : server.arg("method");
   const String path = server.arg("path");
@@ -3814,6 +4484,119 @@ void handleCameraRequest() {
   normalizedMethod.toUpperCase();
   proxyCameraRequest(normalizedMethod, path, requestBody, contentType, body, statusCode);
   server.send(statusCode, "application/json", body);
+}
+
+bool jsonObjectHasIntField(const String &objectJson, const char *fieldName, int expectedValue) {
+  const String key = String("\"") + String(fieldName) + "\"";
+  int index = objectJson.indexOf(key);
+  while (index >= 0) {
+    const int colon = objectJson.indexOf(':', index + key.length());
+    if (colon < 0) {
+      return false;
+    }
+    int valueStart = colon + 1;
+    while (valueStart < static_cast<int>(objectJson.length()) && objectJson[valueStart] == ' ') {
+      ++valueStart;
+    }
+    const int value = objectJson.substring(valueStart).toInt();
+    if (value == expectedValue) {
+      return true;
+    }
+    index = objectJson.indexOf(key, colon + 1);
+  }
+  return false;
+}
+
+String extractLatestMediaItemJson(const String &galleryJson, int typeFilter, bool &found) {
+  found = false;
+  const int dataKey = galleryJson.indexOf("\"data\"");
+  if (dataKey < 0) {
+    return "";
+  }
+  const int arrayStart = galleryJson.indexOf('[', dataKey);
+  if (arrayStart < 0) {
+    return "";
+  }
+
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
+  int objectStart = -1;
+  for (int i = arrayStart + 1; i < static_cast<int>(galleryJson.length()); ++i) {
+    const char c = galleryJson[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (c == '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (c == '{') {
+      if (depth == 0) {
+        objectStart = i;
+      }
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0 && objectStart >= 0) {
+        const String item = galleryJson.substring(objectStart, i + 1);
+        if (typeFilter < 0 || jsonObjectHasIntField(item, "type", typeFilter)) {
+          found = true;
+          return item;
+        }
+        objectStart = -1;
+      }
+    } else if (c == ']' && depth == 0) {
+      break;
+    }
+  }
+  return "";
+}
+
+void handleCameraLatest() {
+  if (!wifiConnected) {
+    server.send(503, "application/json", "{\"error\":\"camera_wifi_down\"}");
+    return;
+  }
+
+  int limit = server.hasArg("limit") ? server.arg("limit").toInt() : 6;
+  if (limit < 1) {
+    limit = 1;
+  } else if (limit > 20) {
+    limit = 20;
+  }
+  int typeFilter = -1;
+  if (server.hasArg("type")) {
+    typeFilter = server.arg("type").toInt();
+  }
+
+  String body;
+  int statusCode = 500;
+  const String path = "/list/detail/backward/900000/" + String(limit);
+  proxyCameraRequest("GET", path, body, statusCode);
+  if (statusCode < 200 || statusCode >= 300) {
+    server.send(statusCode, "application/json", body);
+    return;
+  }
+
+  bool found = false;
+  const String item = extractLatestMediaItemJson(body, typeFilter, found);
+  String payload = "{";
+  payload += "\"ok\":true";
+  payload += ",\"limit\":" + String(limit);
+  payload += ",\"type_filter\":" + String(typeFilter);
+  payload += ",\"data\":";
+  payload += found ? item : String("null");
+  payload += "}";
+  server.send(200, "application/json", payload);
 }
 
 void handleCameraInfo1() {
@@ -3895,7 +4678,10 @@ void controlWorkerTask(void *pvParameters) {
       message = ok ? "bringup_complete" : "bringup_failed";
     } else if (action == CONTROL_ACTION_STREAM_START) {
       ok = startStreamSession();
-      message = ok ? "stream_active" : "stream_start_failed";
+      message = ok ? "stream_active" : lastStreamStartMessage.c_str();
+      if (!ok && (message == nullptr || message[0] == '\0')) {
+        message = "stream_start_failed";
+      }
     } else if (action == CONTROL_ACTION_STREAM_STOP) {
       stopTunnelSession("http_control_stop");
       ok = true;
@@ -3908,6 +4694,7 @@ void controlWorkerTask(void *pvParameters) {
 
 void startHttpServer() {
   if (httpServerStarted) {
+    server.begin();
     return;
   }
   server.on("/status", HTTP_GET, handleStatus);
@@ -3917,11 +4704,16 @@ void startHttpServer() {
   server.on("/control/bringup", HTTP_POST, handleControlBringup);
   server.on("/control/stream_start", HTTP_POST, handleControlStreamStart);
   server.on("/control/stream_stop", HTTP_POST, handleControlStreamStop);
+  server.on("/session/lease", HTTP_POST, handleSessionLease);
+  server.on("/session/release", HTTP_POST, handleSessionRelease);
+  server.on("/session/status", HTTP_GET, handleSessionStatus);
   server.on("/battery/status", HTTP_GET, handleBatteryStatus);
   server.on("/onboard/status", HTTP_GET, handleOnboardCameraStatus);
   server.on("/onboard/latest.jpg", HTTP_GET, handleOnboardCameraLatest);
   server.on("/onboard/capture", HTTP_POST, handleOnboardCameraCapture);
   server.on("/onboard/config", HTTP_POST, handleOnboardCameraConfig);
+  server.on("/onboard/timelapse/start", HTTP_POST, handleOnboardTimelapseStart);
+  server.on("/onboard/timelapse/stop", HTTP_POST, handleOnboardTimelapseStop);
   server.on("/scan/wifi", HTTP_GET, handleWifiScan);
   server.on("/upload/status", HTTP_GET, handleUploadStatus);
   server.on("/upload/telemetry", HTTP_POST, handleUploadTelemetry);
@@ -3935,6 +4727,7 @@ void startHttpServer() {
   server.on("/camera/info/6", HTTP_GET, handleCameraInfo6);
   server.on("/camera/getParaSetting", HTTP_GET, handleParaSettings);
   server.on("/camera/gallery", HTTP_GET, handleGalleryList);
+  server.on("/camera/latest", HTTP_GET, handleCameraLatest);
   server.on("/camera/standby/reset", HTTP_GET, handleStandbyReset);
   server.begin();
   httpServerStarted = true;
@@ -3977,12 +4770,16 @@ void udpInspectTask(void *pvParameters) {
 
     stats->packets++;
     stats->bytes += len;
-    stats->lastSourceIp = IPAddress(ntohl(srcAddr.sin_addr.s_addr));
+    stats->lastSourceIp = IPAddress(srcAddr.sin_addr.s_addr);
     stats->lastSourcePort = ntohs(srcAddr.sin_port);
     stats->lastPacketLen = static_cast<size_t>(len);
     if (primary) {
+      mediaPrimaryPackets++;
+      mediaPrimaryBytes += len;
       lastPrimaryPacketMs = millis();
     } else {
+      mediaSecondaryPackets++;
+      mediaSecondaryBytes += len;
       lastSecondaryPacketMs = millis();
     }
 
@@ -4108,6 +4905,10 @@ void handleSerialCommand(const String &line) {
     }
     return;
   }
+  if (cmd == "halow_status") {
+    Serial.println(buildHaLowStatusJson());
+    return;
+  }
   if (cmd == "status") {
     printRuntimeStatus();
     Serial.printf("[battery] %s\n", buildBatteryJson().c_str());
@@ -4170,6 +4971,56 @@ void handleSerialCommand(const String &line) {
     Serial.printf("[onboard-config] result=%s %s\n",
                   allOk ? "ok" : "partial_failure",
                   buildOnboardCameraStatusJson().c_str());
+    return;
+  }
+  if (cmd.startsWith("onboard_timelapse")) {
+    if (cmd == "onboard_timelapse_stop") {
+      stopOnboardTimelapse("stopped");
+      Serial.println(buildOnboardCameraStatusJson());
+      return;
+    }
+    String args = cmd.substring(strlen("onboard_timelapse"));
+    args.trim();
+    unsigned long durationMs = 0;
+    unsigned long intervalMs = ONBOARD_TIMELAPSE_DEFAULT_INTERVAL_MS;
+    bool allOk = true;
+    while (!args.isEmpty()) {
+      int space = args.indexOf(' ');
+      String token = space >= 0 ? args.substring(0, space) : args;
+      args = space >= 0 ? args.substring(space + 1) : "";
+      args.trim();
+      token.trim();
+      if (token.isEmpty()) {
+        continue;
+      }
+      const int equals = token.indexOf('=');
+      if (equals <= 0) {
+        Serial.printf("[onboard-timelapse] invalid token=%s\n", token.c_str());
+        allOk = false;
+        continue;
+      }
+      String key = token.substring(0, equals);
+      String value = token.substring(equals + 1);
+      key.toLowerCase();
+      String error;
+      if (!applyOnboardTimelapseSerialArg(key, value, durationMs, intervalMs, error)) {
+        Serial.printf("[onboard-timelapse] %s=%s failed error=%s\n",
+                      key.c_str(),
+                      value.c_str(),
+                      error.c_str());
+        allOk = false;
+      }
+    }
+    if (!allOk || durationMs < ONBOARD_TIMELAPSE_MIN_INTERVAL_MS) {
+      Serial.println("[onboard-timelapse] failed error=invalid_duration");
+      return;
+    }
+    if (durationMs > ONBOARD_TIMELAPSE_MAX_DURATION_MS) {
+      Serial.println("[onboard-timelapse] failed error=duration_too_long");
+      return;
+    }
+    startOnboardTimelapse(durationMs, intervalMs);
+    Serial.println(buildOnboardCameraStatusJson());
     return;
   }
   if (cmd == "onboard_dump" || cmd == "onboard_dump fresh") {
@@ -4349,9 +5200,8 @@ void setup() {
   if (RUN_LOCAL_SERIAL_TEST) {
     Serial.println("Local serial test mode active; starting HaLow control plane before camera wake");
     connectHaLow();
-    if (halowConnected) {
-      startHttpServer();
-    } else {
+    startHttpServer();
+    if (!halowConnected) {
       Serial.println("[HaLow] local serial mode boot did not reach control plane");
     }
     startLocalUdpInspectors();
@@ -4413,10 +5263,15 @@ void loop() {
   pollSerialConsole();
 
   if (RUN_LOCAL_SERIAL_TEST) {
+    halowConnected = (HaLow.status() == WL_CONNECTED);
+    if (!httpServerStarted) {
+      startHttpServer();
+    }
     if (httpServerStarted) {
       server.handleClient();
     }
     refreshWifiState();
+    processCameraSessionLeaseExpiry();
     if (streamSessionActive && rtspSessionOpen && millis() - lastRtspKeepaliveMs > RTSP_KEEPALIVE_INTERVAL_MS) {
       sendRtspKeepalive();
     }

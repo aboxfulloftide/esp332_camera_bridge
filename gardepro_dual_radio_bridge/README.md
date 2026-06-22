@@ -18,13 +18,13 @@ This matches your stated board usage:
 - joins the configured HaLow upstream network:
   - SSID from local config
   - password from local config
-  - requested static IP `192.168.1.30/24`
-  - gateway `192.168.1.1`
+  - IP address assigned by the HaLow network
 - exposes a small local HTTP bridge on port `18080`
 - proxies confirmed camera HTTP routes to `192.168.8.1:8080`
 - listens for UDP media on local ports `25748/25749`
 - can open a single outbound TCP tunnel to the upstream receiver:
-  - `192.168.1.39:6000`
+  - `UPSTREAM_TUNNEL_HOST:UPSTREAM_TUNNEL_PORT`
+  - defaults to `UPSTREAM_API_HOST:6000`
   - protocol magic: `GPRT`
   - media packets forwarded as framed raw RTP / RTCP payloads
   - control frames include:
@@ -61,6 +61,8 @@ server with the current:
 - `/onboard/latest.jpg`
 - `/onboard/capture`
 - `/onboard/config`
+- `/onboard/timelapse/start`
+- `/onboard/timelapse/stop`
 - `/scan/wifi`
 - `/upload/status`
 - `/upload/telemetry`
@@ -69,8 +71,12 @@ server with the current:
 - `/control/bringup`
 - `/control/stream_start`
 - `/control/stream_stop`
+- `/session/lease`
+- `/session/release`
+- `/session/status`
 - `/camera/request`
 - `/camera/raw`
+- `/camera/latest`
 - `/camera/info/1`
 - `/camera/info/2`
 - `/camera/info/3`
@@ -102,6 +108,12 @@ Unified board features:
 - trigger a one-shot web UI capture with temporary settings using `POST /onboard/capture` and the same sensor tuning fields
   - example: `POST /onboard/capture?framesize=UXGA&jpeg_quality=8&aec=0&aec_value=2300`
   - one-shot settings are applied for that capture only, then the scheduled/default profile is restored
+- timelapse mode temporarily overrides the daylight window and captures every 5 minutes by default
+  - start with `POST /onboard/timelapse/start?hours=2`
+  - optional duration fields: `hours`, `duration_hours`, `duration_minutes`, `minutes`, or `duration_ms`
+  - optional interval override: `interval_ms=300000`
+  - stop early with `POST /onboard/timelapse/stop`
+  - when the duration expires, the firmware automatically returns to normal onboard camera mode
 - battery telemetry reads the HT-HC32/33 battery divider (`GPIO1` / `ADC_IN`, controlled by `GPIO20` / `ADC_Ctrl`)
 - idle WiFi scanning is available at `/scan/wifi`
 - upstream API upload plumbing is available over HaLow:
@@ -138,7 +150,13 @@ the bridge is connected to the trail-camera hotspot or streaming.
 Control behavior is now server-oriented rather than console-oriented:
 
 - the `POST /control/*` routes return quickly with a queued/accepted response
+- `POST /control/stream_start` can be queued behind an active `bringup`; the
+  accepted response uses `message: "queued_after:bringup"` instead of rejecting
+  with `busy:bringup`
 - a background worker task performs the actual BLE / WiFi / RTSP work
+- `POST /session/lease?ttl_ms=120000` keeps the camera session warm on the board and refreshes on camera proxy activity
+- `POST /session/release` clears the lease and can request camera standby
+- `GET /camera/latest?type=1` returns one item from a small gallery page instead of relaying the full gallery
 - `POST /camera/request` can now forward raw JSON bodies to the camera, for example `POST /cmd/setSetting` and `POST /cmd/setGmtClock`
 - `/camera/raw` now dechunks camera file responses before relaying them to the server
 - in local serial mode the sketch now boots HaLow and the HTTP control plane immediately instead of waiting for camera wake first
@@ -149,6 +167,11 @@ Control behavior is now server-oriented rather than console-oriented:
   - `control_last_action`
   - `control_last_ok`
   - `control_last_message`
+- `/status` also exposes:
+  - `camera_session` for lease state and camera request activity
+  - `timing` for bringup phase timings
+  - `stream_status` for RTSP status codes, tunnel target/connect errors, UDP
+    receive counters, and tunnel-forwarding counters
 
 ## Current Live-View Result
 
@@ -245,12 +268,26 @@ In local serial mode, `stream_start` now:
 - runs the proven RTSP live-view sequence
 - opens the TCP tunnel to the Pi receiver
 - forwards packets seen on local UDP listeners into that tunnel
+- reports precise stream failure stage through `/status.stream_status`
+
+Latest live-board validation:
+
+- `POST /control/bringup` succeeds and joins the camera as `192.168.8.30`
+- RTSP `DESCRIBE`, `SETUP`, and `PLAY` return `200`
+- camera RTP is received from `192.168.8.1:49152` on local UDP port `25748`
+- camera RTCP is received from `192.168.8.1:49153` on local UDP port `25749`
+- when the upstream receiver is available at `UPSTREAM_TUNNEL_HOST:UPSTREAM_TUNNEL_PORT`,
+  `stream_status.tunnel_packets_sent` and `stream_status.tunnel_bytes_sent`
+  increase
+- if the upstream receiver is missing, `/status.stream_status` reports
+  `last_stage: "tunnel_connect_failed"` and the socket error code
 
 This is the current preferred mode while validating end-to-end live forwarding.
 
 ## Local Receiver
 
-Run the upstream receiver on the Pi at `192.168.1.39`:
+Run the upstream receiver on the server configured as `UPSTREAM_TUNNEL_HOST`
+or, by default, `UPSTREAM_API_HOST`:
 
 ```bash
 python3 /home/matheau/esp32_camera/gardepro_tunnel_server.py --verbose

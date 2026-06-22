@@ -2943,7 +2943,8 @@ A background worker task on the ESP32 performs the actual action.
 Board-side camera routes also expanded:
 
 - generic JSON-capable camera request proxy:
-  - `GET /camera/request?method=GET&path=/cmd/...`
+  - `GET /camera/request?path=/cmd/...`
+  - `POST /camera/request?method=POST&path=/cmd/...&content_type=application/json`
 - raw camera fetch passthrough:
   - `GET /camera/raw?path=/...`
 - added fixed info routes:

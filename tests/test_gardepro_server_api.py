@@ -198,6 +198,58 @@ class GardeProServerAPITests(unittest.TestCase):
         self.assertEqual(result, {"result": {"ok": True}})
         self.assertEqual(calls, ["open", "action", "close"])
 
+    def test_camera_request_get_omits_method_query(self) -> None:
+        api = self.make_api()
+        calls: list[tuple[str, str, object, object, str]] = []
+
+        def request_json(method, path, *, query=None, body=None, content_type=""):
+            calls.append((method, path, query, body, content_type))
+            return 200, {}, {"code": 0}
+
+        api.request_json = request_json
+        api.bringup = lambda: self.fail("bringup should not be called")
+
+        result = api.camera_request_json("GET", "/cmd/getSetting")
+
+        self.assertEqual(result, {"code": 0})
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "/camera/request", {"path": "/cmd/getSetting"}, None, ""),
+            ],
+        )
+
+    def test_camera_request_post_includes_method_and_content_type(self) -> None:
+        api = self.make_api()
+        calls: list[tuple[str, str, object, object, str]] = []
+
+        def request_json(method, path, *, query=None, body=None, content_type=""):
+            calls.append((method, path, query, body, content_type))
+            return 200, {}, {"code": 0}
+
+        api.request_json = request_json
+        api.bringup = lambda: self.fail("bringup should not be called")
+
+        result = api.camera_request_json_body("POST", "/cmd/setSetting", {"data": {"mode": 1}})
+
+        self.assertEqual(result, {"code": 0})
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "POST",
+                    "/camera/request",
+                    {
+                        "path": "/cmd/setSetting",
+                        "method": "POST",
+                        "content_type": "application/json",
+                    },
+                    b'{"data":{"mode":1}}',
+                    "application/json",
+                ),
+            ],
+        )
+
     def test_list_media_in_session_returns_serialized_media(self) -> None:
         api = self.make_api()
         calls: list[str] = []

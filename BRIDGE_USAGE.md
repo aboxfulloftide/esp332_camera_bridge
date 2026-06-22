@@ -204,7 +204,7 @@ Format behavior:
 
 Current board-side camera routes:
 
-- `GET /camera/request?method=GET&path=/cmd/...`
+- `GET /camera/request?path=/cmd/...`
 - `POST /camera/request?method=POST&path=/cmd/...&content_type=application/json` with raw request body
 - `GET /camera/raw?path=/...`
 - `GET /camera/info/1..6`
@@ -339,23 +339,28 @@ Current firmware clue summary:
   - `tc_sleep_ctl(...)`
 - this supports using firmware as a clue source for settings/session behavior, not as a patch target
 
-Current blocker from the latest live validation:
+Current live validation state:
 
-- the attached camera is currently not powered, so the latest BLE wake/discovery conclusions should be treated as provisional until rerun with a valid device state
-- the board now comes up on HaLow immediately after boot and `/status` is reachable before `bringup`
-- `/status` now stays responsive while `bringup` is actively running, and the Python control path now gets a board-side `bringup_failed` result instead of timing out waiting for control completion
-- the local serial loop now polls the HTTP server far more frequently, and the long BLE / WiFi waits now yield cooperatively instead of sleeping in large blocking chunks
-- background idle WiFi recovery no longer races with a manual `bringup`; during the latest run `idle_recoveries` stayed at `0` while `control_action` was `bringup`
-- after the failed `bringup`, `/status` remains usable and reports `control_last_message: "bringup_failed"`
-- BLE scan telemetry is now exposed in `/status`:
-  - `ble_scan_mode`
-  - `ble_scan_results`
-  - `ble_scan_attempts`
-  - `ble_target_seen_count`
-  - `ble_last_seen_*`
-  - `ble_best_seen_*`
-- the latest live run saw `30` advertisements during active scan and `56` total after passive fallback, but `ble_target_seen_count` stayed `0` and the final state was still `ble_stage: "scan_not_found"`
-- the remaining live blocker is now narrower:
-  - BLE target discovery / wake reliability
-  - getting the camera hotspot to appear after wake
-  - only after that can settings-key mapping and delete-path confirmation be completed against an awake camera
+- the board boots onto HaLow and `/status` is reachable before camera bringup
+- `POST /control/bringup` wakes the camera, joins camera WiFi, and reports
+  `control_last_message: "bringup_complete"` on success
+- `POST /control/stream_start` can now queue behind active `bringup`; the
+  board returns `message: "queued_after:bringup"` instead of dropping the live
+  start request as `busy:bringup`
+- RTSP `DESCRIBE`, `SETUP`, and `PLAY` are confirmed at status `200`
+- camera RTP/RTCP packets are confirmed on the board UDP listeners:
+  - primary RTP: local `25748`, source `192.168.8.1:49152`
+  - secondary RTCP: local `25749`, source `192.168.8.1:49153`
+- `/status.stream_status` reports:
+  - RTSP status codes
+  - selected PLAY URL
+  - tunnel target and tunnel connect error
+  - UDP receive counters
+  - tunnel forwarding counters
+- the live tunnel target is no longer hard-coded to `192.168.1.39`; it defaults
+  to `UPSTREAM_API_HOST:6000` through `UPSTREAM_TUNNEL_HOST` /
+  `UPSTREAM_TUNNEL_PORT`
+- if there is no upstream receiver listening at the configured tunnel target,
+  the board reports `stream_tunnel_connect_failed`; if the receiver is present,
+  `stream_status.tunnel_packets_sent` and `stream_status.tunnel_bytes_sent`
+  should increase

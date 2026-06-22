@@ -508,14 +508,16 @@ class GardeProServerAPI:
         body: bytes | None = None,
         content_type: str = "",
     ) -> Any:
+        http_method = "POST" if body is not None else "GET"
+        query = {"path": camera_path}
+        if body is not None:
+            query["method"] = method.upper()
+            if content_type:
+                query["content_type"] = content_type
         status, _, payload = self.request_json(
-            "POST" if body is not None else "GET",
+            http_method,
             "/camera/request",
-            query={
-                "method": method.upper(),
-                "path": camera_path,
-                **({"content_type": content_type} if content_type else {}),
-            },
+            query=query,
             body=body,
             content_type=content_type,
         )
@@ -525,13 +527,9 @@ class GardeProServerAPI:
             return payload
         self.bringup()
         status, _, payload = self.request_json(
-            "POST" if body is not None else "GET",
+            http_method,
             "/camera/request",
-            query={
-                "method": method.upper(),
-                "path": camera_path,
-                **({"content_type": content_type} if content_type else {}),
-            },
+            query=query,
             body=body,
             content_type=content_type,
         )
