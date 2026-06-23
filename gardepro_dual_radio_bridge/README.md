@@ -60,12 +60,18 @@ server with the current:
 - `/onboard/status`
 - `/onboard/latest.jpg`
 - `/onboard/capture`
+- `GET /onboard/media`
+- `GET /onboard/media/{id}`
+- `GET /onboard/media/{id}/thumb`
+- `DELETE /onboard/media/{id}`
+- `POST /onboard/media/delete_all`
 - `/onboard/config`
 - `/onboard/timelapse/start`
 - `/onboard/timelapse/stop`
 - `/scan/wifi`
 - `/upload/status`
 - `/upload/telemetry`
+- `/upload/observations`
 - `/upload/events`
 - `/upload/all`
 - `/control/bringup`
@@ -90,8 +96,17 @@ server with the current:
 Unified board features:
 
 - onboard ESP camera initializes at boot and captures a JPEG every 30 minutes by default
-- latest onboard JPEG is available at `/onboard/latest.jpg`
+- every successful capture is persisted to LittleFS with a monotonic media ID and metadata sidecar
+- saved media survives reboot; deleting media does not renumber IDs or cause ID reuse
+- latest saved onboard JPEG is available at `/onboard/latest.jpg`, including after reboot
 - force a fresh onboard capture with `POST /onboard/capture`
+- list saved captures with `GET /onboard/media?offset=0&limit=50&sort=newest`
+  - `sort=oldest` reverses the order
+  - optional `from` and `to` filters accept Unix epoch seconds
+- download or delete an item with `GET` or `DELETE /onboard/media/{id}`
+- delete all items with `POST /onboard/media/delete_all`; the response reports `deleted` and `failed`
+- thumbnail generation is not currently supported; `thumb_path` is `null` and the thumbnail route returns `thumbnail_not_available`
+- the active HT-HC33 partition currently exposes 640 KiB to LittleFS, so UXGA retention is limited and `storage_full` is returned before an incomplete file is created
 - periodic onboard capture now defaults to one JPEG every 30 minutes
 - with `PSRAM=opi` enabled, the onboard camera supports UXGA `1600x1200`
 - scheduled onboard captures run only inside the configured daylight window
@@ -116,6 +131,13 @@ Unified board features:
   - when the duration expires, the firmware automatically returns to normal onboard camera mode
 - battery telemetry reads the HT-HC32/33 battery divider (`GPIO1` / `ADC_IN`, controlled by `GPIO20` / `ADC_Ctrl`)
 - idle WiFi scanning is available at `/scan/wifi`
+- scheduled WiFi and BLE scans upload to `/api/observations/upload` over HaLow
+  - the first scan runs 15 seconds after boot
+  - scans run every 2 minutes during the `07:00`-`21:00` daytime window
+  - scans run every 15 minutes at night
+  - when the clock is not set, the 2-minute interval is used
+  - camera WiFi, streaming, and control work pause both scanners; blocked or failed cycles retry after 30 seconds
+  - `POST /upload/observations` manually runs and uploads both scanners
 - upstream API upload plumbing is available over HaLow:
   - `GET /upload/status`
   - `POST /upload/telemetry` -> `/api/board/telemetry`
@@ -130,6 +152,10 @@ Upload configuration is supplied by `local_config.h`:
 - `UPSTREAM_API_PORT` defaults to `80`
 - `UPSTREAM_API_PREFIX` defaults to `/trail_cam`, making firmware uploads target `http://192.168.1.42/trail_cam/api/...`
 - `UPSTREAM_API_TOKEN`
+- `AIR_SCAN_API_HOST` defaults to `192.168.1.22`
+- `AIR_SCAN_API_PORT` defaults to `8002`; WiFi/BLE observations are posted to
+  `/api/observations/upload` there, and that service writes the `wireless`
+  database on `192.168.1.42`
 
 The firmware sets `BOARD_HOSTNAME` on the ESP32 2.4 GHz WiFi station before
 joining the trail-camera hotspot. The current Heltec HaLow wrapper does not

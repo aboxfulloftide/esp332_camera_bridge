@@ -7,6 +7,11 @@
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
 #include <Preferences.h>
+#include <LittleFS.h>
+#include <FS.h>
+#include <uri/UriRegex.h>
+#include <algorithm>
+#include <vector>
 #include <stdint.h>
 #include <time.h>
 #include <sys/time.h>
@@ -77,6 +82,12 @@ static const uint16_t CAMERA_RTSP_PORT = 554;
 #ifndef UPSTREAM_API_TOKEN
 #define UPSTREAM_API_TOKEN ""
 #endif
+#ifndef AIR_SCAN_API_HOST
+#define AIR_SCAN_API_HOST "192.168.1.22"
+#endif
+#ifndef AIR_SCAN_API_PORT
+#define AIR_SCAN_API_PORT 8002
+#endif
 #ifndef UPSTREAM_TUNNEL_HOST
 #define UPSTREAM_TUNNEL_HOST UPSTREAM_API_HOST
 #endif
@@ -129,6 +140,11 @@ static const int BAT_ADC_CTRL_PIN = 20;
 static const int BAT_CHRG_PIN = 15;
 static const int BAT_DONE_PIN = 16;
 static const unsigned long WIFI_SCAN_CACHE_MS = 60000UL;
+static const unsigned long WIFI_SCAN_DAY_INTERVAL_MS = 120000UL;
+static const unsigned long WIFI_SCAN_NIGHT_INTERVAL_MS = 900000UL;
+static const unsigned long WIFI_SCAN_INITIAL_DELAY_MS = 15000UL;
+static const uint16_t WIFI_SCAN_DAY_START_MINUTE = 420;
+static const uint16_t WIFI_SCAN_DAY_END_MINUTE = 1260;
 
 WebServer server(BRIDGE_HTTP_PORT);
 bool httpServerStarted = false;
@@ -224,6 +240,9 @@ static const uint8_t BLE_CONNECT_ATTEMPTS = 3;
 static const uint16_t BLE_CONNECT_TIMEOUT_MS = 15000;
 static const uint8_t BLE_WAKE_PULSE_ATTEMPTS = 3;
 static const unsigned long BLE_WAKE_PULSE_DELAY_MS = 350;
+static const size_t BLE_OBSERVATION_DEVICE_LIMIT = 96;
+static const size_t BLE_OBSERVATION_FIELD_LIMIT = 512;
+static const uint32_t BLE_OBSERVATION_SCAN_WINDOW_MS = 10000UL;
 static const unsigned long BRINGUP_HOTSPOT_WAIT_MS = 20000;
 static const unsigned long BRINGUP_HOTSPOT_POLL_MS = 3000;
 static const unsigned long BRINGUP_HOTSPOT_FAST_WINDOW_MS = 10000;
@@ -258,10 +277,20 @@ unsigned long lastWifiJoinElapsedMs = 0;
 unsigned long lastCameraHttpElapsedMs = 0;
 SemaphoreHandle_t tunnelWriteMutex = nullptr;
 TaskHandle_t controlWorkerTaskHandle = nullptr;
+TaskHandle_t wifiScannerTaskHandle = nullptr;
+SemaphoreHandle_t observationUploadMutex = nullptr;
 
 SemaphoreHandle_t onboardFrameMutex = nullptr;
+SemaphoreHandle_t onboardStorageMutex = nullptr;
 TaskHandle_t onboardCaptureTaskHandle = nullptr;
 bool onboardCameraReady = false;
+bool onboardStorageReady = false;
+String onboardStorageError;
+uint32_t onboardStoredPhotoCount = 0;
+uint32_t onboardLatestMediaId = 0;
+uint32_t onboardNextMediaId = 1;
+static const char *ONBOARD_MEDIA_DIR = "/onboard";
+static const uint32_t ONBOARD_MEDIA_META_MAGIC = 0x4f4d4431;
 bool onboardCaptureEnabled = ONBOARD_CAPTURE_ENABLED != 0;
 unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
 uint16_t onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
@@ -305,6 +334,26 @@ bool onboardAgc = true;
 int onboardAgcGain = 0;
 int onboardSpecialEffect = 0;
 
+struct OnboardMediaInfo {
+  uint32_t id;
+  uint32_t recordedAt;
+  size_t bytes;
+  uint16_t width;
+  uint16_t height;
+  uint8_t captureKind;
+};
+
+struct OnboardMediaMetaDisk {
+  uint32_t magic;
+  uint32_t id;
+  uint32_t recordedAt;
+  uint32_t bytes;
+  uint16_t width;
+  uint16_t height;
+  uint8_t captureKind;
+  uint8_t reserved[3];
+};
+
 struct OnboardCameraSettings {
   framesize_t frameSize;
   int jpegQuality;
@@ -327,9 +376,45 @@ struct OnboardCameraSettings {
 };
 
 String wifiScanLastJson = "{\"networks\":[]}";
+String wifiObservationsLastJson = "";
 uint16_t wifiScanLastCount = 0;
 unsigned long wifiScanLastMs = 0;
 bool wifiScanBusy = false;
+unsigned long wifiScannerLastRunMs = 0;
+unsigned long wifiScannerLastUploadMs = 0;
+uint32_t wifiScannerRunCount = 0;
+uint32_t wifiScannerUploadSuccessCount = 0;
+uint32_t wifiScannerUploadFailureCount = 0;
+String wifiScannerLastError = "idle";
+unsigned long bleScannerLastRunMs = 0;
+unsigned long bleScannerLastUploadMs = 0;
+uint32_t bleScannerRunCount = 0;
+uint32_t bleScannerLastCount = 0;
+uint32_t bleScannerUploadSuccessCount = 0;
+uint32_t bleScannerUploadFailureCount = 0;
+uint32_t bleScannerLastManufacturerCount = 0;
+uint32_t bleScannerLastServicesCount = 0;
+uint32_t bleScannerLastServiceDataCount = 0;
+uint32_t bleScannerLastTxPowerCount = 0;
+uint32_t bleScannerLastNameCount = 0;
+String bleScannerLastError = "idle";
+String bleObservationsLastJson = "";
+
+struct BleObservationEntry {
+  bool active;
+  String mac;
+  int rssi;
+  bool isRandomized;
+  bool hasTxPower;
+  int txPower;
+  String localName;
+  String manufacturerData;
+  String advServices;
+  String advServiceData;
+};
+
+BleObservationEntry bleObservationEntries[BLE_OBSERVATION_DEVICE_LIMIT];
+size_t bleObservationEntryCount = 0;
 
 Preferences runtimePrefs;
 uint32_t persistentBootCount = 0;
@@ -1434,11 +1519,152 @@ bool initOnboardCamera() {
   return true;
 }
 
-bool captureOnboardFrame() {
-  if (!onboardCameraReady) {
-    ++onboardCaptureFailures;
+const char *onboardCaptureKindName(uint8_t kind) {
+  if (kind == 1) return "scheduled";
+  if (kind == 2) return "timelapse";
+  return "manual";
+}
+
+uint8_t onboardCaptureKindValue(const char *kind) {
+  if (kind != nullptr && strcmp(kind, "scheduled") == 0) return 1;
+  if (kind != nullptr && strcmp(kind, "timelapse") == 0) return 2;
+  return 0;
+}
+
+String onboardMediaIdString(uint32_t id) {
+  char value[12];
+  snprintf(value, sizeof(value), "%08lu", static_cast<unsigned long>(id));
+  return String(value);
+}
+
+String onboardMediaImagePath(uint32_t id) {
+  return String(ONBOARD_MEDIA_DIR) + "/" + onboardMediaIdString(id) + ".jpg";
+}
+
+String onboardMediaMetaPath(uint32_t id) {
+  return String(ONBOARD_MEDIA_DIR) + "/" + onboardMediaIdString(id) + ".meta";
+}
+
+String onboardRecordedAtJson(uint32_t epoch) {
+  if (epoch < 1700000000UL) return "null";
+  time_t timestamp = static_cast<time_t>(epoch);
+  struct tm tmValue{};
+  gmtime_r(&timestamp, &tmValue);
+  char formatted[24];
+  strftime(formatted, sizeof(formatted), "%Y-%m-%dT%H:%M:%SZ", &tmValue);
+  return "\"" + String(formatted) + "\"";
+}
+
+bool readOnboardMediaInfo(uint32_t id, OnboardMediaInfo &info) {
+  if (!onboardStorageReady || id == 0) return false;
+  const String imagePath = onboardMediaImagePath(id);
+  const String metaPath = onboardMediaMetaPath(id);
+  File image = LittleFS.open(imagePath, FILE_READ);
+  if (!image || image.isDirectory()) return false;
+  const size_t imageBytes = image.size();
+  image.close();
+  File metaFile = LittleFS.open(metaPath, FILE_READ);
+  if (!metaFile || metaFile.size() != sizeof(OnboardMediaMetaDisk)) return false;
+  OnboardMediaMetaDisk disk{};
+  const size_t readBytes = metaFile.read(reinterpret_cast<uint8_t *>(&disk), sizeof(disk));
+  metaFile.close();
+  if (readBytes != sizeof(disk) || disk.magic != ONBOARD_MEDIA_META_MAGIC || disk.id != id) return false;
+  info.id = id;
+  info.recordedAt = disk.recordedAt;
+  info.bytes = imageBytes;
+  info.width = disk.width;
+  info.height = disk.height;
+  info.captureKind = disk.captureKind;
+  return true;
+}
+
+void refreshOnboardMediaState() {
+  onboardStoredPhotoCount = 0;
+  onboardLatestMediaId = 0;
+  if (!onboardStorageReady) return;
+  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  if (!dir || !dir.isDirectory()) return;
+  File file = dir.openNextFile(FILE_READ);
+  while (file) {
+    const String name = file.name();
+    if (!file.isDirectory() && name.endsWith(".jpg")) {
+      const int slash = name.lastIndexOf('/');
+      const String idText = name.substring(slash + 1, name.length() - 4);
+      const uint32_t id = strtoul(idText.c_str(), nullptr, 10);
+      OnboardMediaInfo info{};
+      if (id > 0 && readOnboardMediaInfo(id, info)) {
+        ++onboardStoredPhotoCount;
+        if (id > onboardLatestMediaId) onboardLatestMediaId = id;
+      }
+    }
+    file.close();
+    file = dir.openNextFile(FILE_READ);
+  }
+  dir.close();
+  if (onboardLatestMediaId >= onboardNextMediaId) onboardNextMediaId = onboardLatestMediaId + 1;
+}
+
+bool initOnboardStorage() {
+  onboardStorageReady = LittleFS.begin(true);
+  if (!onboardStorageReady) {
+    onboardStorageError = "storage_unavailable";
+    Serial.println("[onboard-storage] LittleFS mount failed");
     return false;
   }
+  if (!LittleFS.exists(ONBOARD_MEDIA_DIR) && !LittleFS.mkdir(ONBOARD_MEDIA_DIR)) {
+    onboardStorageReady = false;
+    onboardStorageError = "storage_unavailable";
+    Serial.println("[onboard-storage] media directory creation failed");
+    return false;
+  }
+  Preferences mediaPrefs;
+  if (mediaPrefs.begin("media", true)) {
+    onboardNextMediaId = mediaPrefs.getULong("next_id", 1);
+    mediaPrefs.end();
+  }
+  refreshOnboardMediaState();
+  onboardStorageError = "";
+  Serial.printf("[onboard-storage] ready total=%u used=%u photos=%u latest=%lu next=%lu\n",
+                static_cast<unsigned>(LittleFS.totalBytes()),
+                static_cast<unsigned>(LittleFS.usedBytes()),
+                onboardStoredPhotoCount,
+                static_cast<unsigned long>(onboardLatestMediaId),
+                static_cast<unsigned long>(onboardNextMediaId));
+  return true;
+}
+
+String buildOnboardMediaJson(const OnboardMediaInfo &info, bool includeCaptureFields) {
+  const String id = onboardMediaIdString(info.id);
+  String payload = "{";
+  payload += "\"id\":\"" + id + "\"";
+  payload += ",\"filename\":\"" + id + ".jpg\"";
+  payload += ",\"recorded_at\":" + onboardRecordedAtJson(info.recordedAt);
+  payload += ",\"bytes\":" + String(static_cast<unsigned>(info.bytes));
+  payload += ",\"content_type\":\"image/jpeg\"";
+  payload += ",\"width\":" + String(info.width);
+  payload += ",\"height\":" + String(info.height);
+  if (includeCaptureFields) {
+    payload += ",\"capture_kind\":\"" + String(onboardCaptureKindName(info.captureKind)) + "\"";
+    payload += ",\"path\":\"/onboard/media/" + id + "\"";
+    payload += ",\"thumb_path\":null";
+  }
+  payload += "}";
+  return payload;
+}
+
+bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *savedMedia = nullptr, String *captureError = nullptr) {
+  if (!onboardCameraReady) {
+    ++onboardCaptureFailures;
+    if (captureError != nullptr) *captureError = "onboard_camera_not_ready";
+    return false;
+  }
+  if (!onboardStorageReady) {
+    ++onboardCaptureFailures;
+    if (captureError != nullptr) *captureError = "storage_unavailable";
+    return false;
+  }
+
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (fb == nullptr || fb->len == 0) {
@@ -1446,6 +1672,20 @@ bool captureOnboardFrame() {
     if (fb != nullptr) {
       esp_camera_fb_return(fb);
     }
+    if (captureError != nullptr) *captureError = "capture_failed";
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    return false;
+  }
+
+  const size_t freeBytes = LittleFS.totalBytes() > LittleFS.usedBytes()
+                             ? LittleFS.totalBytes() - LittleFS.usedBytes()
+                             : 0;
+  if (freeBytes < fb->len + sizeof(OnboardMediaMetaDisk) + 4096) {
+    ++onboardCaptureFailures;
+    esp_camera_fb_return(fb);
+    onboardStorageError = "storage_full";
+    if (captureError != nullptr) *captureError = "storage_full";
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     return false;
   }
 
@@ -1453,11 +1693,62 @@ bool captureOnboardFrame() {
   if (copy == nullptr) {
     ++onboardCaptureFailures;
     esp_camera_fb_return(fb);
+    if (captureError != nullptr) *captureError = "capture_failed";
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     return false;
   }
   memcpy(copy, fb->buf, fb->len);
   const size_t copyLen = fb->len;
+  const uint16_t width = fb->width;
+  const uint16_t height = fb->height;
+  const uint32_t id = onboardNextMediaId;
+  const uint32_t recordedAt = onboardClockValid() ? static_cast<uint32_t>(time(nullptr)) : 0;
+  const String imagePath = onboardMediaImagePath(id);
+  const String metaPath = onboardMediaMetaPath(id);
+  const String tempImagePath = String(ONBOARD_MEDIA_DIR) + "/.capture.jpg.tmp";
+  const String tempMetaPath = String(ONBOARD_MEDIA_DIR) + "/.capture.meta.tmp";
+  LittleFS.remove(tempImagePath);
+  LittleFS.remove(tempMetaPath);
+  File imageFile = LittleFS.open(tempImagePath, FILE_WRITE);
+  const size_t imageWritten = imageFile ? imageFile.write(fb->buf, fb->len) : 0;
+  if (imageFile) imageFile.close();
   esp_camera_fb_return(fb);
+
+  OnboardMediaMetaDisk disk{};
+  disk.magic = ONBOARD_MEDIA_META_MAGIC;
+  disk.id = id;
+  disk.recordedAt = recordedAt;
+  disk.bytes = copyLen;
+  disk.width = width;
+  disk.height = height;
+  disk.captureKind = onboardCaptureKindValue(captureKind);
+  File metaFile = LittleFS.open(tempMetaPath, FILE_WRITE);
+  const size_t metaWritten = metaFile ? metaFile.write(reinterpret_cast<const uint8_t *>(&disk), sizeof(disk)) : 0;
+  if (metaFile) metaFile.close();
+  const bool stored = imageWritten == copyLen && metaWritten == sizeof(disk) &&
+                      LittleFS.rename(tempImagePath, imagePath) && LittleFS.rename(tempMetaPath, metaPath);
+  if (!stored) {
+    LittleFS.remove(tempImagePath);
+    LittleFS.remove(tempMetaPath);
+    LittleFS.remove(imagePath);
+    LittleFS.remove(metaPath);
+    free(copy);
+    ++onboardCaptureFailures;
+    onboardStorageError = "storage_unavailable";
+    if (captureError != nullptr) *captureError = "storage_unavailable";
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    return false;
+  }
+
+  ++onboardNextMediaId;
+  Preferences mediaPrefs;
+  if (mediaPrefs.begin("media", false)) {
+    mediaPrefs.putULong("next_id", onboardNextMediaId);
+    mediaPrefs.end();
+  }
+  ++onboardStoredPhotoCount;
+  onboardLatestMediaId = id;
+  onboardStorageError = "";
 
   if (onboardFrameMutex != nullptr) {
     xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
@@ -1474,8 +1765,21 @@ bool captureOnboardFrame() {
     free(old);
   }
 
-  Serial.printf("[onboard-camera] captured bytes=%u count=%u\n",
+  if (savedMedia != nullptr) {
+    savedMedia->id = id;
+    savedMedia->recordedAt = recordedAt;
+    savedMedia->bytes = copyLen;
+    savedMedia->width = width;
+    savedMedia->height = height;
+    savedMedia->captureKind = disk.captureKind;
+  }
+  if (captureError != nullptr) *captureError = "";
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+
+  Serial.printf("[onboard-camera] captured id=%s bytes=%u kind=%s count=%u\n",
+                onboardMediaIdString(id).c_str(),
                 static_cast<unsigned>(copyLen),
+                onboardCaptureKindName(disk.captureKind),
                 onboardCaptureCount);
   return true;
 }
@@ -1498,6 +1802,12 @@ String buildOnboardCameraStatusJson() {
   if (onboardFrameMutex != nullptr) {
     xSemaphoreGive(onboardFrameMutex);
   }
+  OnboardMediaInfo latestInfo{};
+  if (onboardStorageReady && onboardLatestMediaId != 0 && readOnboardMediaInfo(onboardLatestMediaId, latestInfo)) {
+    latestLen = latestInfo.bytes;
+  }
+  const size_t storageTotal = onboardStorageReady ? LittleFS.totalBytes() : 0;
+  const size_t storageUsed = onboardStorageReady ? LittleFS.usedBytes() : 0;
 
   const int localMinute = onboardLocalMinuteOfDay();
   String payload = "{";
@@ -1533,6 +1843,13 @@ String buildOnboardCameraStatusJson() {
   payload += ",\"agc\":" + String(onboardAgc ? "true" : "false");
   payload += ",\"agc_gain\":" + String(onboardAgcGain);
   payload += ",\"special_effect\":" + String(onboardSpecialEffect);
+  payload += ",\"storage_ready\":" + String(onboardStorageReady ? "true" : "false");
+  payload += ",\"storage_type\":\"littlefs\"";
+  payload += ",\"storage_total_bytes\":" + String(static_cast<unsigned>(storageTotal));
+  payload += ",\"storage_used_bytes\":" + String(static_cast<unsigned>(storageUsed));
+  payload += ",\"storage_free_bytes\":" + String(static_cast<unsigned>(storageTotal >= storageUsed ? storageTotal - storageUsed : 0));
+  payload += ",\"stored_photo_count\":" + String(onboardStoredPhotoCount);
+  payload += ",\"latest_media_id\":" + (onboardLatestMediaId == 0 ? String("null") : "\"" + onboardMediaIdString(onboardLatestMediaId) + "\"");
   payload += ",\"latest_bytes\":" + String(static_cast<unsigned>(latestLen));
   payload += ",\"captures\":" + String(count);
   payload += ",\"failures\":" + String(failures);
@@ -1904,7 +2221,7 @@ void onboardCaptureTask(void *pvParameters) {
       if (onboardTimelapseActive) {
         if (onboardTimelapseLastCaptureMs == 0 ||
             nowMs - onboardTimelapseLastCaptureMs >= onboardTimelapseIntervalMs) {
-          if (captureOnboardFrame()) {
+          if (captureOnboardFrame("timelapse")) {
             onboardTimelapseLastCaptureMs = millis();
             ++onboardTimelapseCaptureCount;
           }
@@ -1915,7 +2232,7 @@ void onboardCaptureTask(void *pvParameters) {
             nowMs - onboardLastScheduleAttemptMs >= normalIntervalMs) {
           onboardLastScheduleAttemptMs = nowMs;
           if (onboardCaptureWindowActive()) {
-            captureOnboardFrame();
+            captureOnboardFrame("scheduled");
           } else {
             ++onboardCaptureScheduleSkips;
             Serial.printf("[onboard-camera] scheduled capture skipped clock_valid=%s local_minute=%d window=%s-%s\n",
@@ -1953,7 +2270,44 @@ String buildWifiScanJson(int scanCount) {
   return payload;
 }
 
-bool runIdleWifiScan(String &payload, String &error) {
+int wifiChannelFrequencyMhz(int channel) {
+  if (channel == 14) return 2484;
+  if (channel >= 1 && channel <= 13) return 2407 + channel * 5;
+  return 0;
+}
+
+String buildWifiObservationsJson(int scanCount) {
+  String payload = "{";
+  payload += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
+  payload += ",\"health\":{";
+  payload += "\"mac\":\"" + WiFi.macAddress() + "\"";
+  payload += ",\"free_heap\":" + String(ESP.getFreeHeap());
+  payload += ",\"min_free_heap\":" + String(ESP.getMinFreeHeap());
+  payload += ",\"uptime_ms\":" + String(millis());
+  payload += ",\"temperature_c\":" + String(readChipTemperatureC(), 1);
+  payload += "},\"observations\":[";
+  for (int i = 0; i < scanCount; ++i) {
+    if (i > 0) payload += ",";
+    const int channel = WiFi.channel(i);
+    payload += "{";
+    payload += "\"mac\":\"" + WiFi.BSSIDstr(i) + "\"";
+    payload += ",\"device_type\":\"AP\"";
+    payload += ",\"interface\":\"esp32-wifi\"";
+    payload += ",\"signal_dbm\":" + String(WiFi.RSSI(i));
+    payload += ",\"channel\":" + String(channel);
+    payload += ",\"freq_mhz\":" + String(wifiChannelFrequencyMhz(channel));
+    payload += ",\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\"";
+    payload += ",\"ht\":false,\"vht\":false,\"he\":false";
+    payload += ",\"probe_count\":1";
+    payload += ",\"recorded_at\":" + buildRecordedAtJsonValue();
+    payload += "}";
+  }
+  payload += "]}";
+  return payload;
+}
+
+bool runIdleWifiScan(String &payload, String &error, int &scanCode) {
+  scanCode = 0;
   if (wifiScanBusy) {
     error = "scan_busy";
     return false;
@@ -1965,15 +2319,22 @@ bool runIdleWifiScan(String &payload, String &error) {
 
   wifiScanBusy = true;
   const wifi_mode_t previousMode = WiFi.getMode();
+  WiFi.scanDelete();
+  WiFi.disconnect(false, false);
   WiFi.mode(WIFI_STA);
-  delay(50);
+  delay(200);
   const int count = WiFi.scanNetworks(false, true);
   if (count < 0) {
+    scanCode = count;
     error = "scan_failed";
+    Serial.printf("[WiFi] idle scan failed code=%d\n", count);
+    WiFi.scanDelete();
+    WiFi.mode(previousMode);
     wifiScanBusy = false;
     return false;
   }
   payload = buildWifiScanJson(count);
+  wifiObservationsLastJson = buildWifiObservationsJson(count);
   WiFi.scanDelete();
   wifiScanLastJson = payload;
   wifiScanLastCount = count;
@@ -2010,7 +2371,15 @@ String jsonNullableString(const String &value) {
 }
 
 String buildRecordedAtJsonValue() {
-  return "null";
+  const time_t now = time(nullptr);
+  if (now < 1700000000) return "null";
+  struct tm tmValue{};
+  gmtime_r(&now, &tmValue);
+  char formatted[24];
+  // air_scan passes this string directly to MySQL DATETIME, which rejects a
+  // trailing UTC "Z" even though it is valid ISO 8601.
+  strftime(formatted, sizeof(formatted), "%Y-%m-%dT%H:%M:%S", &tmValue);
+  return "\"" + String(formatted) + "\"";
 }
 
 void setUploadResult(bool ok, int statusCode, const String &message) {
@@ -2123,6 +2492,8 @@ String buildUploadStatusJson() {
   payload += ",\"api_host\":\"" + jsonEscape(UPSTREAM_API_HOST) + "\"";
   payload += ",\"api_port\":" + String(UPSTREAM_API_PORT);
   payload += ",\"api_prefix\":\"" + jsonEscape(UPSTREAM_API_PREFIX) + "\"";
+  payload += ",\"observations_api_host\":\"" + jsonEscape(AIR_SCAN_API_HOST) + "\"";
+  payload += ",\"observations_api_port\":" + String(AIR_SCAN_API_PORT);
   payload += ",\"attempts\":" + String(uploadAttemptCount);
   payload += ",\"successes\":" + String(uploadSuccessCount);
   payload += ",\"failures\":" + String(uploadFailureCount);
@@ -2131,6 +2502,30 @@ String buildUploadStatusJson() {
   payload += ",\"last_attempt_age_ms\":" + String(msSince(uploadLastAttemptMs));
   payload += ",\"last_success_age_ms\":" + String(msSince(uploadLastSuccessMs));
   payload += ",\"queued_events\":" + String(static_cast<unsigned>(uploadEventCount));
+  payload += ",\"wifi_scanner\":{";
+  payload += "\"runs\":" + String(wifiScannerRunCount);
+  payload += ",\"upload_successes\":" + String(wifiScannerUploadSuccessCount);
+  payload += ",\"upload_failures\":" + String(wifiScannerUploadFailureCount);
+  payload += ",\"last_error\":\"" + jsonEscape(wifiScannerLastError) + "\"";
+  payload += ",\"last_run_age_ms\":" + String(msSince(wifiScannerLastRunMs));
+  payload += ",\"last_upload_age_ms\":" + String(msSince(wifiScannerLastUploadMs));
+  payload += ",\"day_interval_ms\":" + String(WIFI_SCAN_DAY_INTERVAL_MS);
+  payload += ",\"night_interval_ms\":" + String(WIFI_SCAN_NIGHT_INTERVAL_MS);
+  payload += "}";
+  payload += ",\"ble_scanner\":{";
+  payload += "\"runs\":" + String(bleScannerRunCount);
+  payload += ",\"last_count\":" + String(bleScannerLastCount);
+  payload += ",\"upload_successes\":" + String(bleScannerUploadSuccessCount);
+  payload += ",\"upload_failures\":" + String(bleScannerUploadFailureCount);
+  payload += ",\"last_error\":\"" + jsonEscape(bleScannerLastError) + "\"";
+  payload += ",\"last_run_age_ms\":" + String(msSince(bleScannerLastRunMs));
+  payload += ",\"last_upload_age_ms\":" + String(msSince(bleScannerLastUploadMs));
+  payload += ",\"last_manufacturer_count\":" + String(bleScannerLastManufacturerCount);
+  payload += ",\"last_services_count\":" + String(bleScannerLastServicesCount);
+  payload += ",\"last_service_data_count\":" + String(bleScannerLastServiceDataCount);
+  payload += ",\"last_tx_power_count\":" + String(bleScannerLastTxPowerCount);
+  payload += ",\"last_name_count\":" + String(bleScannerLastNameCount);
+  payload += "}";
   payload += "}";
   return payload;
 }
@@ -2504,8 +2899,224 @@ class BridgeBleAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
   }
 };
 
+String bytesToHex(const std::string &data) {
+  static const char hex[] = "0123456789abcdef";
+  String output;
+  output.reserve(data.size() * 2);
+  for (uint8_t value : data) {
+    output += hex[(value >> 4) & 0x0f];
+    output += hex[value & 0x0f];
+  }
+  return output;
+}
+
+String normalizeBleUuid(String uuid) {
+  uuid.toLowerCase();
+  if (uuid.length() == 4) {
+    return "0000" + uuid + "-0000-1000-8000-00805f9b34fb";
+  }
+  if (uuid.length() == 8) {
+    return uuid + "-0000-1000-8000-00805f9b34fb";
+  }
+  return uuid;
+}
+
+void truncateBleField(String &value) {
+  if (value.length() > BLE_OBSERVATION_FIELD_LIMIT) {
+    value.remove(BLE_OBSERVATION_FIELD_LIMIT);
+  }
+}
+
+String formatBleManufacturerData(const NimBLEAdvertisedDevice *device) {
+  String output;
+  for (uint8_t i = 0; i < device->getManufacturerDataCount(); ++i) {
+    const std::string data = device->getManufacturerData(i);
+    if (data.size() < 2) continue;
+    if (!output.isEmpty()) output += ",";
+    const uint16_t companyId = static_cast<uint8_t>(data[0]) |
+                               (static_cast<uint16_t>(static_cast<uint8_t>(data[1])) << 8);
+    char company[6];
+    snprintf(company, sizeof(company), "%04X:", companyId);
+    output += company;
+    output += bytesToHex(data.substr(2));
+  }
+  return output;
+}
+
+void resetBleObservationEntries() {
+  for (size_t i = 0; i < bleObservationEntryCount; ++i) {
+    bleObservationEntries[i] = BleObservationEntry{};
+  }
+  bleObservationEntryCount = 0;
+}
+
+BleObservationEntry *findOrCreateBleObservationEntry(const String &mac) {
+  for (size_t i = 0; i < bleObservationEntryCount; ++i) {
+    if (bleObservationEntries[i].active && bleObservationEntries[i].mac == mac) {
+      return &bleObservationEntries[i];
+    }
+  }
+  if (bleObservationEntryCount >= BLE_OBSERVATION_DEVICE_LIMIT) return nullptr;
+  BleObservationEntry &entry = bleObservationEntries[bleObservationEntryCount++];
+  entry = BleObservationEntry{};
+  entry.active = true;
+  entry.mac = mac;
+  entry.rssi = -127;
+  return &entry;
+}
+
+void mergeBleObservation(const NimBLEAdvertisedDevice *device) {
+  String mac = device->getAddress().toString().c_str();
+  mac.toLowerCase();
+  BleObservationEntry *entry = findOrCreateBleObservationEntry(mac);
+  if (entry == nullptr) return;
+
+  const int rssi = device->getRSSI();
+  if (rssi > entry->rssi) entry->rssi = rssi;
+  entry->isRandomized = device->getAddressType() != 0;
+  if (device->haveTXPower()) {
+    entry->hasTxPower = true;
+    entry->txPower = device->getTXPower();
+  }
+
+  const String name = device->haveName() ? String(device->getName().c_str()) : String("");
+  if (!name.isEmpty() && entry->localName.isEmpty()) {
+    entry->localName = name;
+    truncateBleField(entry->localName);
+  }
+
+  String manufacturerData = formatBleManufacturerData(device);
+  truncateBleField(manufacturerData);
+  if (!manufacturerData.isEmpty() && entry->manufacturerData.isEmpty()) {
+    entry->manufacturerData = manufacturerData;
+  }
+
+  String services;
+  for (uint8_t i = 0; i < device->getServiceUUIDCount(); ++i) {
+    if (i > 0) services += ",";
+    services += normalizeBleUuid(device->getServiceUUID(i).toString().c_str());
+  }
+  truncateBleField(services);
+  if (!services.isEmpty()) {
+    if (entry->advServices.isEmpty()) {
+      entry->advServices = services;
+    } else if (entry->advServices.indexOf(services) < 0) {
+      String merged = entry->advServices + "," + services;
+      truncateBleField(merged);
+      entry->advServices = merged;
+    }
+  }
+
+  String serviceData;
+  for (uint8_t i = 0; i < device->getServiceDataCount(); ++i) {
+    if (i > 0) serviceData += ",";
+    serviceData += normalizeBleUuid(device->getServiceDataUUID(i).toString().c_str());
+    serviceData += ":";
+    serviceData += bytesToHex(device->getServiceData(i));
+  }
+  truncateBleField(serviceData);
+  if (!serviceData.isEmpty() && entry->advServiceData.isEmpty()) {
+    entry->advServiceData = serviceData;
+  }
+}
+
+void buildBleObservationsPayload() {
+  bleObservationsLastJson = "{";
+  bleObservationsLastJson += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
+  bleObservationsLastJson += ",\"health\":{";
+  bleObservationsLastJson += "\"mac\":\"" + WiFi.macAddress() + "\"";
+  bleObservationsLastJson += ",\"free_heap\":" + String(ESP.getFreeHeap());
+  bleObservationsLastJson += ",\"min_free_heap\":" + String(ESP.getMinFreeHeap());
+  bleObservationsLastJson += ",\"uptime_ms\":" + String(millis());
+  bleObservationsLastJson += ",\"temperature_c\":" + String(readChipTemperatureC(), 1);
+  bleObservationsLastJson += "},\"observations\":[";
+
+  bleScannerLastCount = 0;
+  bleScannerLastManufacturerCount = 0;
+  bleScannerLastServicesCount = 0;
+  bleScannerLastServiceDataCount = 0;
+  bleScannerLastTxPowerCount = 0;
+  bleScannerLastNameCount = 0;
+  for (size_t i = 0; i < bleObservationEntryCount; ++i) {
+    const BleObservationEntry &entry = bleObservationEntries[i];
+    if (!entry.active || entry.mac.isEmpty()) continue;
+    if (bleScannerLastCount > 0) bleObservationsLastJson += ",";
+    bleObservationsLastJson += "{";
+    bleObservationsLastJson += "\"mac\":\"" + jsonEscape(entry.mac) + "\"";
+    bleObservationsLastJson += ",\"device_type\":\"BLE\"";
+    bleObservationsLastJson += ",\"interface\":\"esp32-ble\"";
+    bleObservationsLastJson += ",\"signal_dbm\":" + String(entry.rssi);
+    bleObservationsLastJson += ",\"channel\":null,\"freq_mhz\":null,\"ssid\":null";
+    bleObservationsLastJson += ",\"local_name\":" + jsonNullableString(entry.localName);
+    bleObservationsLastJson += ",\"is_randomized\":" + String(entry.isRandomized ? "true" : "false");
+    bleObservationsLastJson += ",\"ht\":false,\"vht\":false,\"he\":false";
+    bleObservationsLastJson += ",\"probe_count\":1";
+    bleObservationsLastJson += ",\"manufacturer_data\":" + jsonNullableString(entry.manufacturerData);
+    bleObservationsLastJson += ",\"adv_services\":" + jsonNullableString(entry.advServices);
+    bleObservationsLastJson += ",\"adv_service_data\":" + jsonNullableString(entry.advServiceData);
+    bleObservationsLastJson += ",\"tx_power\":" + (entry.hasTxPower ? String(entry.txPower) : String("null"));
+    bleObservationsLastJson += ",\"recorded_at\":" + buildRecordedAtJsonValue();
+    bleObservationsLastJson += "}";
+    ++bleScannerLastCount;
+    if (!entry.manufacturerData.isEmpty()) ++bleScannerLastManufacturerCount;
+    if (!entry.advServices.isEmpty()) ++bleScannerLastServicesCount;
+    if (!entry.advServiceData.isEmpty()) ++bleScannerLastServiceDataCount;
+    if (entry.hasTxPower) ++bleScannerLastTxPowerCount;
+    if (!entry.localName.isEmpty()) ++bleScannerLastNameCount;
+  }
+  bleObservationsLastJson += "]}";
+}
+
+class ObservationBleScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *device) override {
+    mergeBleObservation(device);
+  }
+};
+
 static BridgeBleClientCallbacks bridgeBleClientCallbacks;
 static BridgeBleAdvertisedDeviceCallbacks bridgeBleScanCallbacks;
+static ObservationBleScanCallbacks observationBleScanCallbacks;
+
+bool runBleObservationScan(String &error) {
+  if (streamSessionActive || wifiConnected || isControlActionActive()) {
+    error = "camera_wifi_active";
+    return false;
+  }
+  if (bleClient != nullptr && bleClient->isConnected()) {
+    error = "camera_ble_active";
+    return false;
+  }
+  bleScannerLastRunMs = millis();
+  ++bleScannerRunCount;
+  bleScannerLastCount = 0;
+  resetBleObservationEntries();
+  if (!bleInitialized) {
+    cooperativeDelay(BLE_INIT_WARMUP_MS);
+    NimBLEDevice::init(BOARD_HOSTNAME);
+    bleInitialized = true;
+  }
+
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->stop();
+  scan->clearResults();
+  scan->setScanCallbacks(&observationBleScanCallbacks, true);
+  scan->setActiveScan(true);
+  scan->setInterval(BLE_SCAN_INTERVAL_MS);
+  scan->setWindow(BLE_SCAN_WINDOW_MS);
+  scan->setMaxResults(0);
+  const bool started = scan->start(BLE_OBSERVATION_SCAN_WINDOW_MS, false, true);
+  const unsigned long startedMs = millis();
+  while (scan->isScanning() && millis() - startedMs < BLE_OBSERVATION_SCAN_WINDOW_MS + 500UL) cooperativeDelay(50);
+  scan->stop();
+  scan->setScanCallbacks(&bridgeBleScanCallbacks, true);
+  buildBleObservationsPayload();
+  if (!started) {
+    error = "ble_scan_failed";
+    return false;
+  }
+  error = "";
+  return true;
+}
 
 bool connectBleTargetWithRetries() {
   bleLastConnectError = 0;
@@ -2947,10 +3558,12 @@ String normalizeApiPath(const String &path) {
   return prefix + "/" + path;
 }
 
-bool postJsonToUpstream(const String &path,
-                        const String &requestBody,
-                        String &responseBody,
-                        int &statusCode) {
+bool postJsonToApi(const char *apiHost,
+                   uint16_t apiPort,
+                   const String &requestPath,
+                   const String &requestBody,
+                   String &responseBody,
+                   int &statusCode) {
   if (!halowConnected || HaLow.status() != WL_CONNECTED) {
     connectHaLow();
   }
@@ -2973,8 +3586,8 @@ bool postJsonToUpstream(const String &path,
 
   sockaddr_in upstreamAddr{};
   upstreamAddr.sin_family = AF_INET;
-  upstreamAddr.sin_addr.s_addr = inet_addr(UPSTREAM_API_HOST);
-  upstreamAddr.sin_port = htons(UPSTREAM_API_PORT);
+  upstreamAddr.sin_addr.s_addr = inet_addr(apiHost);
+  upstreamAddr.sin_port = htons(apiPort);
 
   if (connect(sock, reinterpret_cast<sockaddr *>(&upstreamAddr), sizeof(upstreamAddr)) != 0) {
     close(sock);
@@ -2983,9 +3596,8 @@ bool postJsonToUpstream(const String &path,
     return false;
   }
 
-  const String requestPath = normalizeApiPath(path);
   String request = "POST " + requestPath + " HTTP/1.1\r\n";
-  request += "Host: " + String(UPSTREAM_API_HOST) + ":" + String(UPSTREAM_API_PORT) + "\r\n";
+  request += "Host: " + String(apiHost) + ":" + String(apiPort) + "\r\n";
   request += "User-Agent: esp32-gardepro-unified/0.1\r\n";
   request += "Content-Type: application/json\r\n";
   request += "Accept: application/json\r\n";
@@ -3047,6 +3659,87 @@ bool postJsonToUpstream(const String &path,
   return statusCode >= 200 && statusCode < 300;
 }
 
+bool postJsonToUpstream(const String &path,
+                        const String &requestBody,
+                        String &responseBody,
+                        int &statusCode) {
+  return postJsonToApi(UPSTREAM_API_HOST,
+                       UPSTREAM_API_PORT,
+                       normalizeApiPath(path),
+                       requestBody,
+                       responseBody,
+                       statusCode);
+}
+
+bool syncBoardClockFromAirScan() {
+  if (onboardClockValid()) return true;
+  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) return false;
+  timeval timeout{};
+  timeout.tv_sec = 5;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = inet_addr(AIR_SCAN_API_HOST);
+  addr.sin_port = htons(AIR_SCAN_API_PORT);
+  if (connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    close(sock);
+    return false;
+  }
+  const String request = "HEAD / HTTP/1.1\r\nHost: " + String(AIR_SCAN_API_HOST) +
+                         ":" + String(AIR_SCAN_API_PORT) + "\r\nConnection: close\r\n\r\n";
+  if (!sendAll(sock, reinterpret_cast<const uint8_t *>(request.c_str()), request.length())) {
+    close(sock);
+    return false;
+  }
+  char buffer[1025];
+  const int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+  close(sock);
+  if (received <= 0) return false;
+  buffer[received] = '\0';
+  String headers(buffer);
+  String lower = headers;
+  lower.toLowerCase();
+  const int dateStart = lower.indexOf("\r\ndate:");
+  if (dateStart < 0) return false;
+  const int valueStart = dateStart + 7;
+  const int valueEnd = headers.indexOf("\r\n", valueStart);
+  if (valueEnd < 0) return false;
+  String dateValue = headers.substring(valueStart, valueEnd);
+  dateValue.trim();
+  char weekday[4] = {};
+  char monthName[4] = {};
+  int day = 0, year = 0, hour = 0, minute = 0, second = 0;
+  if (sscanf(dateValue.c_str(), "%3[^,], %d %3s %d %d:%d:%d GMT",
+             weekday, &day, monthName, &year, &hour, &minute, &second) != 7) return false;
+  static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  int month = -1;
+  for (int i = 0; i < 12; ++i) {
+    if (strcmp(monthName, months[i]) == 0) {
+      month = i;
+      break;
+    }
+  }
+  if (month < 0) return false;
+  struct tm tmValue{};
+  tmValue.tm_year = year - 1900;
+  tmValue.tm_mon = month;
+  tmValue.tm_mday = day;
+  tmValue.tm_hour = hour;
+  tmValue.tm_min = minute;
+  tmValue.tm_sec = second;
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  const time_t epoch = mktime(&tmValue);
+  if (epoch < 1700000000) return false;
+  timeval tv{};
+  tv.tv_sec = epoch;
+  settimeofday(&tv, nullptr);
+  Serial.printf("[clock] synchronized from air_scan HTTP date epoch=%ld\n", static_cast<long>(epoch));
+  return true;
+}
+
 bool uploadTelemetryNow(String &responseBody, int &statusCode) {
   ++uploadAttemptCount;
   const String payload = buildBoardTelemetryJson();
@@ -3054,6 +3747,120 @@ bool uploadTelemetryNow(String &responseBody, int &statusCode) {
   setUploadResult(ok, statusCode, ok ? "telemetry_uploaded" : responseBody);
   enqueueUploadEvent("telemetry_upload", ok ? "manual_or_api" : "upload_failed", "{\"status_code\":" + String(statusCode) + "}", ok);
   return ok;
+}
+
+bool uploadWifiObservationsNow(String &responseBody, int &statusCode) {
+  syncBoardClockFromAirScan();
+  String scanPayload;
+  String scanError;
+  int scanCode = 0;
+  wifiScannerLastRunMs = millis();
+  ++wifiScannerRunCount;
+  if (!runIdleWifiScan(scanPayload, scanError, scanCode)) {
+    statusCode = 0;
+    wifiScannerLastError = scanError;
+    responseBody = "{\"error\":\"" + jsonEscape(scanError) + "\"";
+    if (scanError == "scan_failed") responseBody += ",\"scan_code\":" + String(scanCode);
+    responseBody += "}";
+    ++wifiScannerUploadFailureCount;
+    Serial.printf("[wifi-scanner] scan skipped/failed error=%s code=%d\n", scanError.c_str(), scanCode);
+    return false;
+  }
+
+  ++uploadAttemptCount;
+  const bool ok = postJsonToApi(AIR_SCAN_API_HOST,
+                                AIR_SCAN_API_PORT,
+                                "/api/observations/upload",
+                                wifiObservationsLastJson,
+                                responseBody,
+                                statusCode);
+  setUploadResult(ok, statusCode, ok ? "wifi_observations_uploaded" : responseBody);
+  if (ok) {
+    ++wifiScannerUploadSuccessCount;
+    wifiScannerLastUploadMs = millis();
+    wifiScannerLastError = "";
+  } else {
+    ++wifiScannerUploadFailureCount;
+    wifiScannerLastError = "upload_failed";
+  }
+  Serial.printf("[wifi-scanner] networks=%u upload=%s status=%d\n",
+                wifiScanLastCount,
+                ok ? "ok" : "failed",
+                statusCode);
+  return ok;
+}
+
+bool uploadBleObservationsNow(String &responseBody, int &statusCode) {
+  String scanError;
+  if (!runBleObservationScan(scanError)) {
+    statusCode = 0;
+    responseBody = "{\"error\":\"" + jsonEscape(scanError) + "\"}";
+    bleScannerLastError = scanError;
+    ++bleScannerUploadFailureCount;
+    Serial.printf("[ble-scanner] scan skipped/failed error=%s\n", scanError.c_str());
+    return false;
+  }
+  ++uploadAttemptCount;
+  const bool ok = postJsonToApi(AIR_SCAN_API_HOST,
+                                AIR_SCAN_API_PORT,
+                                "/api/observations/upload",
+                                bleObservationsLastJson,
+                                responseBody,
+                                statusCode);
+  setUploadResult(ok, statusCode, ok ? "ble_observations_uploaded" : responseBody);
+  if (ok) {
+    ++bleScannerUploadSuccessCount;
+    bleScannerLastUploadMs = millis();
+    bleScannerLastError = "";
+  } else {
+    ++bleScannerUploadFailureCount;
+    bleScannerLastError = "upload_failed";
+  }
+  Serial.printf("[ble-scanner] devices=%u upload=%s status=%d\n",
+                bleScannerLastCount,
+                ok ? "ok" : "failed",
+                statusCode);
+  return ok;
+}
+
+unsigned long currentWifiScannerIntervalMs() {
+  if (!onboardClockValid()) return WIFI_SCAN_DAY_INTERVAL_MS;
+  const int localMinute = onboardLocalMinuteOfDay();
+  const bool daytime = localMinute >= WIFI_SCAN_DAY_START_MINUTE && localMinute < WIFI_SCAN_DAY_END_MINUTE;
+  return daytime ? WIFI_SCAN_DAY_INTERVAL_MS : WIFI_SCAN_NIGHT_INTERVAL_MS;
+}
+
+void wifiScannerTask(void *pvParameters) {
+  (void)pvParameters;
+  vTaskDelay(pdMS_TO_TICKS(WIFI_SCAN_INITIAL_DELAY_MS));
+  while (true) {
+    String wifiResponse;
+    int wifiStatus = 0;
+    if (observationUploadMutex != nullptr) {
+      xSemaphoreTake(observationUploadMutex, portMAX_DELAY);
+    }
+    const bool wifiOk = uploadWifiObservationsNow(wifiResponse, wifiStatus);
+    String bleResponse;
+    int bleStatus = 0;
+    const bool bleOk = uploadBleObservationsNow(bleResponse, bleStatus);
+    if (observationUploadMutex != nullptr) {
+      xSemaphoreGive(observationUploadMutex);
+    }
+    const unsigned long waitMs = (wifiOk && bleOk) ? currentWifiScannerIntervalMs() : 30000UL;
+    vTaskDelay(pdMS_TO_TICKS(waitMs));
+  }
+}
+
+void startWifiScannerTask() {
+  if (wifiScannerTaskHandle == nullptr) {
+    xTaskCreatePinnedToCore(wifiScannerTask,
+                            "rf-scanner",
+                            12288,
+                            nullptr,
+                            1,
+                            &wifiScannerTaskHandle,
+                            1);
+  }
 }
 
 bool uploadQueuedEventsNow(String &responseBody, int &statusCode) {
@@ -3931,32 +4738,34 @@ void handleOnboardCameraStatus() {
 }
 
 void handleOnboardCameraLatest() {
-  if (!onboardCameraReady) {
-    server.send(503, "application/json", "{\"error\":\"onboard_camera_not_ready\"}");
+  if (!onboardStorageReady) {
+    server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
     return;
   }
 
   if (server.hasArg("capture") && server.arg("capture") == "1") {
-    captureOnboardFrame();
+    String error;
+    if (!captureOnboardFrame("manual", nullptr, &error)) {
+      server.send(error == "storage_full" ? 507 : 500, "application/json", "{\"error\":\"" + jsonEscape(error) + "\"}");
+      return;
+    }
   }
 
-  uint8_t *buf = nullptr;
-  size_t len = 0;
-  if (onboardFrameMutex != nullptr) {
-    xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
+  if (onboardLatestMediaId == 0) {
+    server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
+    return;
   }
-  buf = onboardLatestJpeg;
-  len = onboardLatestJpegLen;
-  if (onboardFrameMutex != nullptr) {
-    xSemaphoreGive(onboardFrameMutex);
-  }
-
-  if (buf == nullptr || len == 0) {
-    server.send(404, "application/json", "{\"error\":\"no_onboard_capture\"}");
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  File file = LittleFS.open(onboardMediaImagePath(onboardLatestMediaId), FILE_READ);
+  if (!file) {
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
     return;
   }
   server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "image/jpeg", reinterpret_cast<const char *>(buf), len);
+  server.streamFile(file, "image/jpeg");
+  file.close();
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
 }
 
 void handleOnboardCameraCapture() {
@@ -3976,7 +4785,9 @@ void handleOnboardCameraCapture() {
     cooperativeDelay(150);
   }
 
-  const bool ok = captureOnboardFrame();
+  OnboardMediaInfo savedMedia{};
+  String captureError;
+  const bool ok = captureOnboardFrame("manual", &savedMedia, &captureError);
   bool settingsRestored = !hasOneShotSettings;
   if (hasOneShotSettings) {
     String restoreError;
@@ -3988,11 +4799,183 @@ void handleOnboardCameraCapture() {
 
   String payload = "{";
   payload += "\"ok\":" + String(ok ? "true" : "false");
+  if (!ok) payload += ",\"error\":\"" + jsonEscape(captureError.isEmpty() ? String("capture_failed") : captureError) + "\"";
+  if (ok) payload += ",\"media\":" + buildOnboardMediaJson(savedMedia, false);
+  payload += ",\"latest_updated\":" + String(ok ? "true" : "false");
   payload += ",\"one_shot_settings\":" + String(hasOneShotSettings ? "true" : "false");
   payload += ",\"settings_restored\":" + String(settingsRestored ? "true" : "false");
   payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
   payload += "}";
-  server.send(ok ? 200 : 500, "application/json", payload);
+  const int status = ok ? 200 : (captureError == "storage_full" ? 507 : (captureError == "storage_unavailable" ? 503 : 500));
+  server.send(status, "application/json", payload);
+}
+
+bool parseOnboardMediaId(const String &value, uint32_t &id) {
+  if (value.isEmpty() || value.length() > 10) return false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (!isDigit(value[i])) return false;
+  }
+  id = strtoul(value.c_str(), nullptr, 10);
+  return id > 0;
+}
+
+void handleOnboardMediaList() {
+  if (!onboardStorageReady) {
+    server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
+    return;
+  }
+  unsigned offset = server.hasArg("offset") ? server.arg("offset").toInt() : 0;
+  unsigned limit = server.hasArg("limit") ? server.arg("limit").toInt() : 50;
+  if (limit == 0 || limit > 100) {
+    server.send(400, "application/json", "{\"error\":\"invalid_request\",\"detail\":\"limit must be 1..100\"}");
+    return;
+  }
+  const bool oldestFirst = server.hasArg("sort") && server.arg("sort") == "oldest";
+  uint32_t fromEpoch = server.hasArg("from") ? strtoul(server.arg("from").c_str(), nullptr, 10) : 0;
+  uint32_t toEpoch = server.hasArg("to") ? strtoul(server.arg("to").c_str(), nullptr, 10) : UINT32_MAX;
+  std::vector<OnboardMediaInfo> media;
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  if (dir && dir.isDirectory()) {
+    File file = dir.openNextFile(FILE_READ);
+    while (file) {
+      const String name = file.name();
+      if (!file.isDirectory() && name.endsWith(".jpg")) {
+        const int slash = name.lastIndexOf('/');
+        uint32_t id = 0;
+        if (parseOnboardMediaId(name.substring(slash + 1, name.length() - 4), id)) {
+          OnboardMediaInfo info{};
+          if (readOnboardMediaInfo(id, info) &&
+              (info.recordedAt == 0 || (info.recordedAt >= fromEpoch && info.recordedAt <= toEpoch))) {
+            media.push_back(info);
+          }
+        }
+      }
+      file.close();
+      file = dir.openNextFile(FILE_READ);
+    }
+    dir.close();
+  }
+  std::sort(media.begin(), media.end(), [oldestFirst](const OnboardMediaInfo &a, const OnboardMediaInfo &b) {
+    return oldestFirst ? a.id < b.id : a.id > b.id;
+  });
+  String payload = "{";
+  payload += "\"count\":" + String(media.size());
+  payload += ",\"offset\":" + String(offset);
+  payload += ",\"limit\":" + String(limit);
+  payload += ",\"sort\":\"" + String(oldestFirst ? "oldest" : "newest") + "\"";
+  payload += ",\"media\":[";
+  unsigned emitted = 0;
+  for (size_t i = offset; i < media.size() && emitted < limit; ++i, ++emitted) {
+    if (emitted > 0) payload += ",";
+    payload += buildOnboardMediaJson(media[i], true);
+  }
+  payload += "]}";
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  server.send(200, "application/json", payload);
+}
+
+void handleOnboardMediaFile() {
+  if (!onboardStorageReady) {
+    server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
+    return;
+  }
+  uint32_t id = 0;
+  if (!parseOnboardMediaId(server.pathArg(0), id)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_request\"}");
+    return;
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  OnboardMediaInfo info{};
+  File file;
+  if (readOnboardMediaInfo(id, info)) file = LittleFS.open(onboardMediaImagePath(id), FILE_READ);
+  if (!file) {
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
+    return;
+  }
+  server.sendHeader("Cache-Control", "public, max-age=31536000, immutable");
+  server.streamFile(file, "image/jpeg");
+  file.close();
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+}
+
+void handleOnboardMediaThumb() {
+  uint32_t id = 0;
+  OnboardMediaInfo info{};
+  if (!onboardStorageReady) {
+    server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
+  } else if (!parseOnboardMediaId(server.pathArg(0), id)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_request\"}");
+  } else if (!readOnboardMediaInfo(id, info)) {
+    server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
+  } else {
+    server.send(404, "application/json", "{\"error\":\"thumbnail_not_available\"}");
+  }
+}
+
+void handleOnboardMediaDelete() {
+  if (!onboardStorageReady) {
+    server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
+    return;
+  }
+  uint32_t id = 0;
+  if (!parseOnboardMediaId(server.pathArg(0), id)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_request\"}");
+    return;
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  OnboardMediaInfo info{};
+  if (!readOnboardMediaInfo(id, info)) {
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
+    return;
+  }
+  const bool imageDeleted = LittleFS.remove(onboardMediaImagePath(id));
+  const bool metaDeleted = LittleFS.remove(onboardMediaMetaPath(id));
+  if (imageDeleted && metaDeleted) refreshOnboardMediaState();
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  if (!imageDeleted || !metaDeleted) {
+    server.send(500, "application/json", "{\"error\":\"delete_failed\"}");
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"id\":\"" + onboardMediaIdString(id) + "\"}");
+}
+
+void handleOnboardMediaDeleteAll() {
+  if (!onboardStorageReady) {
+    server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
+    return;
+  }
+  unsigned deleted = 0;
+  unsigned failed = 0;
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  std::vector<uint32_t> ids;
+  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  if (dir && dir.isDirectory()) {
+    File file = dir.openNextFile(FILE_READ);
+    while (file) {
+      const String name = file.name();
+      if (!file.isDirectory() && name.endsWith(".jpg")) {
+        const int slash = name.lastIndexOf('/');
+        uint32_t id = 0;
+        if (parseOnboardMediaId(name.substring(slash + 1, name.length() - 4), id)) ids.push_back(id);
+      }
+      file.close();
+      file = dir.openNextFile(FILE_READ);
+    }
+    dir.close();
+  }
+  for (uint32_t id : ids) {
+    const bool imageDeleted = LittleFS.remove(onboardMediaImagePath(id));
+    const bool metaDeleted = !LittleFS.exists(onboardMediaMetaPath(id)) || LittleFS.remove(onboardMediaMetaPath(id));
+    if (imageDeleted && metaDeleted) ++deleted; else ++failed;
+  }
+  refreshOnboardMediaState();
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  String payload = "{\"ok\":" + String(failed == 0 ? "true" : "false") +
+                   ",\"deleted\":" + String(deleted) + ",\"failed\":" + String(failed) + "}";
+  server.send(failed == 0 ? 200 : 500, "application/json", payload);
 }
 
 bool parseOnboardTimelapseArgs(unsigned long &durationMs, unsigned long &intervalMs, String &error) {
@@ -4144,10 +5127,16 @@ void handleWifiScan() {
 
   String payload;
   String error;
-  if (!runIdleWifiScan(payload, error)) {
+  int scanCode = 0;
+  if (!runIdleWifiScan(payload, error, scanCode)) {
     String body = "{";
     body += "\"error\":\"" + jsonEscape(error) + "\"";
-    body += ",\"hint\":\"scan requires idle trail-camera WiFi\"";
+    if (error == "scan_failed") {
+      body += ",\"scan_code\":" + String(scanCode);
+      body += ",\"hint\":\"ESP32 WiFi driver rejected the scan after STA reset\"";
+    } else if (error == "camera_wifi_active") {
+      body += ",\"hint\":\"scan requires idle trail-camera WiFi\"";
+    }
     body += "}";
     server.send(409, "application/json", body);
     return;
@@ -4171,6 +5160,28 @@ void handleUploadEvents() {
   int statusCode = 0;
   const bool ok = uploadQueuedEventsNow(body, statusCode);
   server.send(ok ? 200 : 502, "application/json", buildUploadResultJson(ok, statusCode, body));
+}
+
+void handleUploadObservations() {
+  if (observationUploadMutex != nullptr && xSemaphoreTake(observationUploadMutex, pdMS_TO_TICKS(60000)) != pdTRUE) {
+    server.send(409, "application/json", "{\"error\":\"observation_upload_busy\"}");
+    return;
+  }
+  String wifiBody;
+  int wifiStatus = 0;
+  const bool wifiOk = uploadWifiObservationsNow(wifiBody, wifiStatus);
+  String bleBody;
+  int bleStatus = 0;
+  const bool bleOk = uploadBleObservationsNow(bleBody, bleStatus);
+  String payload = "{";
+  payload += "\"ok\":" + String((wifiOk && bleOk) ? "true" : "false");
+  payload += ",\"wifi\":" + buildUploadResultJson(wifiOk, wifiStatus, wifiBody);
+  payload += ",\"ble\":" + buildUploadResultJson(bleOk, bleStatus, bleBody);
+  payload += "}";
+  if (observationUploadMutex != nullptr) {
+    xSemaphoreGive(observationUploadMutex);
+  }
+  server.send((wifiOk && bleOk) ? 200 : 502, "application/json", payload);
 }
 
 void handleUploadAll() {
@@ -4711,6 +5722,11 @@ void startHttpServer() {
   server.on("/onboard/status", HTTP_GET, handleOnboardCameraStatus);
   server.on("/onboard/latest.jpg", HTTP_GET, handleOnboardCameraLatest);
   server.on("/onboard/capture", HTTP_POST, handleOnboardCameraCapture);
+  server.on("/onboard/media", HTTP_GET, handleOnboardMediaList);
+  server.on("/onboard/media/delete_all", HTTP_POST, handleOnboardMediaDeleteAll);
+  server.on(UriRegex("^\\/onboard\\/media\\/([0-9]+)\\/thumb$"), HTTP_GET, handleOnboardMediaThumb);
+  server.on(UriRegex("^\\/onboard\\/media\\/([0-9]+)$"), HTTP_GET, handleOnboardMediaFile);
+  server.on(UriRegex("^\\/onboard\\/media\\/([0-9]+)$"), HTTP_DELETE, handleOnboardMediaDelete);
   server.on("/onboard/config", HTTP_POST, handleOnboardCameraConfig);
   server.on("/onboard/timelapse/start", HTTP_POST, handleOnboardTimelapseStart);
   server.on("/onboard/timelapse/stop", HTTP_POST, handleOnboardTimelapseStop);
@@ -4718,6 +5734,7 @@ void startHttpServer() {
   server.on("/upload/status", HTTP_GET, handleUploadStatus);
   server.on("/upload/telemetry", HTTP_POST, handleUploadTelemetry);
   server.on("/upload/events", HTTP_POST, handleUploadEvents);
+  server.on("/upload/observations", HTTP_POST, handleUploadObservations);
   server.on("/upload/all", HTTP_POST, handleUploadAll);
   server.on("/camera/info/1", HTTP_GET, handleCameraInfo1);
   server.on("/camera/info/2", HTTP_GET, handleCameraInfo2);
@@ -5030,8 +6047,11 @@ void handleSerialCommand(const String &line) {
   if (cmd == "wifi_scan") {
     String payload;
     String error;
-    if (runIdleWifiScan(payload, error)) {
+    int scanCode = 0;
+    if (runIdleWifiScan(payload, error, scanCode)) {
       Serial.println(payload);
+    } else if (error == "scan_failed") {
+      Serial.printf("[wifi-scan] failed error=%s code=%d\n", error.c_str(), scanCode);
     } else {
       Serial.printf("[wifi-scan] failed error=%s\n", error.c_str());
     }
@@ -5179,6 +6199,9 @@ void setup() {
   Serial.printf("[battery] %s\n", buildBatteryJson().c_str());
 
   onboardFrameMutex = xSemaphoreCreateMutex();
+  onboardStorageMutex = xSemaphoreCreateMutex();
+  observationUploadMutex = xSemaphoreCreateMutex();
+  initOnboardStorage();
   loadOnboardConfig();
   initOnboardCamera();
   if (onboardCaptureTaskHandle == nullptr) {
@@ -5216,6 +6239,7 @@ void setup() {
                               &controlWorkerTaskHandle,
                               CONTROL_WORKER_CORE);
     }
+    startWifiScannerTask();
     return;
   }
 
@@ -5254,6 +6278,7 @@ void setup() {
                             &controlWorkerTaskHandle,
                             CONTROL_WORKER_CORE);
   }
+  startWifiScannerTask();
 
   xTaskCreatePinnedToCore(udpForwardTask, "udp-primary", 4096, reinterpret_cast<void *>(0), 1, nullptr, 0);
   xTaskCreatePinnedToCore(udpForwardTask, "udp-secondary", 4096, reinterpret_cast<void *>(1), 1, nullptr, 0);
