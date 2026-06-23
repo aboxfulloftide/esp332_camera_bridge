@@ -88,6 +88,9 @@ static const uint16_t CAMERA_RTSP_PORT = 554;
 #ifndef AIR_SCAN_API_PORT
 #define AIR_SCAN_API_PORT 8002
 #endif
+#ifndef BOARD_TIMEZONE
+#define BOARD_TIMEZONE "EST5EDT,M3.2.0/2,M11.1.0/2"
+#endif
 #ifndef UPSTREAM_TUNNEL_HOST
 #define UPSTREAM_TUNNEL_HOST UPSTREAM_API_HOST
 #endif
@@ -2374,10 +2377,12 @@ String buildRecordedAtJsonValue() {
   const time_t now = time(nullptr);
   if (now < 1700000000) return "null";
   struct tm tmValue{};
-  gmtime_r(&now, &tmValue);
+  setenv("TZ", BOARD_TIMEZONE, 1);
+  tzset();
+  localtime_r(&now, &tmValue);
   char formatted[24];
   // air_scan passes this string directly to MySQL DATETIME, which rejects a
-  // trailing UTC "Z" even though it is valid ISO 8601.
+  // timezone suffix. Emit local wall time to match the database/server clock.
   strftime(formatted, sizeof(formatted), "%Y-%m-%dT%H:%M:%S", &tmValue);
   return "\"" + String(formatted) + "\"";
 }
@@ -3082,19 +3087,28 @@ bool runBleObservationScan(String &error) {
     error = "camera_wifi_active";
     return false;
   }
-  if (bleClient != nullptr && bleClient->isConnected()) {
-    error = "camera_ble_active";
-    return false;
-  }
   bleScannerLastRunMs = millis();
   ++bleScannerRunCount;
   bleScannerLastCount = 0;
   resetBleObservationEntries();
-  if (!bleInitialized) {
-    cooperativeDelay(BLE_INIT_WARMUP_MS);
-    NimBLEDevice::init(BOARD_HOSTNAME);
-    bleInitialized = true;
+
+  WiFi.mode(WIFI_OFF);
+  cooperativeDelay(200);
+
+  if (bleClient != nullptr) {
+    if (bleClient->isConnected()) {
+      bleClient->disconnect();
+      cooperativeDelay(50);
+    }
+    NimBLEDevice::deleteClient(bleClient);
+    bleClient = nullptr;
   }
+  bleNotifyChar3 = nullptr;
+  bleDataChar4 = nullptr;
+  NimBLEDevice::deinit(true);
+  cooperativeDelay(50);
+  NimBLEDevice::init(BOARD_HOSTNAME);
+  bleInitialized = true;
 
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->stop();
@@ -3737,6 +3751,8 @@ bool syncBoardClockFromAirScan() {
   tv.tv_sec = epoch;
   settimeofday(&tv, nullptr);
   Serial.printf("[clock] synchronized from air_scan HTTP date epoch=%ld\n", static_cast<long>(epoch));
+  setenv("TZ", BOARD_TIMEZONE, 1);
+  tzset();
   return true;
 }
 
@@ -3816,8 +3832,13 @@ bool uploadBleObservationsNow(String &responseBody, int &statusCode) {
     ++bleScannerUploadFailureCount;
     bleScannerLastError = "upload_failed";
   }
-  Serial.printf("[ble-scanner] devices=%u upload=%s status=%d\n",
+  Serial.printf("[ble-scanner] devices=%u mfr=%u svc=%u svc_data=%u name=%u tx=%u upload=%s status=%d\n",
                 bleScannerLastCount,
+                bleScannerLastManufacturerCount,
+                bleScannerLastServicesCount,
+                bleScannerLastServiceDataCount,
+                bleScannerLastNameCount,
+                bleScannerLastTxPowerCount,
                 ok ? "ok" : "failed",
                 statusCode);
   return ok;
