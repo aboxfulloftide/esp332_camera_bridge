@@ -2915,8 +2915,23 @@ String bytesToHex(const std::string &data) {
   return output;
 }
 
+String bytesToHex(const uint8_t *data, size_t length) {
+  static const char hex[] = "0123456789abcdef";
+  String output;
+  output.reserve(length * 2);
+  for (size_t i = 0; i < length; ++i) {
+    const uint8_t value = data[i];
+    output += hex[(value >> 4) & 0x0f];
+    output += hex[value & 0x0f];
+  }
+  return output;
+}
+
 String normalizeBleUuid(String uuid) {
   uuid.toLowerCase();
+  if (uuid.startsWith("0x")) {
+    uuid = uuid.substring(2);
+  }
   if (uuid.length() == 4) {
     return "0000" + uuid + "-0000-1000-8000-00805f9b34fb";
   }
@@ -2924,6 +2939,47 @@ String normalizeBleUuid(String uuid) {
     return uuid + "-0000-1000-8000-00805f9b34fb";
   }
   return uuid;
+}
+
+String formatBleUuid16(uint16_t uuid) {
+  char text[37];
+  snprintf(text, sizeof(text), "0000%04x-0000-1000-8000-00805f9b34fb", uuid);
+  return String(text);
+}
+
+String formatBleUuid32(uint32_t uuid) {
+  char text[37];
+  snprintf(text, sizeof(text), "%08lx-0000-1000-8000-00805f9b34fb", static_cast<unsigned long>(uuid));
+  return String(text);
+}
+
+String formatBleUuid128(const uint8_t *data) {
+  char text[37];
+  snprintf(text, sizeof(text),
+           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           data[15], data[14], data[13], data[12],
+           data[11], data[10],
+           data[9], data[8],
+           data[7], data[6],
+           data[5], data[4], data[3], data[2], data[1], data[0]);
+  return String(text);
+}
+
+void appendCsvValue(String &target, const String &value) {
+  if (value.isEmpty()) return;
+  if (target.isEmpty()) {
+    target = value;
+    return;
+  }
+  int start = 0;
+  while (start < target.length()) {
+    int end = target.indexOf(',', start);
+    if (end < 0) end = target.length();
+    if (target.substring(start, end) == value) return;
+    start = end + 1;
+  }
+  target += ",";
+  target += value;
 }
 
 void truncateBleField(String &value) {
@@ -2946,6 +3002,85 @@ String formatBleManufacturerData(const NimBLEAdvertisedDevice *device) {
     output += bytesToHex(data.substr(2));
   }
   return output;
+}
+
+void mergeBlePayloadFields(BleObservationEntry &entry, const uint8_t *payload, size_t payloadLength) {
+  size_t index = 0;
+  while (index < payloadLength) {
+    const uint8_t length = payload[index];
+    if (length == 0) break;
+    if (length < 1 || length > payloadLength - index - 1) break;
+    const uint8_t type = payload[index + 1];
+    const uint8_t *data = &payload[index + 2];
+    const size_t dataLength = length - 1;
+
+    if (type == 0xff && dataLength >= 2) {
+      const uint16_t companyId = static_cast<uint16_t>(data[0]) |
+                                 (static_cast<uint16_t>(data[1]) << 8);
+      char company[6];
+      snprintf(company, sizeof(company), "%04X:", companyId);
+      String value = String(company) + bytesToHex(data + 2, dataLength - 2);
+      truncateBleField(value);
+      appendCsvValue(entry.manufacturerData, value);
+    } else if ((type == 0x02 || type == 0x03) && dataLength >= 2) {
+      for (size_t pos = 0; pos + 1 < dataLength; pos += 2) {
+        appendCsvValue(entry.advServices,
+                       formatBleUuid16(static_cast<uint16_t>(data[pos]) |
+                                       (static_cast<uint16_t>(data[pos + 1]) << 8)));
+      }
+    } else if ((type == 0x04 || type == 0x05) && dataLength >= 4) {
+      for (size_t pos = 0; pos + 3 < dataLength; pos += 4) {
+        appendCsvValue(entry.advServices,
+                       formatBleUuid32(static_cast<uint32_t>(data[pos]) |
+                                       (static_cast<uint32_t>(data[pos + 1]) << 8) |
+                                       (static_cast<uint32_t>(data[pos + 2]) << 16) |
+                                       (static_cast<uint32_t>(data[pos + 3]) << 24)));
+      }
+    } else if ((type == 0x06 || type == 0x07) && dataLength >= 16) {
+      for (size_t pos = 0; pos + 15 < dataLength; pos += 16) {
+        appendCsvValue(entry.advServices, formatBleUuid128(data + pos));
+      }
+    } else if (type == 0x16 && dataLength >= 2) {
+      String value = formatBleUuid16(static_cast<uint16_t>(data[0]) |
+                                     (static_cast<uint16_t>(data[1]) << 8));
+      value += ":";
+      value += bytesToHex(data + 2, dataLength - 2);
+      truncateBleField(value);
+      appendCsvValue(entry.advServiceData, value);
+    } else if (type == 0x20 && dataLength >= 4) {
+      String value = formatBleUuid32(static_cast<uint32_t>(data[0]) |
+                                     (static_cast<uint32_t>(data[1]) << 8) |
+                                     (static_cast<uint32_t>(data[2]) << 16) |
+                                     (static_cast<uint32_t>(data[3]) << 24));
+      value += ":";
+      value += bytesToHex(data + 4, dataLength - 4);
+      truncateBleField(value);
+      appendCsvValue(entry.advServiceData, value);
+    } else if (type == 0x21 && dataLength >= 16) {
+      String value = formatBleUuid128(data);
+      value += ":";
+      value += bytesToHex(data + 16, dataLength - 16);
+      truncateBleField(value);
+      appendCsvValue(entry.advServiceData, value);
+    } else if ((type == 0x08 || type == 0x09) && dataLength > 0 && entry.localName.isEmpty()) {
+      String value;
+      value.reserve(dataLength);
+      for (size_t pos = 0; pos < dataLength; ++pos) {
+        const char c = static_cast<char>(data[pos]);
+        if (c >= 32 && c <= 126) value += c;
+      }
+      truncateBleField(value);
+      entry.localName = value;
+    } else if (type == 0x0a && dataLength >= 1) {
+      entry.hasTxPower = true;
+      entry.txPower = static_cast<int8_t>(data[0]);
+    }
+
+    truncateBleField(entry.manufacturerData);
+    truncateBleField(entry.advServices);
+    truncateBleField(entry.advServiceData);
+    index += length + 1;
+  }
 }
 
 void resetBleObservationEntries() {
@@ -2982,6 +3117,11 @@ void mergeBleObservation(const NimBLEAdvertisedDevice *device) {
   if (device->haveTXPower()) {
     entry->hasTxPower = true;
     entry->txPower = device->getTXPower();
+  }
+
+  const std::vector<uint8_t> &payload = device->getPayload();
+  if (!payload.empty()) {
+    mergeBlePayloadFields(*entry, payload.data(), payload.size());
   }
 
   const String name = device->haveName() ? String(device->getName().c_str()) : String("");
@@ -5169,6 +5309,14 @@ void handleUploadStatus() {
   server.send(200, "application/json", buildUploadStatusJson());
 }
 
+void handleUploadBleLast() {
+  if (bleObservationsLastJson.isEmpty()) {
+    server.send(404, "application/json", "{\"error\":\"no_ble_observation_payload\"}");
+    return;
+  }
+  server.send(200, "application/json", bleObservationsLastJson);
+}
+
 void handleUploadTelemetry() {
   String body;
   int statusCode = 0;
@@ -5753,6 +5901,7 @@ void startHttpServer() {
   server.on("/onboard/timelapse/stop", HTTP_POST, handleOnboardTimelapseStop);
   server.on("/scan/wifi", HTTP_GET, handleWifiScan);
   server.on("/upload/status", HTTP_GET, handleUploadStatus);
+  server.on("/upload/ble/last", HTTP_GET, handleUploadBleLast);
   server.on("/upload/telemetry", HTTP_POST, handleUploadTelemetry);
   server.on("/upload/events", HTTP_POST, handleUploadEvents);
   server.on("/upload/observations", HTTP_POST, handleUploadObservations);
