@@ -294,6 +294,9 @@ uint32_t onboardLatestMediaId = 0;
 uint32_t onboardNextMediaId = 1;
 static const char *ONBOARD_MEDIA_DIR = "/onboard";
 static const uint32_t ONBOARD_MEDIA_META_MAGIC = 0x4f4d4431;
+static const char *OBSERVATION_QUEUE_DIR = "/obsq";
+static const size_t OBSERVATION_QUEUE_MAX_FILES = 48;
+static const size_t OBSERVATION_QUEUE_MIN_FREE_BYTES = 32768;
 bool onboardCaptureEnabled = ONBOARD_CAPTURE_ENABLED != 0;
 unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
 uint16_t onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
@@ -434,6 +437,12 @@ int uploadLastStatusCode = 0;
 String uploadLastMessage = "idle";
 unsigned long uploadLastAttemptMs = 0;
 unsigned long uploadLastSuccessMs = 0;
+uint32_t observationQueueNextId = 1;
+uint32_t observationQueueEnqueueCount = 0;
+uint32_t observationQueueDropCount = 0;
+uint32_t observationQueueReplaySuccessCount = 0;
+uint32_t observationQueueReplayFailureCount = 0;
+String observationQueueLastError = "";
 
 struct CameraProbeTarget {
   const char *label;
@@ -1620,10 +1629,21 @@ bool initOnboardStorage() {
     Serial.println("[onboard-storage] media directory creation failed");
     return false;
   }
+  if (!LittleFS.exists(OBSERVATION_QUEUE_DIR) && !LittleFS.mkdir(OBSERVATION_QUEUE_DIR)) {
+    onboardStorageReady = false;
+    onboardStorageError = "storage_unavailable";
+    Serial.println("[observation-queue] directory creation failed");
+    return false;
+  }
   Preferences mediaPrefs;
   if (mediaPrefs.begin("media", true)) {
     onboardNextMediaId = mediaPrefs.getULong("next_id", 1);
     mediaPrefs.end();
+  }
+  Preferences queuePrefs;
+  if (queuePrefs.begin("obsq", true)) {
+    observationQueueNextId = queuePrefs.getULong("next_id", 1);
+    queuePrefs.end();
   }
   refreshOnboardMediaState();
   onboardStorageError = "";
@@ -2492,6 +2512,26 @@ void clearUploadedEvents() {
 }
 
 String buildUploadStatusJson() {
+  size_t queuedObservationBatches = 0;
+  size_t queuedObservationBytes = 0;
+  if (onboardStorageReady) {
+    File dir = LittleFS.open(OBSERVATION_QUEUE_DIR, FILE_READ);
+    if (dir && dir.isDirectory()) {
+      File file = dir.openNextFile(FILE_READ);
+      while (file) {
+        if (!file.isDirectory()) {
+          const String name = file.name();
+          if (name.endsWith(".json")) {
+            ++queuedObservationBatches;
+            queuedObservationBytes += file.size();
+          }
+        }
+        file.close();
+        file = dir.openNextFile(FILE_READ);
+      }
+      dir.close();
+    }
+  }
   String payload = "{";
   payload += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
   payload += ",\"api_host\":\"" + jsonEscape(UPSTREAM_API_HOST) + "\"";
@@ -2507,6 +2547,15 @@ String buildUploadStatusJson() {
   payload += ",\"last_attempt_age_ms\":" + String(msSince(uploadLastAttemptMs));
   payload += ",\"last_success_age_ms\":" + String(msSince(uploadLastSuccessMs));
   payload += ",\"queued_events\":" + String(static_cast<unsigned>(uploadEventCount));
+  payload += ",\"observation_queue\":{";
+  payload += "\"queued_batches\":" + String(static_cast<unsigned>(queuedObservationBatches));
+  payload += ",\"queued_bytes\":" + String(static_cast<unsigned>(queuedObservationBytes));
+  payload += ",\"enqueue_count\":" + String(observationQueueEnqueueCount);
+  payload += ",\"drop_count\":" + String(observationQueueDropCount);
+  payload += ",\"replay_successes\":" + String(observationQueueReplaySuccessCount);
+  payload += ",\"replay_failures\":" + String(observationQueueReplayFailureCount);
+  payload += ",\"last_error\":\"" + jsonEscape(observationQueueLastError) + "\"";
+  payload += "}";
   payload += ",\"wifi_scanner\":{";
   payload += "\"runs\":" + String(wifiScannerRunCount);
   payload += ",\"upload_successes\":" + String(wifiScannerUploadSuccessCount);
@@ -3825,6 +3874,163 @@ bool postJsonToUpstream(const String &path,
                        statusCode);
 }
 
+String observationQueuePath(uint32_t id, const String &kind) {
+  char name[40];
+  snprintf(name, sizeof(name), "/%08lu_%s.json", static_cast<unsigned long>(id), kind.c_str());
+  return String(OBSERVATION_QUEUE_DIR) + name;
+}
+
+bool observationQueueStats(size_t &count, size_t &bytes, std::vector<String> *paths = nullptr) {
+  count = 0;
+  bytes = 0;
+  if (paths != nullptr) paths->clear();
+  if (!onboardStorageReady) return false;
+  File dir = LittleFS.open(OBSERVATION_QUEUE_DIR, FILE_READ);
+  if (!dir || !dir.isDirectory()) return false;
+  File file = dir.openNextFile(FILE_READ);
+  while (file) {
+    if (!file.isDirectory()) {
+      const String name = file.name();
+      if (name.endsWith(".json")) {
+        ++count;
+        bytes += file.size();
+        if (paths != nullptr) {
+          paths->push_back(name.startsWith("/") ? name : String(OBSERVATION_QUEUE_DIR) + "/" + name);
+        }
+      }
+    }
+    file.close();
+    file = dir.openNextFile(FILE_READ);
+  }
+  dir.close();
+  if (paths != nullptr) std::sort(paths->begin(), paths->end());
+  return true;
+}
+
+bool enqueueObservationPayload(const String &kind, const String &payload) {
+  if (!onboardStorageReady) {
+    observationQueueLastError = "storage_unavailable";
+    ++observationQueueDropCount;
+    return false;
+  }
+  if (payload.isEmpty()) {
+    observationQueueLastError = "empty_payload";
+    ++observationQueueDropCount;
+    return false;
+  }
+  size_t queuedCount = 0;
+  size_t queuedBytes = 0;
+  observationQueueStats(queuedCount, queuedBytes);
+  if (queuedCount >= OBSERVATION_QUEUE_MAX_FILES) {
+    observationQueueLastError = "queue_full";
+    ++observationQueueDropCount;
+    return false;
+  }
+  const size_t totalBytes = LittleFS.totalBytes();
+  const size_t usedBytes = LittleFS.usedBytes();
+  const size_t freeBytes = totalBytes > usedBytes ? totalBytes - usedBytes : 0;
+  if (freeBytes < payload.length() + OBSERVATION_QUEUE_MIN_FREE_BYTES) {
+    observationQueueLastError = "storage_full";
+    ++observationQueueDropCount;
+    return false;
+  }
+
+  const uint32_t id = observationQueueNextId++;
+  Preferences queuePrefs;
+  if (queuePrefs.begin("obsq", false)) {
+    queuePrefs.putULong("next_id", observationQueueNextId);
+    queuePrefs.end();
+  }
+
+  const String finalPath = observationQueuePath(id, kind);
+  const String tempPath = finalPath + ".tmp";
+  LittleFS.remove(tempPath);
+  File file = LittleFS.open(tempPath, FILE_WRITE);
+  if (!file) {
+    observationQueueLastError = "queue_write_failed";
+    ++observationQueueDropCount;
+    return false;
+  }
+  const size_t written = file.print(payload);
+  file.close();
+  if (written != payload.length() || !LittleFS.rename(tempPath, finalPath)) {
+    LittleFS.remove(tempPath);
+    LittleFS.remove(finalPath);
+    observationQueueLastError = "queue_commit_failed";
+    ++observationQueueDropCount;
+    return false;
+  }
+  ++observationQueueEnqueueCount;
+  observationQueueLastError = "";
+  Serial.printf("[observation-queue] saved kind=%s path=%s bytes=%u\n",
+                kind.c_str(),
+                finalPath.c_str(),
+                static_cast<unsigned>(payload.length()));
+  return true;
+}
+
+bool replayQueuedObservationBatches(uint8_t maxBatches, String &summary) {
+  summary = "{\"attempted\":0,\"uploaded\":0,\"failed\":0}";
+  if (!onboardStorageReady) {
+    observationQueueLastError = "storage_unavailable";
+    return true;
+  }
+  size_t queuedCount = 0;
+  size_t queuedBytes = 0;
+  std::vector<String> paths;
+  if (!observationQueueStats(queuedCount, queuedBytes, &paths) || paths.empty()) {
+    observationQueueLastError = "";
+    return true;
+  }
+
+  uint8_t attempted = 0;
+  uint8_t uploaded = 0;
+  uint8_t failed = 0;
+  for (const String &path : paths) {
+    if (attempted >= maxBatches) break;
+    File file = LittleFS.open(path, FILE_READ);
+    if (!file) {
+      LittleFS.remove(path);
+      continue;
+    }
+    String payload = file.readString();
+    file.close();
+    if (payload.isEmpty()) {
+      LittleFS.remove(path);
+      continue;
+    }
+    ++attempted;
+    ++uploadAttemptCount;
+    String responseBody;
+    int statusCode = 0;
+    const bool ok = postJsonToApi(AIR_SCAN_API_HOST,
+                                  AIR_SCAN_API_PORT,
+                                  "/api/observations/upload",
+                                  payload,
+                                  responseBody,
+                                  statusCode);
+    setUploadResult(ok, statusCode, ok ? "queued_observations_uploaded" : responseBody);
+    if (ok) {
+      LittleFS.remove(path);
+      ++uploaded;
+      ++observationQueueReplaySuccessCount;
+      Serial.printf("[observation-queue] uploaded path=%s status=%d\n", path.c_str(), statusCode);
+    } else {
+      ++failed;
+      ++observationQueueReplayFailureCount;
+      observationQueueLastError = "replay_failed";
+      Serial.printf("[observation-queue] replay failed path=%s status=%d\n", path.c_str(), statusCode);
+      break;
+    }
+  }
+
+  summary = "{\"attempted\":" + String(attempted) +
+            ",\"uploaded\":" + String(uploaded) +
+            ",\"failed\":" + String(failed) + "}";
+  if (failed == 0) observationQueueLastError = "";
+  return failed == 0;
+}
+
 bool syncBoardClockFromAirScan() {
   if (onboardClockValid()) return true;
   int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -3938,6 +4144,7 @@ bool uploadWifiObservationsNow(String &responseBody, int &statusCode) {
   } else {
     ++wifiScannerUploadFailureCount;
     wifiScannerLastError = "upload_failed";
+    enqueueObservationPayload("wifi", wifiObservationsLastJson);
   }
   Serial.printf("[wifi-scanner] networks=%u upload=%s status=%d\n",
                 wifiScanLastCount,
@@ -3971,6 +4178,7 @@ bool uploadBleObservationsNow(String &responseBody, int &statusCode) {
   } else {
     ++bleScannerUploadFailureCount;
     bleScannerLastError = "upload_failed";
+    enqueueObservationPayload("ble", bleObservationsLastJson);
   }
   Serial.printf("[ble-scanner] devices=%u mfr=%u svc=%u svc_data=%u name=%u tx=%u upload=%s status=%d\n",
                 bleScannerLastCount,
@@ -4000,6 +4208,8 @@ void wifiScannerTask(void *pvParameters) {
     if (observationUploadMutex != nullptr) {
       xSemaphoreTake(observationUploadMutex, portMAX_DELAY);
     }
+    String queueSummary;
+    const bool queueOk = replayQueuedObservationBatches(4, queueSummary);
     const bool wifiOk = uploadWifiObservationsNow(wifiResponse, wifiStatus);
     String bleResponse;
     int bleStatus = 0;
@@ -4007,7 +4217,7 @@ void wifiScannerTask(void *pvParameters) {
     if (observationUploadMutex != nullptr) {
       xSemaphoreGive(observationUploadMutex);
     }
-    const unsigned long waitMs = (wifiOk && bleOk) ? currentWifiScannerIntervalMs() : 30000UL;
+    const unsigned long waitMs = (queueOk && wifiOk && bleOk) ? currentWifiScannerIntervalMs() : 30000UL;
     vTaskDelay(pdMS_TO_TICKS(waitMs));
   }
 }
@@ -5336,6 +5546,8 @@ void handleUploadObservations() {
     server.send(409, "application/json", "{\"error\":\"observation_upload_busy\"}");
     return;
   }
+  String queueBody;
+  const bool queueOk = replayQueuedObservationBatches(4, queueBody);
   String wifiBody;
   int wifiStatus = 0;
   const bool wifiOk = uploadWifiObservationsNow(wifiBody, wifiStatus);
@@ -5343,14 +5555,15 @@ void handleUploadObservations() {
   int bleStatus = 0;
   const bool bleOk = uploadBleObservationsNow(bleBody, bleStatus);
   String payload = "{";
-  payload += "\"ok\":" + String((wifiOk && bleOk) ? "true" : "false");
+  payload += "\"ok\":" + String((queueOk && wifiOk && bleOk) ? "true" : "false");
+  payload += ",\"queued_replay\":" + queueBody;
   payload += ",\"wifi\":" + buildUploadResultJson(wifiOk, wifiStatus, wifiBody);
   payload += ",\"ble\":" + buildUploadResultJson(bleOk, bleStatus, bleBody);
   payload += "}";
   if (observationUploadMutex != nullptr) {
     xSemaphoreGive(observationUploadMutex);
   }
-  server.send((wifiOk && bleOk) ? 200 : 502, "application/json", payload);
+  server.send((queueOk && wifiOk && bleOk) ? 200 : 502, "application/json", payload);
 }
 
 void handleUploadAll() {
