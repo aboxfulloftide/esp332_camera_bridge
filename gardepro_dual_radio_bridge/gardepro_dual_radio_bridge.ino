@@ -5216,6 +5216,120 @@ void runRtspProbeSequence() {
   Serial.println("=== End RTSP probe sequence ===");
 }
 
+String buildSystemStatusJson() {
+  String payload = "{";
+  payload += "\"uptime_ms\":" + String(millis());
+  payload += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
+  payload += ",\"boot_count\":" + String(persistentBootCount);
+  payload += ",\"boot_session_id\":" + String(bootSessionId);
+  payload += ",\"psram_found\":" + String(psramFound() ? "true" : "false");
+  payload += ",\"psram_size\":" + String(ESP.getPsramSize());
+  payload += ",\"psram_free\":" + String(ESP.getFreePsram());
+  payload += ",\"chip_temperature_c\":" + String(readChipTemperatureC(), 1);
+  payload += "}";
+  return payload;
+}
+
+String buildWifiStatusJson() {
+  String payload = "{";
+  payload += "\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  payload += ",\"wifi_ip\":\"" + WiFi.localIP().toString() + "\"";
+  payload += ",\"wifi_scan_busy\":" + String(wifiScanBusy ? "true" : "false");
+  payload += ",\"wifi_scan_last_count\":" + String(wifiScanLastCount);
+  payload += ",\"wifi_scan_last_age_ms\":" + String(msSince(wifiScanLastMs));
+  payload += ",\"scanner\":{";
+  payload += "\"runs\":" + String(wifiScannerRunCount);
+  payload += ",\"upload_successes\":" + String(wifiScannerUploadSuccessCount);
+  payload += ",\"upload_failures\":" + String(wifiScannerUploadFailureCount);
+  payload += ",\"last_error\":\"" + jsonEscape(wifiScannerLastError) + "\"";
+  payload += ",\"last_run_age_ms\":" + String(msSince(wifiScannerLastRunMs));
+  payload += ",\"last_upload_age_ms\":" + String(msSince(wifiScannerLastUploadMs));
+  payload += "}";
+  payload += "}";
+  return payload;
+}
+
+String buildCameraBridgeStatusJson() {
+  String payload = "{";
+  payload += "\"camera_ip\":\"" + CAMERA_IP.toString() + "\"";
+  payload += ",\"camera_wifi_ever_connected\":" + String(cameraWifiEverConnected ? "true" : "false");
+  payload += ",\"standby_requested\":" + String(standbyRequested ? "true" : "false");
+  payload += ",\"session\":" + buildCameraSessionJson();
+  payload += "}";
+  return payload;
+}
+
+String buildStreamRuntimeStatusJson() {
+  String payload = "{";
+  payload += "\"stream_status\":" + buildStreamStatusJson();
+  payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
+  payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
+  payload += ",\"recoveries\":" + String(streamRecoveryAttempts);
+  payload += ",\"idle_recoveries\":" + String(idleRecoveryAttempts);
+  payload += ",\"http_keepalive_failures\":" + String(httpKeepaliveFailures);
+  payload += ",\"idle_recovery_last_ms\":" + String(msSince(lastIdleRecoveryMs));
+  payload += ",\"media_primary_packets\":" + String(mediaPrimaryPackets);
+  payload += ",\"media_primary_bytes\":" + String(mediaPrimaryBytes);
+  payload += ",\"media_secondary_packets\":" + String(mediaSecondaryPackets);
+  payload += ",\"media_secondary_bytes\":" + String(mediaSecondaryBytes);
+  payload += "}";
+  return payload;
+}
+
+String buildBleStatusJson() {
+  String payload = "{";
+  payload += "\"ble_wake_attempted\":" + String(bleWakeAttempted ? "true" : "false");
+  payload += ",\"ble_wake_confirmed\":" + String(bleWakeConfirmed ? "true" : "false");
+  payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
+  payload += ",\"ble_scan_mode\":\"" + jsonEscape(bleScanMode) + "\"";
+  payload += ",\"ble_scan_results\":" + String(bleScanResultCount);
+  payload += ",\"ble_scan_attempts\":" + String(bleScanAttemptCounter);
+  payload += ",\"ble_target_seen_count\":" + String(bleTargetSeenCount);
+  payload += ",\"ble_connect_attempts\":" + String(bleConnectAttempts);
+  payload += ",\"ble_last_connect_error\":" + String(bleLastConnectError);
+  payload += ",\"ble_last_seen_mac\":\"" + jsonEscape(bleLastSeenMac) + "\"";
+  payload += ",\"ble_last_seen_name\":\"" + jsonEscape(bleLastSeenName) + "\"";
+  payload += ",\"ble_last_seen_rssi\":" + String(bleLastSeenRssi);
+  payload += ",\"ble_best_seen_mac\":\"" + jsonEscape(bleBestSeenMac) + "\"";
+  payload += ",\"ble_best_seen_name\":\"" + jsonEscape(bleBestSeenName) + "\"";
+  payload += ",\"ble_best_seen_rssi\":" + String(bleBestSeenRssi);
+  payload += ",\"ble_recent_devices\":" + buildBleRecentDevicesJson();
+  payload += ",\"ble_notify_count\":" + String(bleNotifyCount);
+  payload += ",\"ble_last_notify\":\"" + jsonEscape(bleLastNotifyText) + "\"";
+  payload += ",\"scanner\":{";
+  payload += "\"runs\":" + String(bleScannerRunCount);
+  payload += ",\"last_count\":" + String(bleScannerLastCount);
+  payload += ",\"last_manufacturer_count\":" + String(bleScannerLastManufacturerCount);
+  payload += ",\"last_services_count\":" + String(bleScannerLastServicesCount);
+  payload += ",\"last_service_data_count\":" + String(bleScannerLastServiceDataCount);
+  payload += ",\"last_tx_power_count\":" + String(bleScannerLastTxPowerCount);
+  payload += ",\"last_name_count\":" + String(bleScannerLastNameCount);
+  payload += ",\"upload_successes\":" + String(bleScannerUploadSuccessCount);
+  payload += ",\"upload_failures\":" + String(bleScannerUploadFailureCount);
+  payload += ",\"last_error\":\"" + jsonEscape(bleScannerLastError) + "\"";
+  payload += ",\"last_run_age_ms\":" + String(msSince(bleScannerLastRunMs));
+  payload += ",\"last_upload_age_ms\":" + String(msSince(bleScannerLastUploadMs));
+  payload += "}";
+  payload += "}";
+  return payload;
+}
+
+String buildControlStatusJson() {
+  ControlState controlSnapshot{};
+  snapshotControlState(controlSnapshot);
+  String payload = "{";
+  payload += "\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
+  payload += ",\"control_pending\":\"" + String(controlActionName(controlSnapshot.pendingAction)) + "\"";
+  payload += ",\"control_action\":\"" + String(controlActionName(controlSnapshot.activeAction)) + "\"";
+  payload += ",\"control_last_action\":\"" + String(controlActionName(controlSnapshot.lastAction)) + "\"";
+  payload += ",\"control_last_ok\":" + String(controlSnapshot.lastOk ? "true" : "false");
+  payload += ",\"control_active_ms\":" + String(msSince(controlSnapshot.activeSinceMs));
+  payload += ",\"control_last_finished_ms\":" + String(msSince(controlSnapshot.lastFinishedMs));
+  payload += ",\"control_last_message\":\"" + jsonEscape(String(controlSnapshot.lastMessage)) + "\"";
+  payload += "}";
+  return payload;
+}
+
 void handleStatus() {
   String basic = "{";
   basic += "\"uptime_ms\":" + String(millis());
@@ -5332,6 +5446,38 @@ void handleStatus() {
 
 void handleBatteryStatus() {
   server.send(200, "application/json", buildBatteryJson());
+}
+
+void handleSystemStatus() {
+  server.send(200, "application/json", buildSystemStatusJson());
+}
+
+void handleHaLowStatusHttp() {
+  server.send(200, "application/json", buildHaLowStatusJson());
+}
+
+void handleWifiStatus() {
+  server.send(200, "application/json", buildWifiStatusJson());
+}
+
+void handleCameraBridgeStatus() {
+  server.send(200, "application/json", buildCameraBridgeStatusJson());
+}
+
+void handleTimingStatus() {
+  server.send(200, "application/json", buildTimingJson());
+}
+
+void handleStreamRuntimeStatus() {
+  server.send(200, "application/json", buildStreamRuntimeStatusJson());
+}
+
+void handleBleStatus() {
+  server.send(200, "application/json", buildBleStatusJson());
+}
+
+void handleControlStatus() {
+  server.send(200, "application/json", buildControlStatusJson());
 }
 
 void handleOnboardCameraStatus() {
@@ -6352,6 +6498,14 @@ void startHttpServer() {
     return;
   }
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/system/status", HTTP_GET, handleSystemStatus);
+  server.on("/halow/status", HTTP_GET, handleHaLowStatusHttp);
+  server.on("/wifi/status", HTTP_GET, handleWifiStatus);
+  server.on("/camera/status", HTTP_GET, handleCameraBridgeStatus);
+  server.on("/timing/status", HTTP_GET, handleTimingStatus);
+  server.on("/stream/status", HTTP_GET, handleStreamRuntimeStatus);
+  server.on("/ble/status", HTTP_GET, handleBleStatus);
+  server.on("/control/status", HTTP_GET, handleControlStatus);
   server.on("/camera/raw", HTTP_GET, handleCameraRawGet);
   server.on("/camera/request", HTTP_GET, handleCameraRequest);
   server.on("/camera/request", HTTP_POST, handleCameraRequest);
