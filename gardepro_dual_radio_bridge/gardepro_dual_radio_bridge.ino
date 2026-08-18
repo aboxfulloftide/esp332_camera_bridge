@@ -9,6 +9,8 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <FS.h>
+#include <halow_SD.h>
+#include <SPI.h>
 #include <uri/UriRegex.h>
 #include <algorithm>
 #include <vector>
@@ -142,6 +144,10 @@ static const int BAT_ADC_PIN = 1;
 static const int BAT_ADC_CTRL_PIN = 20;
 static const int BAT_CHRG_PIN = 15;
 static const int BAT_DONE_PIN = 16;
+static const int SD_MOSI_PIN = 11;
+static const int SD_CLK_PIN = 15;
+static const int SD_MISO_PIN = 16;
+static const int SD_CS_PIN = 10;
 static const unsigned long WIFI_SCAN_CACHE_MS = 60000UL;
 static const unsigned long WIFI_SCAN_DAY_INTERVAL_MS = 120000UL;
 static const unsigned long WIFI_SCAN_NIGHT_INTERVAL_MS = 900000UL;
@@ -297,6 +303,11 @@ static const uint32_t ONBOARD_MEDIA_META_MAGIC = 0x4f4d4431;
 static const char *OBSERVATION_QUEUE_DIR = "/obsq";
 static const size_t OBSERVATION_QUEUE_MAX_FILES = 48;
 static const size_t OBSERVATION_QUEUE_MIN_FREE_BYTES = 32768;
+static SPIClass sdSpi(HSPI);
+bool sdReady = false;
+String sdLastMessage = "not_started";
+uint32_t sdMountAttempts = 0;
+uint32_t sdMountSuccesses = 0;
 bool onboardCaptureEnabled = ONBOARD_CAPTURE_ENABLED != 0;
 unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
 uint16_t onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
@@ -321,6 +332,7 @@ uint32_t onboardCaptureFailures = 0;
 uint32_t onboardCaptureScheduleSkips = 0;
 unsigned long onboardLastCaptureMs = 0;
 unsigned long onboardLastScheduleAttemptMs = 0;
+unsigned long onboardLastClockInvalidSkipLogMs = 0;
 framesize_t onboardFrameSize = FRAMESIZE_UXGA;
 int onboardJpegQuality = 8;
 int onboardBrightness = 0;
@@ -437,6 +449,7 @@ int uploadLastStatusCode = 0;
 String uploadLastMessage = "idle";
 unsigned long uploadLastAttemptMs = 0;
 unsigned long uploadLastSuccessMs = 0;
+unsigned long lastClockSyncAttemptMs = 0;
 uint32_t observationQueueNextId = 1;
 uint32_t observationQueueEnqueueCount = 0;
 uint32_t observationQueueDropCount = 0;
@@ -1131,9 +1144,15 @@ int onboardLocalMinuteOfDay() {
   if (!onboardClockValid()) {
     return -1;
   }
-  time_t adjusted = time(nullptr) + static_cast<time_t>(onboardCaptureTzOffsetMin) * 60;
+  time_t adjusted = time(nullptr);
+  setenv("TZ", BOARD_TIMEZONE, 1);
+  tzset();
   struct tm tmValue;
-  gmtime_r(&adjusted, &tmValue);
+  localtime_r(&adjusted, &tmValue);
+  if (onboardCaptureTzOffsetMin != 0) {
+    adjusted += static_cast<time_t>(onboardCaptureTzOffsetMin) * 60;
+    localtime_r(&adjusted, &tmValue);
+  }
   return tmValue.tm_hour * 60 + tmValue.tm_min;
 }
 
@@ -1656,6 +1675,63 @@ bool initOnboardStorage() {
   return true;
 }
 
+bool mountSdCard(uint32_t frequency = 4000000UL) {
+  ++sdMountAttempts;
+  SD.end();
+  sdSpi.end();
+  delay(50);
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  pinMode(SD_MISO_PIN, INPUT_PULLUP);
+  sdSpi.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN, sdSpi, frequency, "/sd", 5, false)) {
+    sdReady = false;
+    sdLastMessage = "begin_failed";
+    Serial.printf("[sd] mount failed freq=%lu\n", static_cast<unsigned long>(frequency));
+    return false;
+  }
+  if (SD.cardType() == CARD_NONE) {
+    SD.end();
+    sdReady = false;
+    sdLastMessage = "card_none";
+    Serial.println("[sd] no card attached");
+    return false;
+  }
+  sdReady = true;
+  sdLastMessage = "mounted";
+  ++sdMountSuccesses;
+  Serial.printf("[sd] mounted type=%u size_mb=%llu total_mb=%llu used_mb=%llu\n",
+                static_cast<unsigned>(SD.cardType()),
+                SD.cardSize() / (1024ULL * 1024ULL),
+                SD.totalBytes() / (1024ULL * 1024ULL),
+                SD.usedBytes() / (1024ULL * 1024ULL));
+  return true;
+}
+
+String buildSdStatusJson() {
+  String payload = "{";
+  payload += "\"ready\":" + String(sdReady ? "true" : "false");
+  payload += ",\"last_message\":\"" + jsonEscape(sdLastMessage) + "\"";
+  payload += ",\"mount_attempts\":" + String(sdMountAttempts);
+  payload += ",\"mount_successes\":" + String(sdMountSuccesses);
+  payload += ",\"pins\":{";
+  payload += "\"mosi\":" + String(SD_MOSI_PIN);
+  payload += ",\"clk\":" + String(SD_CLK_PIN);
+  payload += ",\"miso\":" + String(SD_MISO_PIN);
+  payload += ",\"cs\":" + String(SD_CS_PIN);
+  payload += "}";
+  if (sdReady) {
+    payload += ",\"card_type\":" + String(static_cast<unsigned>(SD.cardType()));
+    payload += ",\"card_size_bytes\":" + String(static_cast<unsigned long long>(SD.cardSize()));
+    payload += ",\"storage_total_bytes\":" + String(static_cast<unsigned long long>(SD.totalBytes()));
+    payload += ",\"storage_used_bytes\":" + String(static_cast<unsigned long long>(SD.usedBytes()));
+    const uint64_t freeBytes = SD.totalBytes() > SD.usedBytes() ? SD.totalBytes() - SD.usedBytes() : 0;
+    payload += ",\"storage_free_bytes\":" + String(static_cast<unsigned long long>(freeBytes));
+  }
+  payload += "}";
+  return payload;
+}
+
 String buildOnboardMediaJson(const OnboardMediaInfo &info, bool includeCaptureFields) {
   const String id = onboardMediaIdString(info.id);
   String payload = "{";
@@ -1871,6 +1947,7 @@ String buildOnboardCameraStatusJson() {
   payload += ",\"storage_total_bytes\":" + String(static_cast<unsigned>(storageTotal));
   payload += ",\"storage_used_bytes\":" + String(static_cast<unsigned>(storageUsed));
   payload += ",\"storage_free_bytes\":" + String(static_cast<unsigned>(storageTotal >= storageUsed ? storageTotal - storageUsed : 0));
+  payload += ",\"sd\":" + buildSdStatusJson();
   payload += ",\"stored_photo_count\":" + String(onboardStoredPhotoCount);
   payload += ",\"latest_media_id\":" + (onboardLatestMediaId == 0 ? String("null") : "\"" + onboardMediaIdString(onboardLatestMediaId) + "\"");
   payload += ",\"latest_bytes\":" + String(static_cast<unsigned>(latestLen));
@@ -2253,10 +2330,18 @@ void onboardCaptureTask(void *pvParameters) {
         const unsigned long normalIntervalMs = onboardCaptureIntervalMs < 5000UL ? 5000UL : onboardCaptureIntervalMs;
         if (onboardLastScheduleAttemptMs == 0 ||
             nowMs - onboardLastScheduleAttemptMs >= normalIntervalMs) {
-          onboardLastScheduleAttemptMs = nowMs;
-          if (onboardCaptureWindowActive()) {
+          if (!onboardClockValid()) {
+            ++onboardCaptureScheduleSkips;
+            if (onboardLastClockInvalidSkipLogMs == 0 ||
+                nowMs - onboardLastClockInvalidSkipLogMs >= 60000UL) {
+              onboardLastClockInvalidSkipLogMs = nowMs;
+              Serial.println("[onboard-camera] scheduled capture skipped clock_valid=no");
+            }
+          } else if (onboardCaptureWindowActive()) {
+            onboardLastScheduleAttemptMs = nowMs;
             captureOnboardFrame("scheduled");
           } else {
+            onboardLastScheduleAttemptMs = nowMs;
             ++onboardCaptureScheduleSkips;
             Serial.printf("[onboard-camera] scheduled capture skipped clock_valid=%s local_minute=%d window=%s-%s\n",
                           onboardClockValid() ? "yes" : "no",
@@ -3528,10 +3613,13 @@ void printSerialHelp() {
   Serial.println("  battery");
   Serial.println("  onboard_status");
   Serial.println("  onboard_capture");
+  Serial.println("  onboard_delete_all");
   Serial.println("  onboard_config key=value [key=value...]");
   Serial.println("  onboard_timelapse hours=<value> [interval_ms=300000]");
   Serial.println("  onboard_timelapse_stop");
   Serial.println("  onboard_dump [fresh]");
+  Serial.println("  sd_status");
+  Serial.println("  sd_mount");
   Serial.println("  wifi_scan");
   Serial.println("  upload_status");
   Serial.println("  upload_telemetry");
@@ -3742,6 +3830,11 @@ void connectHaLow() {
                   HaLow.localIP().toString().c_str(),
                   HaLow.gatewayIP().toString().c_str());
     sendBoardRegistration();
+    lastClockSyncAttemptMs = millis();
+    const bool clockOk = syncBoardClockFromAirScan();
+    Serial.printf("[clock] sync after HaLow connect=%s valid=%s\n",
+                  clockOk ? "ok" : "failed",
+                  onboardClockValid() ? "yes" : "no");
   } else {
     Serial.println("HaLow connect timed out");
   }
@@ -5190,6 +5283,47 @@ bool parseOnboardMediaId(const String &value, uint32_t &id) {
   return id > 0;
 }
 
+bool deleteAllOnboardMedia(unsigned &deleted, unsigned &failed) {
+  deleted = 0;
+  failed = 0;
+  if (!onboardStorageReady) return false;
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  std::vector<uint32_t> ids;
+  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  if (dir && dir.isDirectory()) {
+    File file = dir.openNextFile(FILE_READ);
+    while (file) {
+      const String name = file.name();
+      if (!file.isDirectory() && name.endsWith(".jpg")) {
+        const int slash = name.lastIndexOf('/');
+        uint32_t id = 0;
+        if (parseOnboardMediaId(name.substring(slash + 1, name.length() - 4), id)) ids.push_back(id);
+      }
+      file.close();
+      file = dir.openNextFile(FILE_READ);
+    }
+    dir.close();
+  }
+  for (uint32_t id : ids) {
+    const bool imageDeleted = LittleFS.remove(onboardMediaImagePath(id));
+    const bool metaDeleted = !LittleFS.exists(onboardMediaMetaPath(id)) || LittleFS.remove(onboardMediaMetaPath(id));
+    if (imageDeleted && metaDeleted) ++deleted; else ++failed;
+  }
+  refreshOnboardMediaState();
+  if (onboardFrameMutex != nullptr) {
+    xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
+    if (onboardLatestJpeg != nullptr) {
+      free(onboardLatestJpeg);
+      onboardLatestJpeg = nullptr;
+    }
+    onboardLatestJpegLen = 0;
+    onboardLastCaptureMs = 0;
+    xSemaphoreGive(onboardFrameMutex);
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  return true;
+}
+
 void handleOnboardMediaList() {
   if (!onboardStorageReady) {
     server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
@@ -5320,30 +5454,7 @@ void handleOnboardMediaDeleteAll() {
   }
   unsigned deleted = 0;
   unsigned failed = 0;
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
-  std::vector<uint32_t> ids;
-  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
-  if (dir && dir.isDirectory()) {
-    File file = dir.openNextFile(FILE_READ);
-    while (file) {
-      const String name = file.name();
-      if (!file.isDirectory() && name.endsWith(".jpg")) {
-        const int slash = name.lastIndexOf('/');
-        uint32_t id = 0;
-        if (parseOnboardMediaId(name.substring(slash + 1, name.length() - 4), id)) ids.push_back(id);
-      }
-      file.close();
-      file = dir.openNextFile(FILE_READ);
-    }
-    dir.close();
-  }
-  for (uint32_t id : ids) {
-    const bool imageDeleted = LittleFS.remove(onboardMediaImagePath(id));
-    const bool metaDeleted = !LittleFS.exists(onboardMediaMetaPath(id)) || LittleFS.remove(onboardMediaMetaPath(id));
-    if (imageDeleted && metaDeleted) ++deleted; else ++failed;
-  }
-  refreshOnboardMediaState();
-  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  deleteAllOnboardMedia(deleted, failed);
   String payload = "{\"ok\":" + String(failed == 0 ? "true" : "false") +
                    ",\"deleted\":" + String(deleted) + ",\"failed\":" + String(failed) + "}";
   server.send(failed == 0 ? 200 : 500, "application/json", payload);
@@ -5525,6 +5636,15 @@ void handleUploadBleLast() {
     return;
   }
   server.send(200, "application/json", bleObservationsLastJson);
+}
+
+void handleSdStatus() {
+  server.send(200, "application/json", buildSdStatusJson());
+}
+
+void handleSdMount() {
+  const bool ok = mountSdCard();
+  server.send(ok ? 200 : 503, "application/json", buildSdStatusJson());
 }
 
 void handleUploadTelemetry() {
@@ -6115,6 +6235,8 @@ void startHttpServer() {
   server.on("/scan/wifi", HTTP_GET, handleWifiScan);
   server.on("/upload/status", HTTP_GET, handleUploadStatus);
   server.on("/upload/ble/last", HTTP_GET, handleUploadBleLast);
+  server.on("/sd/status", HTTP_GET, handleSdStatus);
+  server.on("/sd/mount", HTTP_POST, handleSdMount);
   server.on("/upload/telemetry", HTTP_POST, handleUploadTelemetry);
   server.on("/upload/events", HTTP_POST, handleUploadEvents);
   server.on("/upload/observations", HTTP_POST, handleUploadObservations);
@@ -6328,6 +6450,26 @@ void handleSerialCommand(const String &line) {
     Serial.printf("[onboard-camera] capture=%s %s\n",
                   ok ? "ok" : "failed",
                   buildOnboardCameraStatusJson().c_str());
+    return;
+  }
+  if (cmd == "onboard_delete_all") {
+    unsigned deleted = 0;
+    unsigned failed = 0;
+    const bool ok = deleteAllOnboardMedia(deleted, failed);
+    Serial.printf("[onboard-camera] delete_all ok=%s deleted=%u failed=%u %s\n",
+                  ok && failed == 0 ? "true" : "false",
+                  deleted,
+                  failed,
+                  buildOnboardCameraStatusJson().c_str());
+    return;
+  }
+  if (cmd == "sd_status") {
+    Serial.println(buildSdStatusJson());
+    return;
+  }
+  if (cmd == "sd_mount") {
+    mountSdCard();
+    Serial.println(buildSdStatusJson());
     return;
   }
   if (cmd.startsWith("onboard_config")) {
@@ -6585,6 +6727,7 @@ void setup() {
   onboardStorageMutex = xSemaphoreCreateMutex();
   observationUploadMutex = xSemaphoreCreateMutex();
   initOnboardStorage();
+  mountSdCard();
   loadOnboardConfig();
   initOnboardCamera();
   if (onboardCaptureTaskHandle == nullptr) {
@@ -6678,6 +6821,11 @@ void loop() {
     if (httpServerStarted) {
       server.handleClient();
     }
+    if (halowConnected && !onboardClockValid() &&
+        (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
+      lastClockSyncAttemptMs = millis();
+      syncBoardClockFromAirScan();
+    }
     refreshWifiState();
     processCameraSessionLeaseExpiry();
     if (streamSessionActive && rtspSessionOpen && millis() - lastRtspKeepaliveMs > RTSP_KEEPALIVE_INTERVAL_MS) {
@@ -6732,6 +6880,12 @@ void loop() {
   }
 
   server.handleClient();
+
+  if (halowConnected && !onboardClockValid() &&
+      (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
+    lastClockSyncAttemptMs = millis();
+    syncBoardClockFromAirScan();
+  }
 
   if (millis() - lastStatusLogMs > 5000) {
     lastStatusLogMs = millis();
