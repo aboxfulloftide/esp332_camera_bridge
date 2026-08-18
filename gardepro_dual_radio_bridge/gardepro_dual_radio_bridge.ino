@@ -3565,16 +3565,16 @@ bool runExactBleWake() {
   resetBleScanStats();
 
   Serial.printf("[BLE] scanning for target %s\n", CAMERA_BLE_MAC);
-  const unsigned long warmupMs = bleInitialized ? BLE_REUSE_WARMUP_MS : BLE_INIT_WARMUP_MS;
-  Serial.printf("[BLE] warmup before BLE init %lu ms initialized=%s\n",
-                warmupMs,
-                bleInitialized ? "yes" : "no");
-  cooperativeDelay(warmupMs);
-  if (!bleInitialized) {
-    NimBLEDevice::init(BOARD_HOSTNAME);
-    bleInitialized = true;
-  }
+  closeBleWakeSession();
+  NimBLEDevice::deinit(true);
+  bleInitialized = false;
+  cooperativeDelay(100);
+  NimBLEDevice::init(BOARD_HOSTNAME);
+  bleInitialized = true;
+  cooperativeDelay(BLE_INIT_WARMUP_MS);
   NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->stop();
+  scan->clearResults();
   scan->setScanCallbacks(&bridgeBleScanCallbacks, true);
   scan->setInterval(BLE_SCAN_INTERVAL_MS);
   scan->setWindow(BLE_SCAN_WINDOW_MS);
