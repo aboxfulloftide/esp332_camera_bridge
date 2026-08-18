@@ -370,6 +370,8 @@ struct OnboardMediaMetaDisk {
   uint16_t height;
   uint8_t captureKind;
   uint8_t reserved[3];
+  uint32_t capturedUptimeSec;
+  uint32_t bootSessionId;
 };
 
 struct OnboardCameraSettings {
@@ -456,6 +458,8 @@ uint32_t observationQueueDropCount = 0;
 uint32_t observationQueueReplaySuccessCount = 0;
 uint32_t observationQueueReplayFailureCount = 0;
 String observationQueueLastError = "";
+size_t observationQueueCachedCount = 0;
+size_t observationQueueCachedBytes = 0;
 
 struct CameraProbeTarget {
   const char *label;
@@ -1576,6 +1580,36 @@ String onboardMediaMetaPath(uint32_t id) {
   return String(ONBOARD_MEDIA_DIR) + "/" + onboardMediaIdString(id) + ".meta";
 }
 
+fs::FS &onboardMediaFs() {
+  return sdReady ? static_cast<fs::FS &>(SD) : static_cast<fs::FS &>(LittleFS);
+}
+
+fs::FS &observationQueueFs() {
+  return sdReady ? static_cast<fs::FS &>(SD) : static_cast<fs::FS &>(LittleFS);
+}
+
+const char *persistentStorageType() {
+  return sdReady ? "sd" : "littlefs";
+}
+
+uint64_t persistentStorageTotalBytes() {
+  return sdReady ? SD.totalBytes() : LittleFS.totalBytes();
+}
+
+uint64_t persistentStorageUsedBytes() {
+  return sdReady ? SD.usedBytes() : LittleFS.usedBytes();
+}
+
+uint64_t persistentStorageFreeBytes() {
+  const uint64_t total = persistentStorageTotalBytes();
+  const uint64_t used = persistentStorageUsedBytes();
+  return total > used ? total - used : 0;
+}
+
+bool ensureFsDir(fs::FS &fs, const char *path) {
+  return fs.exists(path) || fs.mkdir(path);
+}
+
 String onboardRecordedAtJson(uint32_t epoch) {
   if (epoch < 1700000000UL) return "null";
   time_t timestamp = static_cast<time_t>(epoch);
@@ -1588,18 +1622,21 @@ String onboardRecordedAtJson(uint32_t epoch) {
 
 bool readOnboardMediaInfo(uint32_t id, OnboardMediaInfo &info) {
   if (!onboardStorageReady || id == 0) return false;
+  fs::FS &fs = onboardMediaFs();
   const String imagePath = onboardMediaImagePath(id);
   const String metaPath = onboardMediaMetaPath(id);
-  File image = LittleFS.open(imagePath, FILE_READ);
+  File image = fs.open(imagePath, FILE_READ);
   if (!image || image.isDirectory()) return false;
   const size_t imageBytes = image.size();
   image.close();
-  File metaFile = LittleFS.open(metaPath, FILE_READ);
-  if (!metaFile || metaFile.size() != sizeof(OnboardMediaMetaDisk)) return false;
+  File metaFile = fs.open(metaPath, FILE_READ);
+  if (!metaFile) return false;
   OnboardMediaMetaDisk disk{};
-  const size_t readBytes = metaFile.read(reinterpret_cast<uint8_t *>(&disk), sizeof(disk));
+  const size_t metaSize = metaFile.size();
+  const size_t readLen = metaSize < sizeof(disk) ? metaSize : sizeof(disk);
+  const size_t readBytes = metaFile.read(reinterpret_cast<uint8_t *>(&disk), readLen);
   metaFile.close();
-  if (readBytes != sizeof(disk) || disk.magic != ONBOARD_MEDIA_META_MAGIC || disk.id != id) return false;
+  if (readBytes != readLen || readLen < 24 || disk.magic != ONBOARD_MEDIA_META_MAGIC || disk.id != id) return false;
   info.id = id;
   info.recordedAt = disk.recordedAt;
   info.bytes = imageBytes;
@@ -1613,7 +1650,8 @@ void refreshOnboardMediaState() {
   onboardStoredPhotoCount = 0;
   onboardLatestMediaId = 0;
   if (!onboardStorageReady) return;
-  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  fs::FS &fs = onboardMediaFs();
+  File dir = fs.open(ONBOARD_MEDIA_DIR, FILE_READ);
   if (!dir || !dir.isDirectory()) return;
   File file = dir.openNextFile(FILE_READ);
   while (file) {
@@ -1635,6 +1673,47 @@ void refreshOnboardMediaState() {
   if (onboardLatestMediaId >= onboardNextMediaId) onboardNextMediaId = onboardLatestMediaId + 1;
 }
 
+void backfillOnboardMediaTimestamps() {
+  if (!onboardStorageReady || !onboardClockValid()) return;
+  fs::FS &fs = onboardMediaFs();
+  File dir = fs.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  if (!dir || !dir.isDirectory()) return;
+  const uint32_t nowEpoch = static_cast<uint32_t>(time(nullptr));
+  const uint32_t nowUptimeSec = millis() / 1000UL;
+  unsigned updated = 0;
+  File file = dir.openNextFile(FILE_READ);
+  while (file) {
+    const String name = file.name();
+    file.close();
+    if (name.endsWith(".meta")) {
+      const String path = name.startsWith("/") ? name : String(ONBOARD_MEDIA_DIR) + "/" + name;
+      File metaFile = fs.open(path, FILE_READ);
+      OnboardMediaMetaDisk disk{};
+      const size_t readLen = metaFile ? metaFile.read(reinterpret_cast<uint8_t *>(&disk), sizeof(disk)) : 0;
+      if (metaFile) metaFile.close();
+      if (readLen >= 24 && disk.magic == ONBOARD_MEDIA_META_MAGIC && disk.recordedAt < 1700000000UL && disk.capturedUptimeSec > 0 && disk.capturedUptimeSec <= nowUptimeSec) {
+        disk.recordedAt = nowEpoch - (nowUptimeSec - disk.capturedUptimeSec);
+        const String tempPath = path + ".tmp";
+        fs.remove(tempPath);
+        File out = fs.open(tempPath, FILE_WRITE);
+        const size_t written = out ? out.write(reinterpret_cast<const uint8_t *>(&disk), sizeof(disk)) : 0;
+        if (out) out.close();
+        if (written == sizeof(disk) && fs.rename(tempPath, path)) {
+          ++updated;
+        } else {
+          fs.remove(tempPath);
+        }
+      }
+    }
+    file = dir.openNextFile(FILE_READ);
+  }
+  dir.close();
+  if (updated > 0) {
+    refreshOnboardMediaState();
+    Serial.printf("[onboard-storage] backfilled %u media timestamps\n", updated);
+  }
+}
+
 bool initOnboardStorage() {
   onboardStorageReady = LittleFS.begin(true);
   if (!onboardStorageReady) {
@@ -1642,13 +1721,13 @@ bool initOnboardStorage() {
     Serial.println("[onboard-storage] LittleFS mount failed");
     return false;
   }
-  if (!LittleFS.exists(ONBOARD_MEDIA_DIR) && !LittleFS.mkdir(ONBOARD_MEDIA_DIR)) {
+  if (!ensureFsDir(LittleFS, ONBOARD_MEDIA_DIR)) {
     onboardStorageReady = false;
     onboardStorageError = "storage_unavailable";
     Serial.println("[onboard-storage] media directory creation failed");
     return false;
   }
-  if (!LittleFS.exists(OBSERVATION_QUEUE_DIR) && !LittleFS.mkdir(OBSERVATION_QUEUE_DIR)) {
+  if (!ensureFsDir(LittleFS, OBSERVATION_QUEUE_DIR)) {
     onboardStorageReady = false;
     onboardStorageError = "storage_unavailable";
     Serial.println("[observation-queue] directory creation failed");
@@ -1665,6 +1744,7 @@ bool initOnboardStorage() {
     queuePrefs.end();
   }
   refreshOnboardMediaState();
+  refreshObservationQueueCachedStats();
   onboardStorageError = "";
   Serial.printf("[onboard-storage] ready total=%u used=%u photos=%u latest=%lu next=%lu\n",
                 static_cast<unsigned>(LittleFS.totalBytes()),
@@ -1699,6 +1779,19 @@ bool mountSdCard(uint32_t frequency = 4000000UL) {
   }
   sdReady = true;
   sdLastMessage = "mounted";
+  if (!ensureFsDir(SD, ONBOARD_MEDIA_DIR)) {
+    sdLastMessage = "media_dir_failed";
+    Serial.println("[sd] media directory creation failed");
+  }
+  if (!ensureFsDir(SD, OBSERVATION_QUEUE_DIR)) {
+    sdLastMessage = "queue_dir_failed";
+    Serial.println("[sd] observation queue directory creation failed");
+  }
+  if (onboardStorageReady) {
+    refreshOnboardMediaState();
+    refreshObservationQueueCachedStats();
+    if (onboardClockValid()) backfillOnboardMediaTimestamps();
+  }
   ++sdMountSuccesses;
   Serial.printf("[sd] mounted type=%u size_mb=%llu total_mb=%llu used_mb=%llu\n",
                 static_cast<unsigned>(SD.cardType()),
@@ -1764,6 +1857,7 @@ bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *s
   }
 
   if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  fs::FS &fs = onboardMediaFs();
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (fb == nullptr || fb->len == 0) {
@@ -1776,9 +1870,7 @@ bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *s
     return false;
   }
 
-  const size_t freeBytes = LittleFS.totalBytes() > LittleFS.usedBytes()
-                             ? LittleFS.totalBytes() - LittleFS.usedBytes()
-                             : 0;
+  const uint64_t freeBytes = persistentStorageFreeBytes();
   if (freeBytes < fb->len + sizeof(OnboardMediaMetaDisk) + 4096) {
     ++onboardCaptureFailures;
     esp_camera_fb_return(fb);
@@ -1806,9 +1898,9 @@ bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *s
   const String metaPath = onboardMediaMetaPath(id);
   const String tempImagePath = String(ONBOARD_MEDIA_DIR) + "/.capture.jpg.tmp";
   const String tempMetaPath = String(ONBOARD_MEDIA_DIR) + "/.capture.meta.tmp";
-  LittleFS.remove(tempImagePath);
-  LittleFS.remove(tempMetaPath);
-  File imageFile = LittleFS.open(tempImagePath, FILE_WRITE);
+  fs.remove(tempImagePath);
+  fs.remove(tempMetaPath);
+  File imageFile = fs.open(tempImagePath, FILE_WRITE);
   const size_t imageWritten = imageFile ? imageFile.write(fb->buf, fb->len) : 0;
   if (imageFile) imageFile.close();
   esp_camera_fb_return(fb);
@@ -1821,16 +1913,18 @@ bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *s
   disk.width = width;
   disk.height = height;
   disk.captureKind = onboardCaptureKindValue(captureKind);
-  File metaFile = LittleFS.open(tempMetaPath, FILE_WRITE);
+  disk.capturedUptimeSec = millis() / 1000UL;
+  disk.bootSessionId = bootSessionId;
+  File metaFile = fs.open(tempMetaPath, FILE_WRITE);
   const size_t metaWritten = metaFile ? metaFile.write(reinterpret_cast<const uint8_t *>(&disk), sizeof(disk)) : 0;
   if (metaFile) metaFile.close();
   const bool stored = imageWritten == copyLen && metaWritten == sizeof(disk) &&
-                      LittleFS.rename(tempImagePath, imagePath) && LittleFS.rename(tempMetaPath, metaPath);
+                      fs.rename(tempImagePath, imagePath) && fs.rename(tempMetaPath, metaPath);
   if (!stored) {
-    LittleFS.remove(tempImagePath);
-    LittleFS.remove(tempMetaPath);
-    LittleFS.remove(imagePath);
-    LittleFS.remove(metaPath);
+    fs.remove(tempImagePath);
+    fs.remove(tempMetaPath);
+    fs.remove(imagePath);
+    fs.remove(metaPath);
     free(copy);
     ++onboardCaptureFailures;
     onboardStorageError = "storage_unavailable";
@@ -1905,8 +1999,8 @@ String buildOnboardCameraStatusJson() {
   if (onboardStorageReady && onboardLatestMediaId != 0 && readOnboardMediaInfo(onboardLatestMediaId, latestInfo)) {
     latestLen = latestInfo.bytes;
   }
-  const size_t storageTotal = onboardStorageReady ? LittleFS.totalBytes() : 0;
-  const size_t storageUsed = onboardStorageReady ? LittleFS.usedBytes() : 0;
+  const uint64_t storageTotal = onboardStorageReady ? persistentStorageTotalBytes() : 0;
+  const uint64_t storageUsed = onboardStorageReady ? persistentStorageUsedBytes() : 0;
 
   const int localMinute = onboardLocalMinuteOfDay();
   String payload = "{";
@@ -1944,10 +2038,10 @@ String buildOnboardCameraStatusJson() {
   payload += ",\"agc_gain\":" + String(onboardAgcGain);
   payload += ",\"special_effect\":" + String(onboardSpecialEffect);
   payload += ",\"storage_ready\":" + String(onboardStorageReady ? "true" : "false");
-  payload += ",\"storage_type\":\"littlefs\"";
-  payload += ",\"storage_total_bytes\":" + String(static_cast<unsigned>(storageTotal));
-  payload += ",\"storage_used_bytes\":" + String(static_cast<unsigned>(storageUsed));
-  payload += ",\"storage_free_bytes\":" + String(static_cast<unsigned>(storageTotal >= storageUsed ? storageTotal - storageUsed : 0));
+  payload += ",\"storage_type\":\"" + String(persistentStorageType()) + "\"";
+  payload += ",\"storage_total_bytes\":" + String(static_cast<unsigned long long>(storageTotal));
+  payload += ",\"storage_used_bytes\":" + String(static_cast<unsigned long long>(storageUsed));
+  payload += ",\"storage_free_bytes\":" + String(static_cast<unsigned long long>(storageTotal >= storageUsed ? storageTotal - storageUsed : 0));
   payload += ",\"sd\":" + buildSdStatusJson();
   payload += ",\"stored_photo_count\":" + String(onboardStoredPhotoCount);
   payload += ",\"latest_media_id\":" + (onboardLatestMediaId == 0 ? String("null") : "\"" + onboardMediaIdString(onboardLatestMediaId) + "\"");
@@ -2132,6 +2226,7 @@ bool applyOnboardCameraSetting(const String &key, const String &value, String &e
     tv.tv_sec = epoch;
     tv.tv_usec = 0;
     settimeofday(&tv, nullptr);
+    backfillOnboardMediaTimestamps();
     return true;
   }
 
@@ -2595,26 +2690,6 @@ void clearUploadedEvents() {
 }
 
 String buildUploadStatusJson() {
-  size_t queuedObservationBatches = 0;
-  size_t queuedObservationBytes = 0;
-  if (onboardStorageReady) {
-    File dir = LittleFS.open(OBSERVATION_QUEUE_DIR, FILE_READ);
-    if (dir && dir.isDirectory()) {
-      File file = dir.openNextFile(FILE_READ);
-      while (file) {
-        if (!file.isDirectory()) {
-          const String name = file.name();
-          if (name.endsWith(".json")) {
-            ++queuedObservationBatches;
-            queuedObservationBytes += file.size();
-          }
-        }
-        file.close();
-        file = dir.openNextFile(FILE_READ);
-      }
-      dir.close();
-    }
-  }
   String payload = "{";
   payload += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
   payload += ",\"api_host\":\"" + jsonEscape(UPSTREAM_API_HOST) + "\"";
@@ -2631,8 +2706,9 @@ String buildUploadStatusJson() {
   payload += ",\"last_success_age_ms\":" + String(msSince(uploadLastSuccessMs));
   payload += ",\"queued_events\":" + String(static_cast<unsigned>(uploadEventCount));
   payload += ",\"observation_queue\":{";
-  payload += "\"queued_batches\":" + String(static_cast<unsigned>(queuedObservationBatches));
-  payload += ",\"queued_bytes\":" + String(static_cast<unsigned>(queuedObservationBytes));
+  payload += "\"storage_type\":\"" + String(persistentStorageType()) + "\"";
+  payload += ",\"queued_batches\":" + String(static_cast<unsigned>(observationQueueCachedCount));
+  payload += ",\"queued_bytes\":" + String(static_cast<unsigned>(observationQueueCachedBytes));
   payload += ",\"enqueue_count\":" + String(observationQueueEnqueueCount);
   payload += ",\"drop_count\":" + String(observationQueueDropCount);
   payload += ",\"replay_successes\":" + String(observationQueueReplaySuccessCount);
@@ -3976,7 +4052,8 @@ bool observationQueueStats(size_t &count, size_t &bytes, std::vector<String> *pa
   bytes = 0;
   if (paths != nullptr) paths->clear();
   if (!onboardStorageReady) return false;
-  File dir = LittleFS.open(OBSERVATION_QUEUE_DIR, FILE_READ);
+  fs::FS &fs = observationQueueFs();
+  File dir = fs.open(OBSERVATION_QUEUE_DIR, FILE_READ);
   if (!dir || !dir.isDirectory()) return false;
   File file = dir.openNextFile(FILE_READ);
   while (file) {
@@ -3998,6 +4075,15 @@ bool observationQueueStats(size_t &count, size_t &bytes, std::vector<String> *pa
   return true;
 }
 
+void refreshObservationQueueCachedStats() {
+  size_t count = 0;
+  size_t bytes = 0;
+  if (observationQueueStats(count, bytes)) {
+    observationQueueCachedCount = count;
+    observationQueueCachedBytes = bytes;
+  }
+}
+
 bool enqueueObservationPayload(const String &kind, const String &payload) {
   if (!onboardStorageReady) {
     observationQueueLastError = "storage_unavailable";
@@ -4012,20 +4098,21 @@ bool enqueueObservationPayload(const String &kind, const String &payload) {
   size_t queuedCount = 0;
   size_t queuedBytes = 0;
   observationQueueStats(queuedCount, queuedBytes);
-  if (queuedCount >= OBSERVATION_QUEUE_MAX_FILES) {
+  const size_t maxFiles = sdReady ? 4096 : OBSERVATION_QUEUE_MAX_FILES;
+  if (queuedCount >= maxFiles) {
     observationQueueLastError = "queue_full";
     ++observationQueueDropCount;
     return false;
   }
-  const size_t totalBytes = LittleFS.totalBytes();
-  const size_t usedBytes = LittleFS.usedBytes();
-  const size_t freeBytes = totalBytes > usedBytes ? totalBytes - usedBytes : 0;
-  if (freeBytes < payload.length() + OBSERVATION_QUEUE_MIN_FREE_BYTES) {
+  const uint64_t freeBytes = persistentStorageFreeBytes();
+  const size_t minFreeBytes = sdReady ? 1024 * 1024 : OBSERVATION_QUEUE_MIN_FREE_BYTES;
+  if (freeBytes < payload.length() + minFreeBytes) {
     observationQueueLastError = "storage_full";
     ++observationQueueDropCount;
     return false;
   }
 
+  fs::FS &fs = observationQueueFs();
   const uint32_t id = observationQueueNextId++;
   Preferences queuePrefs;
   if (queuePrefs.begin("obsq", false)) {
@@ -4035,8 +4122,8 @@ bool enqueueObservationPayload(const String &kind, const String &payload) {
 
   const String finalPath = observationQueuePath(id, kind);
   const String tempPath = finalPath + ".tmp";
-  LittleFS.remove(tempPath);
-  File file = LittleFS.open(tempPath, FILE_WRITE);
+  fs.remove(tempPath);
+  File file = fs.open(tempPath, FILE_WRITE);
   if (!file) {
     observationQueueLastError = "queue_write_failed";
     ++observationQueueDropCount;
@@ -4044,17 +4131,20 @@ bool enqueueObservationPayload(const String &kind, const String &payload) {
   }
   const size_t written = file.print(payload);
   file.close();
-  if (written != payload.length() || !LittleFS.rename(tempPath, finalPath)) {
-    LittleFS.remove(tempPath);
-    LittleFS.remove(finalPath);
+  if (written != payload.length() || !fs.rename(tempPath, finalPath)) {
+    fs.remove(tempPath);
+    fs.remove(finalPath);
     observationQueueLastError = "queue_commit_failed";
     ++observationQueueDropCount;
     return false;
   }
   ++observationQueueEnqueueCount;
+  observationQueueCachedCount = queuedCount + 1;
+  observationQueueCachedBytes = queuedBytes + payload.length();
   observationQueueLastError = "";
-  Serial.printf("[observation-queue] saved kind=%s path=%s bytes=%u\n",
+  Serial.printf("[observation-queue] saved kind=%s storage=%s path=%s bytes=%u\n",
                 kind.c_str(),
+                persistentStorageType(),
                 finalPath.c_str(),
                 static_cast<unsigned>(payload.length()));
   return true;
@@ -4077,17 +4167,19 @@ bool replayQueuedObservationBatches(uint8_t maxBatches, String &summary) {
   uint8_t attempted = 0;
   uint8_t uploaded = 0;
   uint8_t failed = 0;
+  fs::FS &fs = observationQueueFs();
   for (const String &path : paths) {
     if (attempted >= maxBatches) break;
-    File file = LittleFS.open(path, FILE_READ);
+    File file = fs.open(path, FILE_READ);
     if (!file) {
-      LittleFS.remove(path);
+      fs.remove(path);
       continue;
     }
+    const size_t queuedFileBytes = file.size();
     String payload = file.readString();
     file.close();
     if (payload.isEmpty()) {
-      LittleFS.remove(path);
+      fs.remove(path);
       continue;
     }
     ++attempted;
@@ -4102,7 +4194,9 @@ bool replayQueuedObservationBatches(uint8_t maxBatches, String &summary) {
                                   statusCode);
     setUploadResult(ok, statusCode, ok ? "queued_observations_uploaded" : responseBody);
     if (ok) {
-      LittleFS.remove(path);
+      fs.remove(path);
+      if (observationQueueCachedCount > 0) --observationQueueCachedCount;
+      if (observationQueueCachedBytes >= queuedFileBytes) observationQueueCachedBytes -= queuedFileBytes;
       ++uploaded;
       ++observationQueueReplaySuccessCount;
       Serial.printf("[observation-queue] uploaded path=%s status=%d\n", path.c_str(), statusCode);
@@ -4190,6 +4284,7 @@ bool syncBoardClockFromAirScan() {
   Serial.printf("[clock] synchronized from air_scan HTTP date epoch=%ld\n", static_cast<long>(epoch));
   setenv("TZ", BOARD_TIMEZONE, 1);
   tzset();
+  backfillOnboardMediaTimestamps();
   return true;
 }
 
@@ -5122,6 +5217,50 @@ void runRtspProbeSequence() {
 }
 
 void handleStatus() {
+  String basic = "{";
+  basic += "\"uptime_ms\":" + String(millis());
+  basic += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
+  basic += ",\"boot_count\":" + String(persistentBootCount);
+  basic += ",\"boot_session_id\":" + String(bootSessionId);
+  basic += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
+  basic += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
+  basic += ",\"halow_rssi\":" + String(halowConnected ? HaLow.RSSI() : 0);
+  basic += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  basic += ",\"clock_valid\":" + String(onboardClockValid() ? "true" : "false");
+  basic += ",\"storage_type\":\"" + String(persistentStorageType()) + "\"";
+  basic += ",\"storage_ready\":" + String(onboardStorageReady ? "true" : "false");
+  basic += ",\"sd_ready\":" + String(sdReady ? "true" : "false");
+  basic += ",\"stored_photo_count\":" + String(onboardStoredPhotoCount);
+  basic += ",\"latest_media_id\":" + (onboardLatestMediaId == 0 ? String("null") : "\"" + onboardMediaIdString(onboardLatestMediaId) + "\"");
+  basic += ",\"onboard_captures\":" + String(onboardCaptureCount);
+  basic += ",\"schedule_mode\":\"" + String(onboardClockValid() ? "clock_window" : "uptime_fallback") + "\"";
+  basic += ",\"observation_queue\":{";
+  basic += "\"storage_type\":\"" + String(persistentStorageType()) + "\"";
+  basic += ",\"queued_batches\":" + String(static_cast<unsigned>(observationQueueCachedCount));
+  basic += ",\"queued_bytes\":" + String(static_cast<unsigned>(observationQueueCachedBytes));
+  basic += "}";
+  basic += ",\"wifi_scanner\":{";
+  basic += "\"runs\":" + String(wifiScannerRunCount);
+  basic += ",\"last_count\":" + String(wifiScanLastCount);
+  basic += ",\"upload_successes\":" + String(wifiScannerUploadSuccessCount);
+  basic += ",\"upload_failures\":" + String(wifiScannerUploadFailureCount);
+  basic += ",\"last_error\":\"" + jsonEscape(wifiScannerLastError) + "\"";
+  basic += "}";
+  basic += ",\"ble_scanner\":{";
+  basic += "\"runs\":" + String(bleScannerRunCount);
+  basic += ",\"last_count\":" + String(bleScannerLastCount);
+  basic += ",\"manufacturer_count\":" + String(bleScannerLastManufacturerCount);
+  basic += ",\"services_count\":" + String(bleScannerLastServicesCount);
+  basic += ",\"name_count\":" + String(bleScannerLastNameCount);
+  basic += ",\"tx_power_count\":" + String(bleScannerLastTxPowerCount);
+  basic += ",\"upload_successes\":" + String(bleScannerUploadSuccessCount);
+  basic += ",\"upload_failures\":" + String(bleScannerUploadFailureCount);
+  basic += ",\"last_error\":\"" + jsonEscape(bleScannerLastError) + "\"";
+  basic += "}";
+  basic += "}";
+  server.send(200, "application/json", basic);
+  return;
+
   ControlState controlSnapshot{};
   snapshotControlState(controlSnapshot);
   String payload = "{";
@@ -5218,7 +5357,7 @@ void handleOnboardCameraLatest() {
     return;
   }
   if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
-  File file = LittleFS.open(onboardMediaImagePath(onboardLatestMediaId), FILE_READ);
+  File file = onboardMediaFs().open(onboardMediaImagePath(onboardLatestMediaId), FILE_READ);
   if (!file) {
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
@@ -5286,8 +5425,9 @@ bool deleteAllOnboardMedia(unsigned &deleted, unsigned &failed) {
   failed = 0;
   if (!onboardStorageReady) return false;
   if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  fs::FS &fs = onboardMediaFs();
   std::vector<uint32_t> ids;
-  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  File dir = fs.open(ONBOARD_MEDIA_DIR, FILE_READ);
   if (dir && dir.isDirectory()) {
     File file = dir.openNextFile(FILE_READ);
     while (file) {
@@ -5303,8 +5443,8 @@ bool deleteAllOnboardMedia(unsigned &deleted, unsigned &failed) {
     dir.close();
   }
   for (uint32_t id : ids) {
-    const bool imageDeleted = LittleFS.remove(onboardMediaImagePath(id));
-    const bool metaDeleted = !LittleFS.exists(onboardMediaMetaPath(id)) || LittleFS.remove(onboardMediaMetaPath(id));
+    const bool imageDeleted = fs.remove(onboardMediaImagePath(id));
+    const bool metaDeleted = !fs.exists(onboardMediaMetaPath(id)) || fs.remove(onboardMediaMetaPath(id));
     if (imageDeleted && metaDeleted) ++deleted; else ++failed;
   }
   refreshOnboardMediaState();
@@ -5338,7 +5478,8 @@ void handleOnboardMediaList() {
   uint32_t toEpoch = server.hasArg("to") ? strtoul(server.arg("to").c_str(), nullptr, 10) : UINT32_MAX;
   std::vector<OnboardMediaInfo> media;
   if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
-  File dir = LittleFS.open(ONBOARD_MEDIA_DIR, FILE_READ);
+  fs::FS &fs = onboardMediaFs();
+  File dir = fs.open(ONBOARD_MEDIA_DIR, FILE_READ);
   if (dir && dir.isDirectory()) {
     File file = dir.openNextFile(FILE_READ);
     while (file) {
@@ -5391,7 +5532,7 @@ void handleOnboardMediaFile() {
   if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
   OnboardMediaInfo info{};
   File file;
-  if (readOnboardMediaInfo(id, info)) file = LittleFS.open(onboardMediaImagePath(id), FILE_READ);
+  if (readOnboardMediaInfo(id, info)) file = onboardMediaFs().open(onboardMediaImagePath(id), FILE_READ);
   if (!file) {
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
@@ -5434,8 +5575,9 @@ void handleOnboardMediaDelete() {
     server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
     return;
   }
-  const bool imageDeleted = LittleFS.remove(onboardMediaImagePath(id));
-  const bool metaDeleted = LittleFS.remove(onboardMediaMetaPath(id));
+  fs::FS &fs = onboardMediaFs();
+  const bool imageDeleted = fs.remove(onboardMediaImagePath(id));
+  const bool metaDeleted = fs.remove(onboardMediaMetaPath(id));
   if (imageDeleted && metaDeleted) refreshOnboardMediaState();
   if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
   if (!imageDeleted || !metaDeleted) {
@@ -5582,6 +5724,7 @@ void handleOnboardCameraConfig() {
     tv.tv_sec = epoch;
     tv.tv_usec = 0;
     settimeofday(&tv, nullptr);
+    backfillOnboardMediaTimestamps();
     configChanged = true;
   }
   String sensorError;
