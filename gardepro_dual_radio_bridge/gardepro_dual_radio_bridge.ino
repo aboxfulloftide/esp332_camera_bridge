@@ -1919,6 +1919,7 @@ String buildOnboardCameraStatusJson() {
   payload += ",\"window_end_minute\":" + String(onboardCaptureEndMinute);
   payload += ",\"tz_offset_min\":" + String(onboardCaptureTzOffsetMin);
   payload += ",\"clock_valid\":" + String(onboardClockValid() ? "true" : "false");
+  payload += ",\"schedule_mode\":\"" + String(onboardClockValid() ? "clock_window" : "uptime_fallback") + "\"";
   payload += ",\"local_minute\":" + String(localMinute);
   payload += ",\"window_active\":" + String(onboardCaptureWindowActive() ? "true" : "false");
   payload += ",\"framesize\":\"" + String(frameSizeName(onboardFrameSize)) + "\"";
@@ -2331,12 +2332,9 @@ void onboardCaptureTask(void *pvParameters) {
         if (onboardLastScheduleAttemptMs == 0 ||
             nowMs - onboardLastScheduleAttemptMs >= normalIntervalMs) {
           if (!onboardClockValid()) {
-            ++onboardCaptureScheduleSkips;
-            if (onboardLastClockInvalidSkipLogMs == 0 ||
-                nowMs - onboardLastClockInvalidSkipLogMs >= 60000UL) {
-              onboardLastClockInvalidSkipLogMs = nowMs;
-              Serial.println("[onboard-camera] scheduled capture skipped clock_valid=no");
-            }
+            onboardLastScheduleAttemptMs = nowMs;
+            Serial.println("[onboard-camera] scheduled capture using uptime fallback clock_valid=no");
+            captureOnboardFrame("scheduled");
           } else if (onboardCaptureWindowActive()) {
             onboardLastScheduleAttemptMs = nowMs;
             captureOnboardFrame("scheduled");
