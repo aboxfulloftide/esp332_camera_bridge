@@ -128,10 +128,10 @@ Important control behavior:
 - `POST /control/bringup`, `POST /control/stream_start`, and `POST /control/stream_stop` are now queued background actions
 - the HTTP request returns immediately with `202 Accepted`
 - the board executes the requested action in a worker task
-- `bringup`, `stream-start`, and `stream-stop` wait on `/status` by default and now accept `--timeout` and `--poll-interval` to tune that wait
-- `session-close` now polls `/status` after standby instead of taking one immediate snapshot, so delayed WiFi drop is reported correctly
+- `bringup`, `stream-start`, and `stream-stop` wait on the board status APIs by default and now accept `--timeout` and `--poll-interval` to tune that wait
+- `session-close` now polls status after standby instead of taking one immediate snapshot, so delayed WiFi drop is reported correctly
 - in the current local-serial-mode sketch, HaLow and the HTTP control plane now boot immediately instead of waiting for the camera wake path to finish first
-- poll `status` to watch:
+- poll `/control/status` to watch:
   - `control_busy`
   - `control_pending`
   - `control_action`
@@ -153,11 +153,11 @@ Stability work completed in the current sketch:
 
 - idle camera WiFi loss is no longer just logged in local serial mode; the sketch now attempts a throttled idle recovery path
 - repeated idle HTTP keepalive failures now increment a counter and can trigger that idle recovery path
-- `/status` now exposes:
+- `/stream/status` now exposes:
   - `idle_recoveries`
   - `http_keepalive_failures`
   - `idle_recovery_last_ms`
-- `/status` now also exposes:
+- `/camera/status` now exposes:
   - `standby_requested`
 - the control worker now runs on a separate core from the main loop to reduce starvation during long control actions
 - local serial mode now brings up HaLow and the HTTP bridge immediately on boot so remote status/control does not wait for the camera wake path
@@ -351,7 +351,7 @@ Current live validation state:
 - camera RTP/RTCP packets are confirmed on the board UDP listeners:
   - primary RTP: local `25748`, source `192.168.8.1:49152`
   - secondary RTCP: local `25749`, source `192.168.8.1:49153`
-- `/status.stream_status` reports:
+- `/stream/status` reports:
   - RTSP status codes
   - selected PLAY URL
   - tunnel target and tunnel connect error

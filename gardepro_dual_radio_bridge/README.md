@@ -38,7 +38,7 @@ Current observed behavior:
 
 - the Heltec HaLow stack accepts the `HaLow.config(...)` call
 - but the live associated address is still DHCP-assigned by the AP
-- in current tests the board comes up as `192.168.1.157`
+- in current field tests the board comes up as `192.168.1.160`
 - the live HaLow MAC used for reservation/identity is:
   - `78:72:64:E4:57:00`
 
@@ -56,6 +56,14 @@ server with the current:
 ## Current HTTP Endpoints
 
 - `/status`
+- `GET /system/status`
+- `GET /halow/status`
+- `GET /wifi/status`
+- `GET /camera/status`
+- `GET /timing/status`
+- `GET /stream/status`
+- `GET /ble/status`
+- `GET /control/status`
 - `/battery/status`
 - `/onboard/status`
 - `/onboard/latest.jpg`
@@ -78,6 +86,9 @@ server with the current:
 - `/upload/observations`
 - `/upload/events`
 - `/upload/all`
+- `GET /upload/ble/last`
+- `GET /sd/status`
+- `POST /sd/mount`
 - `GET /firmware/status`
 - `POST /firmware/update`
 - `/control/bringup`
@@ -98,6 +109,8 @@ server with the current:
 - `/camera/getParaSetting`
 - `/camera/gallery`
 - `/camera/standby/reset`
+
+See [BOARD_HTTP_API.md](BOARD_HTTP_API.md) for the current route-by-route board HTTP API reference.
 
 Unified board features:
 
@@ -201,18 +214,14 @@ Control behavior is now server-oriented rather than console-oriented:
 - `POST /camera/request` can now forward raw JSON bodies to the camera, for example `POST /cmd/setSetting` and `POST /cmd/setGmtClock`
 - `/camera/raw` now dechunks camera file responses before relaying them to the server
 - in local serial mode the sketch now boots HaLow and the HTTP control plane immediately instead of waiting for camera wake first
-- `/status` exposes control state:
-  - `control_busy`
-  - `control_pending`
-  - `control_action`
-  - `control_last_action`
-  - `control_last_ok`
-  - `control_last_message`
-- `/status` also exposes:
-  - `camera_session` for lease state and camera request activity
-  - `timing` for bringup phase timings
-  - `stream_status` for RTSP status codes, tunnel target/connect errors, UDP
-    receive counters, and tunnel-forwarding counters
+- `/status` is now a compact board-health summary for field checks.
+- Detailed runtime state is split across the alternate status endpoints:
+  - `/control/status` for queued/active/last control action state
+  - `/camera/status` and `/session/status` for camera session and lease state
+  - `/timing/status` for bringup phase timings
+  - `/stream/status` for RTSP status codes, tunnel target/connect errors, UDP receive counters, and tunnel-forwarding counters
+  - `/ble/status` for BLE wake/discovery telemetry and BLE scanner counters
+  - `/wifi/status` for trail-camera Wi-Fi state and Wi-Fi scanner counters
 
 ## Current Live-View Result
 
@@ -267,7 +276,7 @@ The main remaining runtime issue is reliable on-demand session startup:
   - re-running RTSP
   - re-establishing the tunnel
 - in the current sketch, idle camera WiFi loss in local serial mode now also triggers a throttled recovery path instead of only passive rescans
-- `/status` now reports:
+- `/stream/status` now reports:
   - `idle_recoveries`
   - `http_keepalive_failures`
   - `idle_recovery_last_ms`
@@ -309,7 +318,7 @@ In local serial mode, `stream_start` now:
 - runs the proven RTSP live-view sequence
 - opens the TCP tunnel to the Pi receiver
 - forwards packets seen on local UDP listeners into that tunnel
-- reports precise stream failure stage through `/status.stream_status`
+- reports precise stream failure stage through `/stream/status`
 
 Latest live-board validation:
 
@@ -320,7 +329,7 @@ Latest live-board validation:
 - when the upstream receiver is available at `UPSTREAM_TUNNEL_HOST:UPSTREAM_TUNNEL_PORT`,
   `stream_status.tunnel_packets_sent` and `stream_status.tunnel_bytes_sent`
   increase
-- if the upstream receiver is missing, `/status.stream_status` reports
+- if the upstream receiver is missing, `/stream/status` reports
   `last_stage: "tunnel_connect_failed"` and the socket error code
 
 This is the current preferred mode while validating end-to-end live forwarding.
@@ -388,10 +397,10 @@ That module now:
 
 - resolves the board IP from the registration file
 - exposes `open_session(...)`, `close_session(...)`, `session(...)`, and `run_in_session(...)` for short-lived session handling
-- waits for queued control actions to finish by polling `/status`
+- waits for queued control actions to finish by polling the board status APIs
 - retries raw camera fetches once after `bringup` when the board reports a transport-level camera failure
 - returns structured raw camera fetch results with decoded body text and parsed JSON when available
-- lets `bringup`, `stream-start`, and `stream-stop` use CLI `--timeout` and `--poll-interval` tuning while they wait on `/status`
+- lets `bringup`, `stream-start`, and `stream-stop` use CLI `--timeout` and `--poll-interval` tuning while they wait on board status APIs
 - uses verified settings updates for `setting-set` and `setting-update-json` by re-reading `/cmd/getSetting` after the write
 - verifies picture capture by polling `picture-result` and checking for a new latest photo
 - verifies video stop by checking whether a new latest video appears after the stop request
@@ -474,7 +483,7 @@ Latest live validation findings after the current stability patches:
 - `/status` now remains reachable while `bringup` is actively running, and the Python control client now gets a board-side `bringup_failed` result instead of timing out waiting for completion
 - the local serial loop now services HTTP much more frequently, and the long BLE / WiFi wait paths now yield cooperatively instead of sleeping in large blocking chunks
 - idle WiFi recovery is now gated off during active control actions, so manual `bringup` no longer races the background recovery path
-- `/status` now also exposes BLE scan telemetry including scan mode, total advertisements seen, target-hit count, and strongest/last seen advertisers
+- `/ble/status` now exposes BLE scan telemetry including scan mode, total advertisements seen, target-hit count, and strongest/last seen advertisers
 - targeted NimBLE validation saw the trail camera advertisement and successfully woke it:
   - target `a4:6d:d4:9e:47:32`
   - name `CAM8Z8_NoName_G_E6`

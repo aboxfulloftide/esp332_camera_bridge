@@ -118,7 +118,7 @@ Return normalized current bridge and camera status.
     "halow_connected": true,
     "wifi_connected": true,
     "camera_ip": "192.168.8.1",
-    "bridge_ip": "192.168.1.157",
+    "bridge_ip": "192.168.1.160",
     "ble_stage": "wake_ok",
     "standby_requested": false,
     "control_last_message": "bringup_complete",

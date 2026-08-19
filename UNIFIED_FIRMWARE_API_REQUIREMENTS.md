@@ -150,7 +150,7 @@ Request:
   },
   "radio": {
     "halow_connected": true,
-    "halow_ip": "192.168.1.157",
+    "halow_ip": "192.168.1.160",
     "halow_rssi": -55,
     "trail_wifi_connected": false
   }

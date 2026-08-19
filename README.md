@@ -14,6 +14,8 @@ This repository contains the current GardePro ESP32 bridge work:
   - receiver for the framed tunnel stream
 - `BRIDGE_USAGE.md`
   - current operator notes and validation workflow
+- `gardepro_dual_radio_bridge/BOARD_HTTP_API.md`
+  - current board HTTP API reference for status, onboard media, scanner/upload, OTA, and trail-camera proxy routes
 - `CAMERA_RETURN_CHECKLIST.md`
   - resume checklist for when the camera has power again
 - `SERVER_SIDE_PLAN.md`

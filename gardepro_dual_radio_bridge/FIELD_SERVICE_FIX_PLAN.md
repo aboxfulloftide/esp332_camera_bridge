@@ -1,6 +1,6 @@
 # Trail ESP32 field-service verification
 
-Date: 2026-08-18
+Date: 2026-08-19
 
 Board: `trail_esp32`
 
@@ -30,6 +30,8 @@ Expected HaLow HTTP address: `http://192.168.1.160:18080`
 - Current source adds OTA update endpoints:
   - `GET /firmware/status`
   - `POST /firmware/update`
+- Current board HTTP API reference:
+  - `gardepro_dual_radio_bridge/BOARD_HTTP_API.md`
 
 ## Verified after flash over USB
 
@@ -81,6 +83,8 @@ curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/scanner/c
 
 Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP server is small and the HaLow link has shown jitter; sequential requests are reliable.
 
+Recent trail-camera field tests show camera operations can pass while a few ESP32 HTTP status polls reset or time out during active live view. Treat `/stream/status` media counters and the stream functional gate as the signal for live-view success; occasional `/control/status` poll failures under stream load are a board responsiveness issue to improve separately.
+
 ## Old `/status` field coverage
 
 - `/status`: compact summary for field checks.
@@ -125,9 +129,9 @@ curl -sS --connect-timeout 10 --max-time 30 \
   -X POST http://192.168.1.160:18080/scanner/disable
 ```
 
-## OTA firmware update after next USB flash
+## OTA firmware update
 
-After a firmware containing OTA support has been flashed once over USB, future updates can be pushed over HaLow.
+OTA support has been flashed over USB. Future updates can be pushed over HaLow when the board HTTP API is reachable.
 
 Build an OTA binary:
 
@@ -164,7 +168,6 @@ halow_status
 halow_up
 onboard_status
 onboard_capture
-onboard_delete_all
 sd_mount
 sd_status
 upload_status

@@ -2,6 +2,8 @@
 
 Base URL: `http://<board-ip>:18080`
 
+Current field unit address: `http://192.168.1.160:18080`
+
 ## Endpoints
 
 ### `GET /onboard/status`
@@ -11,10 +13,10 @@ Returns camera configuration and storage state. Storage fields:
 ```json
 {
   "storage_ready": true,
-  "storage_type": "littlefs",
-  "storage_total_bytes": 655360,
-  "storage_used_bytes": 155648,
-  "storage_free_bytes": 499712,
+  "storage_type": "sd",
+  "storage_total_bytes": 63856705536,
+  "storage_used_bytes": 6291456,
+  "storage_free_bytes": 63850414080,
   "stored_photo_count": 1,
   "latest_media_id": "00000004",
   "latest_bytes": 138736
@@ -126,5 +128,6 @@ Possible codes include:
 
 - Treat media IDs as opaque strings. IDs remain stable and are never renumbered or reused after deletion.
 - Resolve relative `path` values against the board base URL.
-- The current board partition provides 640 KiB of media storage. Handle HTTP `507` / `storage_full`.
+- SD is the primary persistent store when mounted. LittleFS is retained only as fallback.
+- Handle HTTP `507` / `storage_full`.
 - File endpoints return binary JPEG data; other endpoints return JSON.
