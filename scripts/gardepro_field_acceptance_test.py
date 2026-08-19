@@ -96,7 +96,7 @@ class FieldTester:
         time.sleep(self.pause)
         return data
 
-    def download(self, phase: str, name: str, path: str, dest: Path, timeout: float | None = None) -> bool:
+    def download(self, phase: str, name: str, path: str, dest: Path, timeout: float | None = None, expect: str = "jpeg") -> bool:
         ok, status, body, error = self.request("GET", path, timeout)
         if not ok:
             self.record(phase, name, False, status=status, error=error, path=path)
@@ -104,9 +104,22 @@ class FieldTester:
             return False
         dest.write_bytes(body)
         jpeg = body.startswith(b"\xff\xd8")
-        self.record(phase, name, jpeg and len(body) > 1000, status=status, path=path, output=str(dest), bytes=len(body), jpeg=jpeg)
+        mp4 = len(body) >= 12 and body[4:8] == b"ftyp"
+        valid_type = mp4 if expect == "mp4" else jpeg
+        self.record(
+            phase,
+            name,
+            valid_type and len(body) > 1000,
+            status=status,
+            path=path,
+            output=str(dest),
+            bytes=len(body),
+            expect=expect,
+            jpeg=jpeg,
+            mp4=mp4,
+        )
         time.sleep(self.pause)
-        return jpeg and len(body) > 1000
+        return valid_type and len(body) > 1000
 
     def ping(self, host: str, count: int) -> None:
         proc = subprocess.run(["ping", "-c", str(count), host], text=True, capture_output=True)
@@ -191,6 +204,7 @@ class FieldTester:
                 f"/camera/raw?path=/file/{latest_id}/{ext}",
                 self.out_dir / f"trail_latest_{latest_id}.{suffix}",
                 timeout=180,
+                expect="mp4" if latest_type == 2 else "jpeg",
             )
 
         self.camera_get("picture_take", "/media/pic/take", timeout=60)
