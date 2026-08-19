@@ -113,6 +113,9 @@ Firmware policy decisions this API must support:
     first, then oldest onboard/local camera image files
   - do not spool trail camera media to ESP32 SD
 - Scanner schedule defaults:
+  - scheduled WiFi/BLE scanning disabled by default on the device
+  - manual `POST /upload/observations` still runs WiFi/BLE scans on demand
+  - API control available with `GET/POST /scanner/config`, `POST /scanner/enable`, and `POST /scanner/disable`
   - daytime window `07:00` through `21:00`
   - WiFi scan every 2 minutes during daytime
   - BLE scan every 2 minutes during daytime

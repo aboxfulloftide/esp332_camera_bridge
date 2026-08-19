@@ -289,15 +289,22 @@ Response:
 
 Recommended sequence:
 
-1. Pause promiscuous WiFi scanning.
-2. Pause BLE scanning unless the BLE stack can safely remain active with HaLow.
+1. If scheduled scanning is enabled, pause promiscuous WiFi scanning.
+2. If scheduled scanning is enabled, pause BLE scanning unless the BLE stack can safely remain active with HaLow.
 3. Connect HaLow.
 4. POST `/api/observations/upload` for WiFi/BLE observations.
 5. POST `/api/board/telemetry`.
 6. POST media metadata and upload pending media blobs.
 7. POST `/api/board/events` if any queued events exist.
 8. Disconnect/idle HaLow if desired.
-9. Resume WiFi/BLE scanning unless a trail-camera session is active.
+9. Resume WiFi/BLE scanning only if the scheduler is enabled and no trail-camera session is active.
+
+## ESP32 scanner scheduling policy
+
+- Scheduled WiFi/BLE scanning must default to disabled on the device.
+- Manual `POST /upload/observations` must continue to run WiFi/BLE scans on demand.
+- The firmware must expose an API to enable or disable scheduled scanning without reflashing.
+- When scheduled scanning is disabled, the firmware may still replay queued observation uploads.
 
 ## Firmware Queue Requirements
 

@@ -20,8 +20,14 @@ Expected HaLow HTTP address: `http://192.168.1.160:18080`
   - Without valid time/HaLow, uptime fallback still captures every 30 minutes.
 - Captures made before network time is available store boot uptime and are backfilled after time sync.
 - BLE upload payloads have been verified to include advertisement fields, including `manufacturer_data`, `adv_services`, `adv_service_data`, `tx_power`, `local_name`, and `signal_dbm`.
-- Next firmware build changes observation uploads to the wireless database host at `192.168.1.42:80`.
-- Next firmware build adds OTA update endpoints:
+- Current source changes observation uploads to the wireless database host at `192.168.1.42:80`.
+- Current source disables scheduled Wi-Fi/BLE scanning by default. Manual scans/uploads remain available.
+- Current source adds scanner schedule control endpoints:
+  - `GET /scanner/config`
+  - `POST /scanner/config?enabled=true|false`
+  - `POST /scanner/enable`
+  - `POST /scanner/disable`
+- Current source adds OTA update endpoints:
   - `GET /firmware/status`
   - `POST /firmware/update`
 
@@ -70,6 +76,7 @@ curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/onboard/s
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/sd/status
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/upload/ble/last
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/firmware/status
+curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/scanner/config
 ```
 
 Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP server is small and the HaLow link has shown jitter; sequential requests are reliable.
@@ -91,6 +98,32 @@ Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP
 - `/session/status`: camera session lease details.
 - `/sd/status`: SD mount/card/storage details.
 - `/firmware/status`: firmware version and OTA status.
+- `/scanner/config`: scheduled Wi-Fi/BLE scanner enable state and observation upload target.
+
+## Scanner schedule control
+
+Scheduled Wi-Fi/BLE scanning defaults to disabled. This reduces ESP32 load and avoids unnecessary 2.4 GHz/BLE activity.
+
+Manual scan/upload remains available:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 120 \
+  -X POST http://192.168.1.160:18080/upload/observations
+```
+
+Enable scheduled scanning:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 30 \
+  -X POST http://192.168.1.160:18080/scanner/enable
+```
+
+Disable scheduled scanning:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 30 \
+  -X POST http://192.168.1.160:18080/scanner/disable
+```
 
 ## OTA firmware update after next USB flash
 

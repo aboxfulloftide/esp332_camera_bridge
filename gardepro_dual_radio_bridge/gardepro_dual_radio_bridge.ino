@@ -91,6 +91,9 @@ static const uint16_t CAMERA_RTSP_PORT = 554;
 #ifndef AIR_SCAN_API_PORT
 #define AIR_SCAN_API_PORT 80
 #endif
+#ifndef SCANNER_SCHEDULE_ENABLED
+#define SCANNER_SCHEDULE_ENABLED 0
+#endif
 #ifndef BOARD_TIMEZONE
 #define BOARD_TIMEZONE "EST5EDT,M3.2.0/2,M11.1.0/2"
 #endif
@@ -419,6 +422,7 @@ uint32_t bleScannerLastServiceDataCount = 0;
 uint32_t bleScannerLastTxPowerCount = 0;
 uint32_t bleScannerLastNameCount = 0;
 String bleScannerLastError = "idle";
+bool scannerScheduleEnabled = SCANNER_SCHEDULE_ENABLED != 0;
 String bleObservationsLastJson = "";
 
 struct BleObservationEntry {
@@ -1478,6 +1482,28 @@ void saveOnboardConfig() {
   runtimePrefs.putBool("agc", onboardAgc);
   runtimePrefs.putUChar("agc_gain", static_cast<uint8_t>(onboardAgcGain));
   runtimePrefs.putUChar("effect", static_cast<uint8_t>(onboardSpecialEffect));
+  runtimePrefs.end();
+}
+
+void loadScannerConfig() {
+  if (!runtimePrefs.begin("scanner", true)) {
+    Serial.println("[scanner-config] failed to open preferences for read");
+    return;
+  }
+  scannerScheduleEnabled = runtimePrefs.getBool("enabled", scannerScheduleEnabled);
+  runtimePrefs.end();
+  Serial.printf("[scanner-config] scheduled_scans=%s upload_host=%s:%u\n",
+                scannerScheduleEnabled ? "enabled" : "disabled",
+                AIR_SCAN_API_HOST,
+                AIR_SCAN_API_PORT);
+}
+
+void saveScannerConfig() {
+  if (!runtimePrefs.begin("scanner", false)) {
+    Serial.println("[scanner-config] failed to open preferences for write");
+    return;
+  }
+  runtimePrefs.putBool("enabled", scannerScheduleEnabled);
   runtimePrefs.end();
 }
 
@@ -2706,6 +2732,7 @@ String buildUploadStatusJson() {
   payload += ",\"api_prefix\":\"" + jsonEscape(UPSTREAM_API_PREFIX) + "\"";
   payload += ",\"observations_api_host\":\"" + jsonEscape(AIR_SCAN_API_HOST) + "\"";
   payload += ",\"observations_api_port\":" + String(AIR_SCAN_API_PORT);
+  payload += ",\"scanner_schedule_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
   payload += ",\"attempts\":" + String(uploadAttemptCount);
   payload += ",\"successes\":" + String(uploadSuccessCount);
   payload += ",\"failures\":" + String(uploadFailureCount);
@@ -2747,6 +2774,33 @@ String buildUploadStatusJson() {
   payload += ",\"last_service_data_count\":" + String(bleScannerLastServiceDataCount);
   payload += ",\"last_tx_power_count\":" + String(bleScannerLastTxPowerCount);
   payload += ",\"last_name_count\":" + String(bleScannerLastNameCount);
+  payload += "}";
+  payload += "}";
+  return payload;
+}
+
+String buildScannerConfigJson() {
+  String payload = "{";
+  payload += "\"scheduled_scans_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
+  payload += ",\"default_enabled\":" + String((SCANNER_SCHEDULE_ENABLED != 0) ? "true" : "false");
+  payload += ",\"manual_upload_endpoint\":\"/upload/observations\"";
+  payload += ",\"config_endpoint\":\"/scanner/config\"";
+  payload += ",\"observations_api_host\":\"" + jsonEscape(AIR_SCAN_API_HOST) + "\"";
+  payload += ",\"observations_api_port\":" + String(AIR_SCAN_API_PORT);
+  payload += ",\"observations_api_path\":\"/api/observations/upload\"";
+  payload += ",\"day_interval_ms\":" + String(WIFI_SCAN_DAY_INTERVAL_MS);
+  payload += ",\"night_interval_ms\":" + String(WIFI_SCAN_NIGHT_INTERVAL_MS);
+  payload += ",\"wifi_scanner\":{";
+  payload += "\"runs\":" + String(wifiScannerRunCount);
+  payload += ",\"upload_successes\":" + String(wifiScannerUploadSuccessCount);
+  payload += ",\"upload_failures\":" + String(wifiScannerUploadFailureCount);
+  payload += ",\"last_error\":\"" + jsonEscape(wifiScannerLastError) + "\"";
+  payload += "}";
+  payload += ",\"ble_scanner\":{";
+  payload += "\"runs\":" + String(bleScannerRunCount);
+  payload += ",\"upload_successes\":" + String(bleScannerUploadSuccessCount);
+  payload += ",\"upload_failures\":" + String(bleScannerUploadFailureCount);
+  payload += ",\"last_error\":\"" + jsonEscape(bleScannerLastError) + "\"";
   payload += "}";
   payload += "}";
   return payload;
@@ -3703,6 +3757,9 @@ void printSerialHelp() {
   Serial.println("  onboard_dump [fresh]");
   Serial.println("  sd_status");
   Serial.println("  sd_mount");
+  Serial.println("  scanner_status");
+  Serial.println("  scanner_enable");
+  Serial.println("  scanner_disable");
   Serial.println("  wifi_scan");
   Serial.println("  upload_status");
   Serial.println("  upload_telemetry");
@@ -4398,21 +4455,27 @@ void wifiScannerTask(void *pvParameters) {
   (void)pvParameters;
   vTaskDelay(pdMS_TO_TICKS(WIFI_SCAN_INITIAL_DELAY_MS));
   while (true) {
-    String wifiResponse;
-    int wifiStatus = 0;
     if (observationUploadMutex != nullptr) {
       xSemaphoreTake(observationUploadMutex, portMAX_DELAY);
     }
     String queueSummary;
     const bool queueOk = replayQueuedObservationBatches(4, queueSummary);
-    const bool wifiOk = uploadWifiObservationsNow(wifiResponse, wifiStatus);
-    String bleResponse;
-    int bleStatus = 0;
-    const bool bleOk = uploadBleObservationsNow(bleResponse, bleStatus);
+    bool wifiOk = true;
+    bool bleOk = true;
+    if (scannerScheduleEnabled) {
+      String wifiResponse;
+      int wifiStatus = 0;
+      wifiOk = uploadWifiObservationsNow(wifiResponse, wifiStatus);
+      String bleResponse;
+      int bleStatus = 0;
+      bleOk = uploadBleObservationsNow(bleResponse, bleStatus);
+    }
     if (observationUploadMutex != nullptr) {
       xSemaphoreGive(observationUploadMutex);
     }
-    const unsigned long waitMs = (queueOk && wifiOk && bleOk) ? currentWifiScannerIntervalMs() : 30000UL;
+    const unsigned long waitMs = scannerScheduleEnabled
+                                   ? ((queueOk && wifiOk && bleOk) ? currentWifiScannerIntervalMs() : 30000UL)
+                                   : 60000UL;
     vTaskDelay(pdMS_TO_TICKS(waitMs));
   }
 }
@@ -5243,6 +5306,7 @@ String buildWifiStatusJson() {
   String payload = "{";
   payload += "\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
   payload += ",\"wifi_ip\":\"" + WiFi.localIP().toString() + "\"";
+  payload += ",\"scheduled_scans_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
   payload += ",\"wifi_scan_busy\":" + String(wifiScanBusy ? "true" : "false");
   payload += ",\"wifi_scan_last_count\":" + String(wifiScanLastCount);
   payload += ",\"wifi_scan_last_age_ms\":" + String(msSince(wifiScanLastMs));
@@ -5287,7 +5351,8 @@ String buildStreamRuntimeStatusJson() {
 
 String buildBleStatusJson() {
   String payload = "{";
-  payload += "\"ble_wake_attempted\":" + String(bleWakeAttempted ? "true" : "false");
+  payload += "\"scheduled_scans_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
+  payload += ",\"ble_wake_attempted\":" + String(bleWakeAttempted ? "true" : "false");
   payload += ",\"ble_wake_confirmed\":" + String(bleWakeConfirmed ? "true" : "false");
   payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
   payload += ",\"ble_scan_mode\":\"" + jsonEscape(bleScanMode) + "\"";
@@ -5353,6 +5418,7 @@ void handleStatus() {
   basic += ",\"storage_type\":\"" + String(persistentStorageType()) + "\"";
   basic += ",\"storage_ready\":" + String(onboardStorageReady ? "true" : "false");
   basic += ",\"sd_ready\":" + String(sdReady ? "true" : "false");
+  basic += ",\"scanner_schedule_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
   basic += ",\"stored_photo_count\":" + String(onboardStoredPhotoCount);
   basic += ",\"latest_media_id\":" + (onboardLatestMediaId == 0 ? String("null") : "\"" + onboardMediaIdString(onboardLatestMediaId) + "\"");
   basic += ",\"onboard_captures\":" + String(onboardCaptureCount);
@@ -6001,6 +6067,49 @@ void handleUploadAll() {
   server.send((telemetryOk && eventsOk) ? 200 : 502, "application/json", payload);
 }
 
+void handleScannerConfigGet() {
+  server.send(200, "application/json", buildScannerConfigJson());
+}
+
+void handleScannerConfigPost() {
+  if (server.hasArg("enabled")) {
+    scannerScheduleEnabled = boolLikeValue(server.arg("enabled"));
+  } else if (server.hasArg("scheduled_scans_enabled")) {
+    scannerScheduleEnabled = boolLikeValue(server.arg("scheduled_scans_enabled"));
+  } else if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    body.toLowerCase();
+    if (body.indexOf("\"enabled\":true") >= 0 || body.indexOf("\"scheduled_scans_enabled\":true") >= 0) {
+      scannerScheduleEnabled = true;
+    } else if (body.indexOf("\"enabled\":false") >= 0 || body.indexOf("\"scheduled_scans_enabled\":false") >= 0) {
+      scannerScheduleEnabled = false;
+    } else {
+      server.send(400, "application/json", "{\"error\":\"invalid_request\",\"detail\":\"expected enabled=true|false\"}");
+      return;
+    }
+  } else {
+    server.send(400, "application/json", "{\"error\":\"invalid_request\",\"detail\":\"expected enabled=true|false\"}");
+    return;
+  }
+  saveScannerConfig();
+  enqueueUploadEvent("scanner_config", scannerScheduleEnabled ? "scheduled_scans_enabled" : "scheduled_scans_disabled", "{}", true);
+  server.send(200, "application/json", buildScannerConfigJson());
+}
+
+void handleScannerEnable() {
+  scannerScheduleEnabled = true;
+  saveScannerConfig();
+  enqueueUploadEvent("scanner_config", "scheduled_scans_enabled", "{}", true);
+  server.send(200, "application/json", buildScannerConfigJson());
+}
+
+void handleScannerDisable() {
+  scannerScheduleEnabled = false;
+  saveScannerConfig();
+  enqueueUploadEvent("scanner_config", "scheduled_scans_disabled", "{}", true);
+  server.send(200, "application/json", buildScannerConfigJson());
+}
+
 bool firmwareUpdateAuthorized() {
   if (String(UPSTREAM_API_TOKEN).isEmpty()) return true;
   return server.hasArg("token") && server.arg("token") == UPSTREAM_API_TOKEN;
@@ -6630,6 +6739,10 @@ void startHttpServer() {
   server.on("/onboard/timelapse/start", HTTP_POST, handleOnboardTimelapseStart);
   server.on("/onboard/timelapse/stop", HTTP_POST, handleOnboardTimelapseStop);
   server.on("/scan/wifi", HTTP_GET, handleWifiScan);
+  server.on("/scanner/config", HTTP_GET, handleScannerConfigGet);
+  server.on("/scanner/config", HTTP_POST, handleScannerConfigPost);
+  server.on("/scanner/enable", HTTP_POST, handleScannerEnable);
+  server.on("/scanner/disable", HTTP_POST, handleScannerDisable);
   server.on("/upload/status", HTTP_GET, handleUploadStatus);
   server.on("/upload/ble/last", HTTP_GET, handleUploadBleLast);
   server.on("/sd/status", HTTP_GET, handleSdStatus);
@@ -6869,6 +6982,22 @@ void handleSerialCommand(const String &line) {
   if (cmd == "sd_mount") {
     mountSdCard();
     Serial.println(buildSdStatusJson());
+    return;
+  }
+  if (cmd == "scanner_status") {
+    Serial.println(buildScannerConfigJson());
+    return;
+  }
+  if (cmd == "scanner_enable") {
+    scannerScheduleEnabled = true;
+    saveScannerConfig();
+    Serial.println(buildScannerConfigJson());
+    return;
+  }
+  if (cmd == "scanner_disable") {
+    scannerScheduleEnabled = false;
+    saveScannerConfig();
+    Serial.println(buildScannerConfigJson());
     return;
   }
   if (cmd.startsWith("onboard_config")) {
@@ -7128,6 +7257,7 @@ void setup() {
   initOnboardStorage();
   mountSdCard();
   loadOnboardConfig();
+  loadScannerConfig();
   initOnboardCamera();
   if (onboardCaptureTaskHandle == nullptr) {
     xTaskCreatePinnedToCore(onboardCaptureTask,
