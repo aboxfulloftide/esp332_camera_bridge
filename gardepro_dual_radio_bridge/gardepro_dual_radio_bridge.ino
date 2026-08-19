@@ -11,6 +11,7 @@
 #include <FS.h>
 #include <halow_SD.h>
 #include <SPI.h>
+#include <Update.h>
 #include <uri/UriRegex.h>
 #include <algorithm>
 #include <vector>
@@ -85,10 +86,10 @@ static const uint16_t CAMERA_RTSP_PORT = 554;
 #define UPSTREAM_API_TOKEN ""
 #endif
 #ifndef AIR_SCAN_API_HOST
-#define AIR_SCAN_API_HOST "192.168.1.22"
+#define AIR_SCAN_API_HOST "192.168.1.42"
 #endif
 #ifndef AIR_SCAN_API_PORT
-#define AIR_SCAN_API_PORT 8002
+#define AIR_SCAN_API_PORT 80
 #endif
 #ifndef BOARD_TIMEZONE
 #define BOARD_TIMEZONE "EST5EDT,M3.2.0/2,M11.1.0/2"
@@ -460,6 +461,14 @@ uint32_t observationQueueReplayFailureCount = 0;
 String observationQueueLastError = "";
 size_t observationQueueCachedCount = 0;
 size_t observationQueueCachedBytes = 0;
+bool otaInProgress = false;
+bool otaSucceeded = false;
+bool otaRestartPending = false;
+unsigned long otaStartedMs = 0;
+unsigned long otaFinishedMs = 0;
+unsigned long otaRestartAtMs = 0;
+size_t otaBytesWritten = 0;
+String otaLastError = "";
 
 struct CameraProbeTarget {
   const char *label;
@@ -5992,6 +6001,99 @@ void handleUploadAll() {
   server.send((telemetryOk && eventsOk) ? 200 : 502, "application/json", payload);
 }
 
+bool firmwareUpdateAuthorized() {
+  if (String(UPSTREAM_API_TOKEN).isEmpty()) return true;
+  return server.hasArg("token") && server.arg("token") == UPSTREAM_API_TOKEN;
+}
+
+String buildFirmwareStatusJson() {
+  String payload = "{";
+  payload += "\"firmware_name\":\"" + jsonEscape(FIRMWARE_NAME) + "\"";
+  payload += ",\"firmware_version\":\"" + jsonEscape(FIRMWARE_VERSION) + "\"";
+  payload += ",\"update_endpoint\":\"/firmware/update\"";
+  payload += ",\"in_progress\":" + String(otaInProgress ? "true" : "false");
+  payload += ",\"last_succeeded\":" + String(otaSucceeded ? "true" : "false");
+  payload += ",\"restart_pending\":" + String(otaRestartPending ? "true" : "false");
+  payload += ",\"bytes_written\":" + String(static_cast<unsigned>(otaBytesWritten));
+  payload += ",\"last_error\":\"" + jsonEscape(otaLastError) + "\"";
+  payload += ",\"started_age_ms\":" + String(msSince(otaStartedMs));
+  payload += ",\"finished_age_ms\":" + String(msSince(otaFinishedMs));
+  payload += ",\"free_sketch_space\":" + String(static_cast<unsigned>(ESP.getFreeSketchSpace()));
+  payload += "}";
+  return payload;
+}
+
+void handleFirmwareStatus() {
+  server.send(200, "application/json", buildFirmwareStatusJson());
+}
+
+void handleFirmwareUpdateFinished() {
+  if (!firmwareUpdateAuthorized()) {
+    server.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+    return;
+  }
+  if (!otaSucceeded) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(otaLastError.isEmpty() ? String("update_failed") : otaLastError) + "\"}");
+    return;
+  }
+  otaRestartPending = true;
+  otaRestartAtMs = millis() + 1500UL;
+  String payload = "{";
+  payload += "\"ok\":true";
+  payload += ",\"bytes_written\":" + String(static_cast<unsigned>(otaBytesWritten));
+  payload += ",\"restart_pending\":true";
+  payload += "}";
+  server.send(200, "application/json", payload);
+}
+
+void handleFirmwareUploadStream() {
+  HTTPUpload &upload = server.upload();
+  if (!firmwareUpdateAuthorized()) {
+    otaLastError = "unauthorized";
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otaInProgress = true;
+    otaSucceeded = false;
+    otaRestartPending = false;
+    otaStartedMs = millis();
+    otaFinishedMs = 0;
+    otaBytesWritten = 0;
+    otaLastError = "";
+    Serial.printf("[ota] update start filename=%s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      otaLastError = "begin_failed";
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!otaLastError.isEmpty()) return;
+    const size_t written = Update.write(upload.buf, upload.currentSize);
+    otaBytesWritten += written;
+    if (written != upload.currentSize) {
+      otaLastError = "write_failed";
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaLastError.isEmpty() && Update.end(true)) {
+      otaSucceeded = true;
+      otaFinishedMs = millis();
+      Serial.printf("[ota] update complete bytes=%u\n", static_cast<unsigned>(otaBytesWritten));
+    } else {
+      if (otaLastError.isEmpty()) otaLastError = "end_failed";
+      Update.printError(Serial);
+    }
+    otaInProgress = false;
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaInProgress = false;
+    otaSucceeded = false;
+    otaFinishedMs = millis();
+    otaLastError = "aborted";
+    Serial.println("[ota] update aborted");
+  }
+}
+
 void handleCameraRawGet() {
   const unsigned long httpStartedMs = millis();
   if (!wifiConnected) {
@@ -6536,6 +6638,8 @@ void startHttpServer() {
   server.on("/upload/events", HTTP_POST, handleUploadEvents);
   server.on("/upload/observations", HTTP_POST, handleUploadObservations);
   server.on("/upload/all", HTTP_POST, handleUploadAll);
+  server.on("/firmware/status", HTTP_GET, handleFirmwareStatus);
+  server.on("/firmware/update", HTTP_POST, handleFirmwareUpdateFinished, handleFirmwareUploadStream);
   server.on("/camera/info/1", HTTP_GET, handleCameraInfo1);
   server.on("/camera/info/2", HTTP_GET, handleCameraInfo2);
   server.on("/camera/info/3", HTTP_GET, handleCameraInfo3);
@@ -7107,6 +7211,11 @@ void setup() {
 
 void loop() {
   pollSerialConsole();
+  if (otaRestartPending && millis() >= otaRestartAtMs) {
+    Serial.println("[ota] restarting after successful firmware update");
+    delay(100);
+    ESP.restart();
+  }
 
   if (RUN_LOCAL_SERIAL_TEST) {
     halowConnected = (HaLow.status() == WL_CONNECTED);

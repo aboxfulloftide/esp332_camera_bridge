@@ -20,6 +20,10 @@ Expected HaLow HTTP address: `http://192.168.1.160:18080`
   - Without valid time/HaLow, uptime fallback still captures every 30 minutes.
 - Captures made before network time is available store boot uptime and are backfilled after time sync.
 - BLE upload payloads have been verified to include advertisement fields, including `manufacturer_data`, `adv_services`, `adv_service_data`, `tx_power`, `local_name`, and `signal_dbm`.
+- Next firmware build changes observation uploads to the wireless database host at `192.168.1.42:80`.
+- Next firmware build adds OTA update endpoints:
+  - `GET /firmware/status`
+  - `POST /firmware/update`
 
 ## Verified after flash over USB
 
@@ -65,6 +69,7 @@ curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/upload/st
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/onboard/status
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/sd/status
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/upload/ble/last
+curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/firmware/status
 ```
 
 Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP server is small and the HaLow link has shown jitter; sequential requests are reliable.
@@ -85,6 +90,38 @@ Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP
 - `/upload/status`: telemetry/event/observation upload state and retry queue state.
 - `/session/status`: camera session lease details.
 - `/sd/status`: SD mount/card/storage details.
+- `/firmware/status`: firmware version and OTA status.
+
+## OTA firmware update after next USB flash
+
+After a firmware containing OTA support has been flashed once over USB, future updates can be pushed over HaLow.
+
+Build an OTA binary:
+
+```bash
+arduino-cli compile \
+  --fqbn heltec:esp_halow:HT-HC33:PSRAM=opi \
+  --export-binaries \
+  /home/matheau/esp32_camera/gardepro_dual_radio_bridge
+```
+
+Upload it to the board:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 300 \
+  -F "firmware=@/home/matheau/esp32_camera/gardepro_dual_radio_bridge/build/heltec.esp_halow.HT-HC33/gardepro_dual_radio_bridge.ino.bin" \
+  http://192.168.1.160:18080/firmware/update
+```
+
+If `UPSTREAM_API_TOKEN` is configured, include the token:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 300 \
+  -F "firmware=@/path/to/gardepro_dual_radio_bridge.ino.bin" \
+  "http://192.168.1.160:18080/firmware/update?token=TOKEN"
+```
+
+The board returns JSON, waits briefly, then restarts into the new image.
 
 ## Useful USB serial commands
 
