@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GardePro</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+  <header class="app-header">
+    <span class="app-title">
+      GardePro
+      <span class="app-subtitle">trail camera control</span>
+    </span>
+    <div id="status-pill" class="status-pill disconnected">
+      <span class="status-dot"></span>offline
+    </div>
+    <button class="theme-btn" id="theme-btn">☀ Light</button>
+  </header>
+
+  <main class="main-content">
+
+    <!-- ── Connection ─────────────────────────────────────────── -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Connection</span>
+      </div>
+      <div class="panel-body">
+        <div class="btn-row">
+          <button class="btn btn-primary"   id="connect-btn">Connect</button>
+          <button class="btn btn-secondary" id="disconnect-btn">Disconnect</button>
+        </div>
+        <div id="connection-log" class="log-line">—</div>
+      </div>
+    </div>
+
+    <!-- ── Bridge / Camera Status ─────────────────────────────── -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Status</span>
+      </div>
+      <div class="panel-body">
+        <div class="status-grid" id="status-grid">
+          <span class="status-label">—</span><span></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Actions ────────────────────────────────────────────── -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Actions</span>
+      </div>
+      <div class="panel-body">
+        <div class="btn-row">
+          <button class="btn btn-primary" id="take-picture-btn">📷 Take Photo</button>
+        </div>
+        <div class="divider"></div>
+        <div class="btn-row">
+          <button class="btn btn-warning"   id="video-start-btn">⏺ Start Video</button>
+          <button class="btn btn-secondary" id="video-stop-btn">⏹ Stop Video</button>
+        </div>
+        <div id="actions-log" class="log-line">—</div>
+      </div>
+    </div>
+
+    <!-- ── Live View ──────────────────────────────────────────── -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Live View</span>
+      </div>
+      <div class="panel-body">
+        <div class="btn-row">
+          <button class="btn btn-primary"   id="live-start-btn">▶ Start Stream</button>
+          <button class="btn btn-secondary" id="live-stop-btn">■ Stop Stream</button>
+        </div>
+        <div id="live-placeholder" class="live-placeholder">Stream inactive</div>
+        <div id="live-log" class="log-line">—</div>
+      </div>
+    </div>
+
+    <!-- ── Settings ───────────────────────────────────────────── -->
+    <div class="panel panel-full">
+      <div class="panel-header">
+        <span class="panel-title">Settings</span>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm btn-secondary" id="load-settings-btn">Load from Camera</button>
+          <button class="btn btn-sm btn-primary"   id="save-settings-btn">Save Changes</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="settings-fields" class="settings-fields">
+          <p style="color:var(--hl-text-faint);font-size:12px;margin:0">
+            Click "Load from Camera" to read current settings.
+          </p>
+        </div>
+        <div id="settings-log" class="log-line">—</div>
+      </div>
+    </div>
+
+    <!-- ── Media Gallery ──────────────────────────────────────── -->
+    <div class="panel panel-full">
+      <div class="panel-header">
+        <span class="panel-title">Media Gallery</span>
+        <button class="btn btn-sm btn-secondary" id="refresh-media-btn">⟳ Refresh</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="gallery-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Type</th>
+              <th>Timestamp</th>
+              <th>Size</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="gallery-body">
+            <tr><td colspan="5" class="empty-state">Click Refresh to load media from camera</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="padding:0 16px 14px">
+        <div id="media-log" class="log-line">
+          Note: downloads open a camera session — may take several seconds for large videos.
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

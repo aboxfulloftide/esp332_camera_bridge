@@ -12,6 +12,12 @@ This repository contains the current GardePro ESP32 bridge work:
   - CLI wrapper for live control and validation
 - `gardepro_tunnel_server.py`
   - receiver for the framed tunnel stream
+- `gardepro_web_server.py`
+  - Flask browser/API server for the operator UI
+- `templates/`
+  - Flask HTML templates for the server UI
+- `static/`
+  - CSS and browser JS for the server UI
 - `BRIDGE_USAGE.md`
   - current operator notes and validation workflow
 - `gardepro_dual_radio_bridge/BOARD_HTTP_API.md`
@@ -41,3 +47,4 @@ Create these local files from the provided examples:
 - The trail-camera hotspot password remains in the repo because it is the vendor default for the device under test.
 - Large local reverse-engineering artifacts and machine-specific files are ignored by git.
 - The current server-side direction is short-lived on-demand sessions, not permanent camera connectivity.
+- The current Flask web server is intentionally small and serves the browser UI plus the API used by that UI; it does not talk to the camera directly from the browser.

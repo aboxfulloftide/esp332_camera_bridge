@@ -1,6 +1,6 @@
 # Server Deployment Handoff
 
-This document is for the machine that will actually host the future server and browser UI.
+This document is for the machine that hosts the Flask browser/API server and the ESP32 bridge runtime.
 
 It explains what that machine needs, what still runs on the bridge machine, and what assumptions the server code can safely make.
 
@@ -14,7 +14,7 @@ There are two logical sides:
 2. Server side
    Runs the web service and browser UI.
 
-If both happen to live on the same machine, that is fine.
+If both happen to live on the same machine, that is fine. The current repo includes a Flask server (`gardepro_web_server.py`) that can be run directly on the bridge host or a separate server host.
 
 If they are split across different machines, the server side must still be able to reach:
 
@@ -30,6 +30,7 @@ Validated runtime components:
 - local tunnel receiver in `gardepro_tunnel_server.py`
 - validated bridge client in `gardepro_server_api.py`
 - validated short-session helpers in `gardepro_server_jobs.py`
+- Flask browser/API server in `gardepro_web_server.py`
 
 Validated camera behaviors:
 
@@ -51,7 +52,7 @@ Simplest first deployment.
 Run on one box:
 
 - `gardepro_tunnel_server.py`
-- future web server
+- `gardepro_web_server.py`
 
 Advantages:
 
@@ -111,6 +112,8 @@ The tunnel receiver currently writes:
 - SDP:
   - `/tmp/gardepro_live.sdp`
 
+The Flask web server also uses temporary local files for browser-facing media downloads and live-view previews.
+
 If the server runs on a different machine, decide whether to:
 
 - keep those exact file paths available there
@@ -121,7 +124,7 @@ If the server runs on a different machine, decide whether to:
 For another machine, the cleanest first step is:
 
 1. copy this repo to the server machine
-2. run the future web server on that machine
+2. run the Flask web server on that machine
 3. configure the server to use explicit bridge host/IP rather than relying only on the local registration file
 4. keep the tunnel receiver on the bridge-side machine unless the live-view path is also being moved
 
@@ -129,7 +132,7 @@ That avoids requiring the full bridge runtime to move immediately.
 
 ## Environment Inputs To Make Configurable
 
-The future server should support configuration for:
+The web server should support configuration for:
 
 - `GARDEPRO_BRIDGE_HOST`
 - `GARDEPRO_BRIDGE_PORT`
@@ -170,6 +173,7 @@ If the server and browser are separate from the bridge machine, confirm firewall
 Minimum:
 
 - Python 3
+- Flask
 - this repo checked out
 - access to the bridge HTTP endpoint
 
@@ -188,7 +192,9 @@ Required:
 
 - `gardepro_server_api.py`
 - `gardepro_server_jobs.py`
-- future web server files
+- `gardepro_web_server.py`
+- `templates/`
+- `static/`
 - this repo documentation
 
 Helpful:
@@ -245,8 +251,8 @@ The server should consume these behaviors, not rediscover them.
 3. Run a basic status probe using `gardepro_server_api.py`.
 4. Verify `session-open` and `session-close`.
 5. Verify settings read.
-6. Verify media list.
-7. Only then begin browser UI work.
+6. Verify media list and download/thumb routes.
+7. Start `gardepro_web_server.py` and confirm the browser UI loads.
 
 ## Recommended Next Artifacts
 

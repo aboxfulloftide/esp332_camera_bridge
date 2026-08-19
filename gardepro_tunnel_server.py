@@ -52,6 +52,8 @@ class TunnelConfig:
     udp_host: str = "127.0.0.1"
     udp_port_primary: int = 5004
     udp_port_secondary: int = 5005
+    frame_width: int = 1600
+    frame_height: int = 1200
     sdp_path: str = "/tmp/gardepro_live.sdp"
     registration_path: str = "/tmp/gardepro_board_registration.json"
     write_payload_dir: str = ""
@@ -59,6 +61,7 @@ class TunnelConfig:
     packet_log_first: int = 20
     packet_log_every: int = 200
     stats_interval_sec: float = 5.0
+    client_idle_timeout_sec: float = 12.0
 
 
 @dataclass
@@ -93,7 +96,7 @@ class GPRTTunnelServer:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((self.config.bind_host, self.config.bind_port))
-        server.listen(1)
+        server.listen(5)
         server.settimeout(1.0)
         self._server_sock = server
 
@@ -146,8 +149,9 @@ class GPRTTunnelServer:
 
     def _handle_client(self, conn: socket.socket, peer: str) -> None:
         conn.settimeout(15.0)
+        idle_deadline = time.time() + self.config.client_idle_timeout_sec
         while not self._stop.is_set():
-            header = self._recv_exact(conn, HEADER_STRUCT.size)
+            header = self._recv_exact(conn, HEADER_STRUCT.size, idle_deadline)
             if header is None:
                 return
 
@@ -163,10 +167,11 @@ class GPRTTunnelServer:
                 )
                 return
 
-            payload = self._recv_exact(conn, payload_len)
+            payload = self._recv_exact(conn, payload_len, idle_deadline)
             if payload is None:
                 return
 
+            idle_deadline = time.time() + self.config.client_idle_timeout_sec
             self.stats.last_packet_at = time.time()
             if stream_id == STREAM_CONTROL:
                 self._handle_control_frame(flags, payload, peer)
@@ -254,6 +259,10 @@ class GPRTTunnelServer:
             if line.startswith("m=video "):
                 rewritten_lines.append(f"m=video {self.config.udp_port_primary} RTP/AVP 96")
                 continue
+            if line.startswith("a=fmtp:96 ") and self.config.frame_width > 0 and self.config.frame_height > 0:
+                rewritten_lines.append(line)
+                rewritten_lines.append(f"a=framesize:96 {self.config.frame_width}-{self.config.frame_height}")
+                continue
             rewritten_lines.append(line)
         rewritten = "\n".join(rewritten_lines) + "\n"
 
@@ -292,12 +301,14 @@ class GPRTTunnelServer:
         )
 
     @staticmethod
-    def _recv_exact(conn: socket.socket, size: int) -> Optional[bytes]:
+    def _recv_exact(conn: socket.socket, size: int, idle_deadline: float) -> Optional[bytes]:
         data = bytearray()
         while len(data) < size:
             try:
                 chunk = conn.recv(size - len(data))
             except socket.timeout:
+                if time.time() >= idle_deadline:
+                    return None
                 continue
             except OSError:
                 return None
@@ -314,6 +325,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-host", default="127.0.0.1")
     parser.add_argument("--udp-port-primary", type=int, default=5004)
     parser.add_argument("--udp-port-secondary", type=int, default=5005)
+    parser.add_argument("--frame-width", type=int, default=1600)
+    parser.add_argument("--frame-height", type=int, default=1200)
     parser.add_argument("--sdp-path", default="/tmp/gardepro_live.sdp")
     parser.add_argument("--registration-path", default="/tmp/gardepro_board_registration.json")
     parser.add_argument("--write-payload-dir", default="")
@@ -321,6 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--packet-log-first", type=int, default=20)
     parser.add_argument("--packet-log-every", type=int, default=200)
     parser.add_argument("--stats-interval-sec", type=float, default=5.0)
+    parser.add_argument("--client-idle-timeout-sec", type=float, default=12.0)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -339,6 +353,8 @@ def main() -> int:
             udp_host=args.udp_host,
             udp_port_primary=args.udp_port_primary,
             udp_port_secondary=args.udp_port_secondary,
+            frame_width=args.frame_width,
+            frame_height=args.frame_height,
             sdp_path=args.sdp_path,
             registration_path=args.registration_path,
             write_payload_dir=args.write_payload_dir,
@@ -346,6 +362,7 @@ def main() -> int:
             packet_log_first=args.packet_log_first,
             packet_log_every=args.packet_log_every,
             stats_interval_sec=args.stats_interval_sec,
+            client_idle_timeout_sec=args.client_idle_timeout_sec,
         )
     )
 

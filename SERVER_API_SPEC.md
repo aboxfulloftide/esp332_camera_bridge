@@ -1,8 +1,13 @@
 # Server API Spec
 
-This document turns the high-level server plan into an implementation-oriented API contract for the future web service.
+This document turns the high-level server plan into an implementation-oriented API contract for the Flask web service.
 
 It is written so the server work can be done on another machine without re-deriving the camera/bridge behavior from scratch.
+
+Current implementation status:
+
+- `gardepro_web_server.py` currently implements the core operator routes for status, sessions, settings, media listing, media download/thumb, take-picture, video start/stop, live start/stop/status, and clock readback
+- the destructive admin routes and some of the richer normalization helpers remain in the spec/planning layer
 
 ## Scope
 
@@ -384,6 +389,11 @@ Return photo or video content.
 
 Because the camera uses different file extensions by type, the server must resolve media ID to media type before download.
 
+Current Flask behavior:
+
+- clients pass `type=photo|video`
+- the server uses that type to choose the correct extension before streaming the file through a temporary local path
+
 ### Behavior
 
 - server may stream directly to client
@@ -403,6 +413,11 @@ Return thumbnail content.
 ### Backing call
 
 - `GardeProServerAPI.download_media_result(..., thumbnail=True)`
+
+Current Flask behavior:
+
+- clients pass `type=photo|video`
+- the server writes the thumbnail to a temporary local file and then streams it back as `image/jpeg`
 
 ## `DELETE /api/media/:id`
 
@@ -492,6 +507,11 @@ Start the live stream path.
 - `GardeProServerAPI.stream_start(...)`
 - plus server-side local stream metadata management
 
+Current Flask behavior:
+
+- returns `stream_active` and `tunnel_connected`
+- the browser UI uses the current tunnel receiver's local SDP/player path for preview
+
 ### Response
 
 ```json
@@ -535,6 +555,10 @@ Return stream state for the page.
 - bridge `/status`
 - optional server-owned viewer/session bookkeeping
 
+Current Flask behavior:
+
+- returns `stream_active`, `tunnel_connected`, and `session_open`
+
 ## `GET /api/admin/clock`
 
 ### Purpose
@@ -557,6 +581,10 @@ Return direct camera clock readback.
   "error": null
 }
 ```
+
+### Current Flask behavior
+
+- implemented and returns `{"clock": <raw readback>}`
 
 ## `POST /api/admin/set-clock`
 
@@ -583,6 +611,7 @@ Set the camera clock explicitly.
 ### Notes
 
 - do not send local Eastern time to this route unless the server converts it to UTC first
+- this route remains in the spec but is not yet wired in the current Flask server
 
 ## `GET /api/admin/format-status`
 
@@ -593,6 +622,7 @@ Return raw format status/result.
 ### Backing call
 
 - `GardeProServerAPI.format_sd_result()`
+- this route remains in the spec but is not yet wired in the current Flask server
 
 ## `POST /api/admin/format-sd`
 
@@ -613,6 +643,7 @@ Format the SD card.
 ### Notes
 
 - live validation confirmed the real post-condition by checking that the gallery became empty afterward
+- this route remains in the spec but is not yet wired in the current Flask server
 
 ## Route-to-Code Mapping
 
