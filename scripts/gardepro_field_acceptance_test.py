@@ -173,19 +173,23 @@ class FieldTester:
     def phase_trail_camera(self) -> None:
         for path in ["/camera/info/1", "/camera/info/2", "/camera/getParaSetting", "/camera/standby/reset"]:
             self.json_request("trail_camera", path, "GET", path, timeout=45)
-        self.json_request("trail_camera", "gallery", "GET", "/camera/gallery", timeout=60)
+        gallery_before = self.json_request("trail_camera", "gallery", "GET", "/camera/gallery", timeout=60)
         latest = self.json_request("trail_camera", "latest_metadata", "GET", "/camera/latest", timeout=60)
         latest_id = None
+        latest_type = None
         if latest:
             data = latest.get("data")
             if isinstance(data, dict):
                 latest_id = data.get("id")
+                latest_type = data.get("type")
         if latest_id:
+            ext = "mp4" if latest_type == 2 else "JPG"
+            suffix = "mp4" if latest_type == 2 else "jpg"
             self.download(
                 "trail_camera",
                 "latest_file_download",
-                f"/camera/raw?path=/file/{latest_id}/JPG",
-                self.out_dir / f"trail_latest_{latest_id}.jpg",
+                f"/camera/raw?path=/file/{latest_id}/{ext}",
+                self.out_dir / f"trail_latest_{latest_id}.{suffix}",
                 timeout=180,
             )
 
@@ -200,7 +204,20 @@ class FieldTester:
                 if created_id:
                     break
             time.sleep(2)
-        self.json_request("trail_camera", "gallery_after_picture", "GET", "/camera/gallery", timeout=60)
+        gallery_after = self.json_request("trail_camera", "gallery_after_picture", "GET", "/camera/gallery", timeout=60)
+        if not created_id and gallery_before and gallery_after:
+            before_ids = {
+                item.get("id")
+                for item in (gallery_before.get("data") or [])
+                if isinstance(item, dict)
+            }
+            new_photos = [
+                item for item in (gallery_after.get("data") or [])
+                if isinstance(item, dict) and item.get("type") == 1 and item.get("id") not in before_ids
+            ]
+            if new_photos:
+                created_id = new_photos[0].get("id")
+                self.record("trail_camera", "created_picture_inferred", True, summary=f"id={created_id}")
         if created_id:
             self.download(
                 "trail_camera",
