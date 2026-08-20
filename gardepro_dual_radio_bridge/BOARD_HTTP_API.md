@@ -185,7 +185,7 @@ SD card mount/storage details: ready state, mount counters, pins, card type/size
 
 ### `GET /scanner/config`
 
-Scheduled Wi-Fi/BLE scan configuration. Scheduled scanning defaults to disabled. Manual upload remains available.
+Scheduled Wi-Fi/BLE scan configuration. In camera-priority firmware this feature is disabled so it cannot compete with trail-camera BLE, trail-camera Wi-Fi, onboard capture, or board HTTP responsiveness.
 
 ### `GET /firmware/status`
 
@@ -202,6 +202,13 @@ Poll `/control/status`, `/wifi/status`, `/ble/status`, and `/timing/status` for 
 ### `POST /control/stream_start`
 
 Queues live-view start. This can queue behind active bringup.
+
+Live view is split into two independent states:
+
+- camera-side RTSP/RTP session on the ESP32
+- optional HaLow tunnel forwarding to the upstream receiver
+
+If the trail-camera RTSP session starts but HaLow or the tunnel is unavailable, the job still succeeds as a local camera stream. `/stream/status` then reports camera packet counters while `tunnel_connected` remains `false`.
 
 ### `POST /control/stream_stop`
 
@@ -267,6 +274,31 @@ Trail-camera still capture uses:
 
 Some camera firmware returns `fileIdx:0` even when the capture succeeded. In that case, compare gallery before/after and use the newest new type-`1` item.
 
+## Camera jobs
+
+### `GET /jobs`
+
+Returns the current in-memory camera worker queue/control state and supported actions.
+
+Current supported actions:
+
+- `bringup`
+- `live_view_start`
+- `live_view_stop`
+- `trigger_photo`
+
+### `POST /jobs`
+
+Queues camera work and returns immediately. This is the first set-and-forget API layer. The current implementation queues into the in-memory control worker; SD-backed durable persistence is the next planned increment.
+
+Examples:
+
+```bash
+curl -sS -X POST "http://192.168.1.160:18080/jobs?action=trigger_photo"
+curl -sS -X POST "http://192.168.1.160:18080/jobs?action=live_view_start"
+curl -sS -X POST "http://192.168.1.160:18080/jobs?action=live_view_stop"
+```
+
 ## Onboard media endpoints
 
 See [ONBOARD_MEDIA_API.md](ONBOARD_MEDIA_API.md).
@@ -289,23 +321,23 @@ Routes:
 
 ### `GET /scan/wifi`
 
-Manual Wi-Fi scan. This only runs when the trail-camera Wi-Fi session is idle.
+Disabled in camera-priority firmware. Returns `410` with `scanner_disabled`.
 
 ### `POST /scanner/config?enabled=true|false`
 
-Updates the scheduled Wi-Fi/BLE scan enable flag.
+Disabled in camera-priority firmware. Returns scanner config with `feature_enabled:false`.
 
 ### `POST /scanner/enable`
 
-Enables scheduled Wi-Fi/BLE scans.
+Disabled in camera-priority firmware.
 
 ### `POST /scanner/disable`
 
-Disables scheduled Wi-Fi/BLE scans.
+Keeps scheduled Wi-Fi/BLE scans disabled.
 
 ### `POST /upload/observations`
 
-Manually runs Wi-Fi/BLE observation upload logic. Failed uploads are persisted to the SD retry queue when SD is mounted and replayed later.
+Disabled in camera-priority firmware. RF observation scanning/upload has been removed from the active firmware path to protect trail-camera and onboard-camera reliability.
 
 Observation upload target:
 

@@ -21,7 +21,9 @@ Expected HaLow HTTP address: `http://192.168.1.160:18080`
 - Captures made before network time is available store boot uptime and are backfilled after time sync.
 - BLE upload payloads have been verified to include advertisement fields, including `manufacturer_data`, `adv_services`, `adv_service_data`, `tx_power`, `local_name`, and `signal_dbm`.
 - Current source changes observation uploads to the wireless database host at `192.168.1.42:80`.
-- Current source disables scheduled Wi-Fi/BLE scanning by default. Manual scans/uploads remain available.
+- Camera-priority firmware disables Wi-Fi/BLE scanning and RF observation upload execution entirely. Scanner routes remain only as disabled compatibility/status responses.
+- Camera jobs can now be queued with `POST /jobs?action=bringup|live_view_start|live_view_stop|trigger_photo`.
+- Live view no longer fails only because HaLow tunnel connect fails. If RTSP starts, the ESP32 keeps the camera-side stream local and retries/uses the tunnel when available.
 - Current source adds scanner schedule control endpoints:
   - `GET /scanner/config`
   - `POST /scanner/config?enabled=true|false`
@@ -93,11 +95,11 @@ Current hardening disables automatic trail-camera HTTP keepalive and automatic c
 - `/status`: compact summary for field checks.
 - `/system/status`: uptime, hostname, boot counters, PSRAM, chip temperature.
 - `/halow/status`: HaLow connected/status/SSID/BSSID/MAC/IP/gateway/RSSI/event counters.
-- `/wifi/status`: trail-camera Wi-Fi state plus Wi-Fi scanner counters.
+- `/wifi/status`: trail-camera Wi-Fi state plus retained disabled Wi-Fi scanner counters.
 - `/camera/status`: camera IP, camera Wi-Fi ever-connected flag, standby flag, session lease summary.
 - `/timing/status`: bringup/BLE wake/hotspot wait/Wi-Fi join/camera HTTP timing.
 - `/stream/status`: RTSP stream status, tunnel state, recovery counters, UDP/media packet counters.
-- `/ble/status`: BLE wake/discovery/GATT state, recent devices, notify info, BLE scanner/upload metadata counters.
+- `/ble/status`: BLE wake/discovery/GATT state, recent devices, notify info, and retained disabled BLE scanner counters.
 - `/control/status`: queued/active/last control action state.
 - `/battery/status`: battery ADC and charge/done GPIO state.
 - `/onboard/status`: onboard camera, schedule, storage, latest media, and timelapse state.
@@ -105,31 +107,17 @@ Current hardening disables automatic trail-camera HTTP keepalive and automatic c
 - `/session/status`: camera session lease details.
 - `/sd/status`: SD mount/card/storage details.
 - `/firmware/status`: firmware version and OTA status.
-- `/scanner/config`: scheduled Wi-Fi/BLE scanner enable state and observation upload target.
+- `/scanner/config`: disabled scanner compatibility/status response.
 
-## Scanner schedule control
+## Scanner routes
 
-Scheduled Wi-Fi/BLE scanning defaults to disabled. This reduces ESP32 load and avoids unnecessary 2.4 GHz/BLE activity.
+Wi-Fi/BLE RF scanning and observation upload execution are disabled in camera-priority firmware. This reduces ESP32 load and avoids unnecessary 2.4 GHz/BLE activity that can interfere with trail-camera and onboard-camera reliability.
 
-Manual scan/upload remains available:
-
-```bash
-curl -sS --connect-timeout 10 --max-time 120 \
-  -X POST http://192.168.1.160:18080/upload/observations
-```
-
-Enable scheduled scanning:
+Do not use scanner routes as field tests. They are retained only as compatibility/status responses:
 
 ```bash
 curl -sS --connect-timeout 10 --max-time 30 \
-  -X POST http://192.168.1.160:18080/scanner/enable
-```
-
-Disable scheduled scanning:
-
-```bash
-curl -sS --connect-timeout 10 --max-time 30 \
-  -X POST http://192.168.1.160:18080/scanner/disable
+  http://192.168.1.160:18080/scanner/config
 ```
 
 ## OTA firmware update

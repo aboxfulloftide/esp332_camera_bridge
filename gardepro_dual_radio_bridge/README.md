@@ -83,6 +83,8 @@ server with the current:
 - `POST /scanner/config`
 - `POST /scanner/enable`
 - `POST /scanner/disable`
+- `GET /jobs`
+- `POST /jobs`
 - `/upload/status`
 - `/upload/telemetry`
 - `/upload/observations`
@@ -152,17 +154,14 @@ Unified board features:
   - when the duration expires, the firmware automatically returns to normal onboard camera mode
 - battery telemetry reads the HT-HC32/33 battery divider (`GPIO1` / `ADC_IN`, controlled by `GPIO20` / `ADC_Ctrl`)
 - idle WiFi scanning is available at `/scan/wifi`
-- scheduled WiFi and BLE scans are disabled by default
-  - enable scheduled scanning with `POST /scanner/enable` or `POST /scanner/config?enabled=true`
-  - disable scheduled scanning with `POST /scanner/disable` or `POST /scanner/config?enabled=false`
-  - check the setting with `GET /scanner/config`
-  - manual scans/uploads still work with `POST /upload/observations`
-  - when enabled, the first scheduled scan runs 15 seconds after boot
-  - scans run every 2 minutes during the `07:00`-`21:00` daytime window
-  - scans run every 15 minutes at night
-  - when the clock is not set, the 2-minute interval is used
-  - camera WiFi, streaming, and control work pause both scanners; blocked or failed cycles retry after 30 seconds
-  - failed uploads are saved to the SD retry queue when SD is mounted and replayed later
+- WiFi/BLE RF scanning is disabled in camera-priority firmware so it cannot compete with trail-camera BLE, trail-camera Wi-Fi, onboard captures, or board HTTP responsiveness
+  - scanner routes return disabled compatibility/status responses
+  - RF observation upload execution is disabled
+  - previous scanner code remains in the source for reference but is not started at boot
+- camera jobs are available through `POST /jobs?action=...`
+  - supported actions: `bringup`, `live_view_start`, `live_view_stop`, `trigger_photo`
+  - jobs currently queue into the in-memory camera control worker; SD-backed durable persistence is planned next
+- live view now keeps the ESP32 camera-side RTSP/RTP session active even if HaLow/tunnel forwarding is unavailable
 - upstream API upload plumbing is available over HaLow:
   - `GET /upload/status`
   - `POST /upload/telemetry` -> `/api/board/telemetry`

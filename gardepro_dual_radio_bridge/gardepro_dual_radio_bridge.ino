@@ -556,6 +556,7 @@ enum ControlAction : uint8_t {
   CONTROL_ACTION_BRINGUP = 1,
   CONTROL_ACTION_STREAM_START = 2,
   CONTROL_ACTION_STREAM_STOP = 3,
+  CONTROL_ACTION_TRIGGER_PHOTO = 4,
 };
 
 struct ControlState {
@@ -2819,7 +2820,10 @@ String buildUploadStatusJson() {
 
 String buildScannerConfigJson() {
   String payload = "{";
-  payload += "\"scheduled_scans_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
+  payload += "\"feature_enabled\":false";
+  payload += ",\"error\":\"scanner_disabled\"";
+  payload += ",\"detail\":\"WiFi/BLE scanning is disabled in camera-priority firmware\"";
+  payload += ",\"scheduled_scans_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
   payload += ",\"default_enabled\":" + String((SCANNER_SCHEDULE_ENABLED != 0) ? "true" : "false");
   payload += ",\"manual_upload_endpoint\":\"/upload/observations\"";
   payload += ",\"config_endpoint\":\"/scanner/config\"";
@@ -2852,6 +2856,8 @@ const char *controlActionName(ControlAction action) {
       return "stream_start";
     case CONTROL_ACTION_STREAM_STOP:
       return "stream_stop";
+    case CONTROL_ACTION_TRIGGER_PHOTO:
+      return "trigger_photo";
     case CONTROL_ACTION_NONE:
     default:
       return "none";
@@ -4519,6 +4525,11 @@ void wifiScannerTask(void *pvParameters) {
 }
 
 void startWifiScannerTask() {
+  scannerScheduleEnabled = false;
+  wifiScannerLastError = "disabled_camera_priority";
+  bleScannerLastError = "disabled_camera_priority";
+  Serial.println("[scanner] RF scanner task disabled in camera-priority firmware");
+  return;
   if (wifiScannerTaskHandle == nullptr) {
     xTaskCreatePinnedToCore(wifiScannerTask,
                             "rf-scanner",
@@ -5059,18 +5070,6 @@ bool startStreamSession() {
     lastStreamStartElapsedMs = millis() - startedMs;
     return true;
   }
-  if (!halowConnected) {
-    lastStreamStartStage = "halow_connect";
-    Serial.println("[stream] HaLow is down, connecting now");
-    connectHaLow();
-  }
-  if (!halowConnected) {
-    Serial.println("[stream] HaLow connect failed");
-    lastStreamStartStage = "halow_down";
-    lastStreamStartMessage = "stream_halow_down";
-    lastStreamStartElapsedMs = millis() - startedMs;
-    return false;
-  }
   if (!wifiConnected) {
     Serial.println("[stream] camera WiFi is down");
     lastStreamStartStage = "camera_wifi_down";
@@ -5090,23 +5089,69 @@ bool startStreamSession() {
   }
 
   lastStreamStartStage = "tunnel_connect";
-  if (!connectTunnelSocket()) {
-    Serial.println("[stream] tunnel connect failed");
-    lastStreamStartStage = "tunnel_connect_failed";
-    lastStreamStartMessage = "stream_tunnel_connect_failed";
-    lastStreamStartElapsedMs = millis() - startedMs;
-    closeRtspSession();
-    return false;
+  bool tunnelOk = false;
+  if (!halowConnected) {
+    Serial.println("[stream] HaLow is down; keeping camera RTSP local and retrying tunnel later");
+    lastStreamStartStage = "camera_stream_local";
+    lastStreamStartMessage = "camera_stream_active_tunnel_halow_down";
+  } else {
+    tunnelOk = connectTunnelSocket();
+    if (!tunnelOk) {
+      Serial.println("[stream] tunnel connect failed; keeping camera RTSP local");
+      lastStreamStartStage = "camera_stream_local";
+      lastStreamStartMessage = "camera_stream_active_tunnel_connect_failed";
+    }
   }
 
   startHttpServer();
   streamSessionActive = true;
   streamSessionStartedMs = millis();
-  lastStreamStartStage = "stream_active";
-  lastStreamStartMessage = "stream_active";
+  if (tunnelOk) {
+    lastStreamStartStage = "stream_active";
+    lastStreamStartMessage = "stream_active";
+  }
   lastStreamStartElapsedMs = millis() - startedMs;
-  Serial.printf("[stream] session active started_ms=%lu\n", streamSessionStartedMs);
+  Serial.printf("[stream] camera session active started_ms=%lu tunnel=%s\n",
+                streamSessionStartedMs,
+                tunnelOk ? "connected" : "local_only");
   return true;
+}
+
+bool runTriggerPhotoJob() {
+  if (!wifiConnected) {
+    Serial.println("[job] trigger_photo requires camera bringup");
+    if (!runBringupSequence()) {
+      lastStreamStartMessage = "trigger_photo_bringup_failed";
+      return false;
+    }
+  }
+
+  String body;
+  int statusCode = 0;
+  if (!proxyCameraRequest("GET", "/media/pic/take", body, statusCode) ||
+      statusCode < 200 || statusCode >= 300) {
+    Serial.printf("[job] trigger_photo take failed status=%d body=%s\n", statusCode, body.c_str());
+    lastStreamStartMessage = "trigger_photo_take_failed";
+    return false;
+  }
+
+  for (int attempt = 1; attempt <= 12; ++attempt) {
+    String resultBody;
+    int resultStatus = 0;
+    if (proxyCameraRequest("GET", "/media/pic/result", resultBody, resultStatus) &&
+        resultStatus >= 200 && resultStatus < 300) {
+      Serial.printf("[job] trigger_photo result attempt=%d status=%d body=%s\n",
+                    attempt,
+                    resultStatus,
+                    resultBody.c_str());
+      lastStreamStartMessage = "trigger_photo_complete";
+      return true;
+    }
+    cooperativeDelay(2000);
+  }
+
+  lastStreamStartMessage = "trigger_photo_result_timeout";
+  return false;
 }
 
 void runCameraHttpSelfTest() {
@@ -6013,6 +6058,8 @@ void handleOnboardCameraConfig() {
 }
 
 void handleWifiScan() {
+  server.send(410, "application/json", "{\"error\":\"scanner_disabled\",\"detail\":\"WiFi/BLE scanning is disabled in camera-priority firmware\"}");
+  return;
   const bool force = server.hasArg("force") && server.arg("force") == "1";
   if (!force && wifiScanLastMs != 0 && millis() - wifiScanLastMs < WIFI_SCAN_CACHE_MS) {
     String cached = wifiScanLastJson;
@@ -6076,6 +6123,8 @@ void handleUploadEvents() {
 }
 
 void handleUploadObservations() {
+  server.send(410, "application/json", "{\"error\":\"scanner_disabled\",\"detail\":\"WiFi/BLE observation upload is disabled in camera-priority firmware\"}");
+  return;
   if (observationUploadMutex != nullptr && xSemaphoreTake(observationUploadMutex, pdMS_TO_TICKS(60000)) != pdTRUE) {
     server.send(409, "application/json", "{\"error\":\"observation_upload_busy\"}");
     return;
@@ -6124,6 +6173,10 @@ void handleScannerConfigGet() {
 }
 
 void handleScannerConfigPost() {
+  scannerScheduleEnabled = false;
+  saveScannerConfig();
+  server.send(410, "application/json", buildScannerConfigJson());
+  return;
   if (server.hasArg("enabled")) {
     scannerScheduleEnabled = boolLikeValue(server.arg("enabled"));
   } else if (server.hasArg("scheduled_scans_enabled")) {
@@ -6149,10 +6202,10 @@ void handleScannerConfigPost() {
 }
 
 void handleScannerEnable() {
-  scannerScheduleEnabled = true;
+  scannerScheduleEnabled = false;
   saveScannerConfig();
-  enqueueUploadEvent("scanner_config", "scheduled_scans_enabled", "{}", true);
-  server.send(200, "application/json", buildScannerConfigJson());
+  enqueueUploadEvent("scanner_config", "scanner_disabled_camera_priority", "{}", true);
+  server.send(410, "application/json", buildScannerConfigJson());
 }
 
 void handleScannerDisable() {
@@ -6500,6 +6553,65 @@ void handleControlStreamStop() {
   server.send(accepted ? 202 : 409, "application/json", payload);
 }
 
+ControlAction parseJobAction(const String &rawAction) {
+  String action = rawAction;
+  action.trim();
+  action.toLowerCase();
+  if (action == "bringup" || action == "open_session") return CONTROL_ACTION_BRINGUP;
+  if (action == "live_view_start" || action == "stream_start") return CONTROL_ACTION_STREAM_START;
+  if (action == "live_view_stop" || action == "stream_stop" || action == "close_session") return CONTROL_ACTION_STREAM_STOP;
+  if (action == "trigger_photo" || action == "take_picture" || action == "capture_photo") return CONTROL_ACTION_TRIGGER_PHOTO;
+  return CONTROL_ACTION_NONE;
+}
+
+void handleJobsGet() {
+  String payload = "{";
+  payload += "\"ok\":true";
+  payload += ",\"durable\":false";
+  payload += ",\"note\":\"jobs currently queue into the in-memory camera control worker; SD-backed persistence is planned\"";
+  payload += ",\"supported_actions\":[\"bringup\",\"live_view_start\",\"live_view_stop\",\"trigger_photo\"]";
+  payload += ",\"control\":";
+  payload += buildControlStatusJson();
+  payload += "}";
+  server.send(200, "application/json", payload);
+}
+
+void handleJobsPost() {
+  String actionArg = server.hasArg("action") ? server.arg("action") : "";
+  if (actionArg.isEmpty() && server.hasArg("plain")) {
+    String body = server.arg("plain");
+    body.toLowerCase();
+    if (body.indexOf("live_view_start") >= 0 || body.indexOf("stream_start") >= 0) {
+      actionArg = "live_view_start";
+    } else if (body.indexOf("live_view_stop") >= 0 || body.indexOf("stream_stop") >= 0) {
+      actionArg = "live_view_stop";
+    } else if (body.indexOf("trigger_photo") >= 0 || body.indexOf("take_picture") >= 0) {
+      actionArg = "trigger_photo";
+    } else if (body.indexOf("bringup") >= 0 || body.indexOf("open_session") >= 0) {
+      actionArg = "bringup";
+    }
+  }
+
+  const ControlAction action = parseJobAction(actionArg);
+  if (action == CONTROL_ACTION_NONE) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_request\",\"detail\":\"expected action=bringup|live_view_start|live_view_stop|trigger_photo\"}");
+    return;
+  }
+
+  String message;
+  const bool accepted = queueControlAction(action, message);
+  String payload = "{";
+  payload += "\"ok\":" + String(accepted ? "true" : "false");
+  payload += ",\"accepted\":" + String(accepted ? "true" : "false");
+  payload += ",\"durable\":false";
+  payload += ",\"action\":\"" + String(controlActionName(action)) + "\"";
+  payload += ",\"message\":\"" + jsonEscape(message) + "\"";
+  payload += ",\"control\":";
+  payload += buildControlStatusJson();
+  payload += "}";
+  server.send(accepted ? 202 : 409, "application/json", payload);
+}
+
 void handleSessionLease() {
   unsigned long ttlMs = CAMERA_SESSION_DEFAULT_LEASE_MS;
   if (server.hasArg("ttl_ms")) {
@@ -6749,6 +6861,12 @@ void controlWorkerTask(void *pvParameters) {
       stopTunnelSession("http_control_stop");
       ok = true;
       message = "stream_stopped";
+    } else if (action == CONTROL_ACTION_TRIGGER_PHOTO) {
+      ok = runTriggerPhotoJob();
+      message = ok ? "trigger_photo_complete" : lastStreamStartMessage.c_str();
+      if (!ok && (message == nullptr || message[0] == '\0')) {
+        message = "trigger_photo_failed";
+      }
     }
 
     finishControlAction(action, ok, message);
@@ -6776,6 +6894,8 @@ void startHttpServer() {
   server.on("/control/bringup", HTTP_POST, handleControlBringup);
   server.on("/control/stream_start", HTTP_POST, handleControlStreamStart);
   server.on("/control/stream_stop", HTTP_POST, handleControlStreamStop);
+  server.on("/jobs", HTTP_GET, handleJobsGet);
+  server.on("/jobs", HTTP_POST, handleJobsPost);
   server.on("/session/lease", HTTP_POST, handleSessionLease);
   server.on("/session/release", HTTP_POST, handleSessionRelease);
   server.on("/session/status", HTTP_GET, handleSessionStatus);
