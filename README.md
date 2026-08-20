@@ -20,6 +20,10 @@ This repository contains the current GardePro ESP32 bridge work:
   - CSS and browser JS for the server UI
 - `BRIDGE_USAGE.md`
   - current operator notes and validation workflow
+- `LAPTOP_FIELD_SETUP.md`
+  - setup guide for a Windows/WSL laptop that can debug, build, and flash the HT-HC33 board
+- `CURRENT_WORK_HANDOFF.md`
+  - current problem statement, flashed firmware state, findings, and next work
 - `gardepro_dual_radio_bridge/BOARD_HTTP_API.md`
   - current board HTTP API reference for status, onboard media, scanner/upload, OTA, and trail-camera proxy routes
 - `CAMERA_RETURN_CHECKLIST.md`
