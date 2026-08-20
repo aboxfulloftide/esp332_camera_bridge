@@ -58,6 +58,7 @@ server with the current:
 
 - `/status`
 - `GET /healthz`
+- `POST /system/http_restart`
 - `GET /system/status`
 - `GET /halow/status`
 - `GET /wifi/status`

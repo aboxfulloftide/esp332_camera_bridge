@@ -57,6 +57,10 @@ Representative fields:
 - `last_service_age_ms`
 - `last_gap_ms`
 - `max_gap_ms`
+- `server_restart_count`
+- `server_last_restart_age_ms`
+- `server_last_restart_reason`
+- `server_idle_restart_ms`
 - `camera_http_keepalive_enabled`
 - `camera_auto_recovery_enabled`
 
@@ -65,6 +69,12 @@ Current firmware defaults both automatic camera HTTP keepalive and automatic cam
 ### `GET /system/status`
 
 System runtime: uptime, hostname, boot counters, PSRAM, and chip temperature.
+
+### `POST /system/http_restart`
+
+Restarts the board HTTP listener without rebooting the ESP32. This is a defensive recovery endpoint for the observed failure mode where serial and HaLow remain alive but the synchronous WebServer/TCP listener stops serving new HTTP clients.
+
+The firmware also periodically re-begins the HTTP listener while idle. It skips the periodic restart during OTA, pending restart, active control actions, and active stream sessions.
 
 ### `GET /halow/status`
 

@@ -90,6 +90,8 @@ Recent trail-camera field tests show camera operations can pass while a few ESP3
 
 Current hardening disables automatic trail-camera HTTP keepalive and automatic camera recovery by default. This keeps an unreliable trail-camera connection from running BLE/Wi-Fi recovery work inside the main HTTP service loop. Use explicit control endpoints for camera work and use `/healthz` plus `http_service.max_gap_ms` to confirm whether the board application loop is staying responsive.
 
+USB diagnostic finding on 2026-08-20: after the field HTTP failure, the ESP32 serial console and HaLow association were still alive, but the board WebServer/TCP listener stopped serving new HTTP clients. Firmware now exposes `POST /system/http_restart`, serial command `http_restart`, and idle periodic HTTP listener restart telemetry under `http_service`.
+
 ## Old `/status` field coverage
 
 - `/status`: compact summary for field checks.

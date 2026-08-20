@@ -243,6 +243,9 @@ static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
 #ifndef CAMERA_AUTO_RECOVERY_ENABLED
 #define CAMERA_AUTO_RECOVERY_ENABLED 0
 #endif
+#ifndef HTTP_SERVER_IDLE_RESTART_MS
+#define HTTP_SERVER_IDLE_RESTART_MS 120000UL
+#endif
 static const BaseType_t CONTROL_WORKER_CORE = 0;
 static const uint8_t BLE_SCAN_ATTEMPTS = 3;
 static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
@@ -297,7 +300,10 @@ unsigned long lastCameraHttpElapsedMs = 0;
 unsigned long lastHttpServiceMs = 0;
 unsigned long httpServiceGapMaxMs = 0;
 unsigned long httpServiceLastGapMs = 0;
+unsigned long lastHttpServerRestartMs = 0;
 uint32_t httpServiceCount = 0;
+uint32_t httpServerRestartCount = 0;
+String httpServerLastRestartReason = "boot";
 SemaphoreHandle_t tunnelWriteMutex = nullptr;
 TaskHandle_t controlWorkerTaskHandle = nullptr;
 TaskHandle_t wifiScannerTaskHandle = nullptr;
@@ -762,12 +768,42 @@ void serviceBoardHttp() {
   ++httpServiceCount;
 }
 
+void restartHttpServer(const char *reason) {
+  Serial.printf("[http] restarting server reason=%s count=%u\n",
+                reason == nullptr ? "" : reason,
+                static_cast<unsigned>(httpServerRestartCount + 1));
+  server.close();
+  cooperativeDelay(25);
+  server.begin();
+  lastHttpServerRestartMs = millis();
+  ++httpServerRestartCount;
+  httpServerLastRestartReason = reason == nullptr ? "" : String(reason);
+}
+
+void maybeRestartHttpServerIdle() {
+  if (!httpServerStarted) return;
+  if (HTTP_SERVER_IDLE_RESTART_MS == 0) return;
+  if (otaInProgress || otaRestartPending) return;
+  if (isControlActionActive() || streamSessionActive) return;
+  if (lastHttpServerRestartMs == 0) {
+    lastHttpServerRestartMs = millis();
+    return;
+  }
+  if (millis() - lastHttpServerRestartMs >= HTTP_SERVER_IDLE_RESTART_MS) {
+    restartHttpServer("idle_periodic");
+  }
+}
+
 String buildHttpServiceJson() {
   String payload = "{";
   payload += "\"service_count\":" + String(httpServiceCount);
   payload += ",\"last_service_age_ms\":" + String(msSince(lastHttpServiceMs));
   payload += ",\"last_gap_ms\":" + String(httpServiceLastGapMs);
   payload += ",\"max_gap_ms\":" + String(httpServiceGapMaxMs);
+  payload += ",\"server_restart_count\":" + String(httpServerRestartCount);
+  payload += ",\"server_last_restart_age_ms\":" + String(msSince(lastHttpServerRestartMs));
+  payload += ",\"server_last_restart_reason\":\"" + jsonEscape(httpServerLastRestartReason) + "\"";
+  payload += ",\"server_idle_restart_ms\":" + String(HTTP_SERVER_IDLE_RESTART_MS);
   payload += ",\"camera_http_keepalive_enabled\":" + String((CAMERA_HTTP_KEEPALIVE_ENABLED != 0) ? "true" : "false");
   payload += ",\"camera_auto_recovery_enabled\":" + String((CAMERA_AUTO_RECOVERY_ENABLED != 0) ? "true" : "false");
   payload += "}";
@@ -3784,6 +3820,7 @@ void printSerialHelp() {
   Serial.println("  halow_up");
   Serial.println("  halow_status");
   Serial.println("  status");
+  Serial.println("  http_restart");
   Serial.println("  selftest");
   Serial.println("  http <path>");
   Serial.println("  httpm <METHOD> <path>");
@@ -5620,6 +5657,11 @@ void handleHealthz() {
   server.send(200, "application/json", payload);
 }
 
+void handleHttpRestart() {
+  server.send(202, "application/json", "{\"ok\":true,\"action\":\"http_restart\"}");
+  restartHttpServer("api_request");
+}
+
 void handleSystemStatus() {
   server.send(200, "application/json", buildSystemStatusJson());
 }
@@ -6879,6 +6921,7 @@ void startHttpServer() {
     return;
   }
   server.on("/healthz", HTTP_GET, handleHealthz);
+  server.on("/system/http_restart", HTTP_POST, handleHttpRestart);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/system/status", HTTP_GET, handleSystemStatus);
   server.on("/halow/status", HTTP_GET, handleHaLowStatusHttp);
@@ -7114,6 +7157,11 @@ void handleSerialCommand(const String &line) {
   }
   if (cmd == "halow_status") {
     Serial.println(buildHaLowStatusJson());
+    return;
+  }
+  if (cmd == "http_restart") {
+    restartHttpServer("serial_command");
+    Serial.println(buildHttpServiceJson());
     return;
   }
   if (cmd == "status") {
@@ -7526,6 +7574,7 @@ void loop() {
       startHttpServer();
     }
     serviceBoardHttp();
+    maybeRestartHttpServerIdle();
     if (halowConnected && !onboardClockValid() &&
         (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
       lastClockSyncAttemptMs = millis();
@@ -7588,6 +7637,7 @@ void loop() {
   }
 
   serviceBoardHttp();
+  maybeRestartHttpServerIdle();
 
   if (halowConnected && !onboardClockValid() &&
       (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
