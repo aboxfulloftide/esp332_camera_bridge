@@ -31,11 +31,36 @@ Representative fields:
 - `latest_media_id`
 - `onboard_captures`
 - `schedule_mode`
+- `http_service`
 - `observation_queue`
 - `wifi_scanner`
 - `ble_scanner`
 
 Detailed data formerly returned by `/status` is split across the endpoints below.
+
+### `GET /healthz`
+
+Minimal board HTTP health check. Use this when diagnosing whether the ESP32 application HTTP loop is still responsive while the HaLow AP still shows the board associated.
+
+Representative fields:
+
+- `ok`
+- `uptime_ms`
+- `hostname`
+- `halow_connected`
+- `halow_ip`
+- `http_service`
+
+`http_service` reports:
+
+- `service_count`
+- `last_service_age_ms`
+- `last_gap_ms`
+- `max_gap_ms`
+- `camera_http_keepalive_enabled`
+- `camera_auto_recovery_enabled`
+
+Current firmware defaults both automatic camera HTTP keepalive and automatic camera recovery to disabled so an unreliable trail-camera connection cannot run blocking recovery work from the board HTTP service loop. Explicit `POST /control/bringup` and `POST /control/stream_start` still run through the control worker.
 
 ### `GET /system/status`
 

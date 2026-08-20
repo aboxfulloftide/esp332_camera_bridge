@@ -237,6 +237,12 @@ static const unsigned long CAMERA_SESSION_DEFAULT_LEASE_MS = 120000;
 static const unsigned long CAMERA_SESSION_MAX_LEASE_MS = 600000;
 static const unsigned long CAMERA_IDLE_HOLD_MS = 120000;
 static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
+#ifndef CAMERA_HTTP_KEEPALIVE_ENABLED
+#define CAMERA_HTTP_KEEPALIVE_ENABLED 0
+#endif
+#ifndef CAMERA_AUTO_RECOVERY_ENABLED
+#define CAMERA_AUTO_RECOVERY_ENABLED 0
+#endif
 static const BaseType_t CONTROL_WORKER_CORE = 0;
 static const uint8_t BLE_SCAN_ATTEMPTS = 3;
 static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
@@ -288,6 +294,10 @@ unsigned long lastBleWakeElapsedMs = 0;
 unsigned long lastHotspotWaitElapsedMs = 0;
 unsigned long lastWifiJoinElapsedMs = 0;
 unsigned long lastCameraHttpElapsedMs = 0;
+unsigned long lastHttpServiceMs = 0;
+unsigned long httpServiceGapMaxMs = 0;
+unsigned long httpServiceLastGapMs = 0;
+uint32_t httpServiceCount = 0;
 SemaphoreHandle_t tunnelWriteMutex = nullptr;
 TaskHandle_t controlWorkerTaskHandle = nullptr;
 TaskHandle_t wifiScannerTaskHandle = nullptr;
@@ -733,6 +743,34 @@ void cooperativeDelay(unsigned long durationMs) {
     delay(1);
     vTaskDelay(pdMS_TO_TICKS(1));
   }
+}
+
+void serviceBoardHttp() {
+  if (!httpServerStarted) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (lastHttpServiceMs != 0) {
+    httpServiceLastGapMs = now - lastHttpServiceMs;
+    if (httpServiceLastGapMs > httpServiceGapMaxMs) {
+      httpServiceGapMaxMs = httpServiceLastGapMs;
+    }
+  }
+  server.handleClient();
+  lastHttpServiceMs = millis();
+  ++httpServiceCount;
+}
+
+String buildHttpServiceJson() {
+  String payload = "{";
+  payload += "\"service_count\":" + String(httpServiceCount);
+  payload += ",\"last_service_age_ms\":" + String(msSince(lastHttpServiceMs));
+  payload += ",\"last_gap_ms\":" + String(httpServiceLastGapMs);
+  payload += ",\"max_gap_ms\":" + String(httpServiceGapMaxMs);
+  payload += ",\"camera_http_keepalive_enabled\":" + String((CAMERA_HTTP_KEEPALIVE_ENABLED != 0) ? "true" : "false");
+  payload += ",\"camera_auto_recovery_enabled\":" + String((CAMERA_AUTO_RECOVERY_ENABLED != 0) ? "true" : "false");
+  payload += "}";
+  return payload;
 }
 
 String buildStreamStartMetadata() {
@@ -5298,6 +5336,7 @@ String buildSystemStatusJson() {
   payload += ",\"psram_size\":" + String(ESP.getPsramSize());
   payload += ",\"psram_free\":" + String(ESP.getFreePsram());
   payload += ",\"chip_temperature_c\":" + String(readChipTemperatureC(), 1);
+  payload += ",\"http_service\":" + buildHttpServiceJson();
   payload += "}";
   return payload;
 }
@@ -5423,6 +5462,7 @@ void handleStatus() {
   basic += ",\"latest_media_id\":" + (onboardLatestMediaId == 0 ? String("null") : "\"" + onboardMediaIdString(onboardLatestMediaId) + "\"");
   basic += ",\"onboard_captures\":" + String(onboardCaptureCount);
   basic += ",\"schedule_mode\":\"" + String(onboardClockValid() ? "clock_window" : "uptime_fallback") + "\"";
+  basic += ",\"http_service\":" + buildHttpServiceJson();
   basic += ",\"observation_queue\":{";
   basic += "\"storage_type\":\"" + String(persistentStorageType()) + "\"";
   basic += ",\"queued_batches\":" + String(static_cast<unsigned>(observationQueueCachedCount));
@@ -5521,6 +5561,18 @@ void handleStatus() {
 
 void handleBatteryStatus() {
   server.send(200, "application/json", buildBatteryJson());
+}
+
+void handleHealthz() {
+  String payload = "{";
+  payload += "\"ok\":true";
+  payload += ",\"uptime_ms\":" + String(millis());
+  payload += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
+  payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
+  payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
+  payload += ",\"http_service\":" + buildHttpServiceJson();
+  payload += "}";
+  server.send(200, "application/json", payload);
 }
 
 void handleSystemStatus() {
@@ -6708,6 +6760,7 @@ void startHttpServer() {
     server.begin();
     return;
   }
+  server.on("/healthz", HTTP_GET, handleHealthz);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/system/status", HTTP_GET, handleSystemStatus);
   server.on("/halow/status", HTTP_GET, handleHaLowStatusHttp);
@@ -7352,9 +7405,7 @@ void loop() {
     if (!httpServerStarted) {
       startHttpServer();
     }
-    if (httpServerStarted) {
-      server.handleClient();
-    }
+    serviceBoardHttp();
     if (halowConnected && !onboardClockValid() &&
         (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
       lastClockSyncAttemptMs = millis();
@@ -7365,7 +7416,8 @@ void loop() {
     if (streamSessionActive && rtspSessionOpen && millis() - lastRtspKeepaliveMs > RTSP_KEEPALIVE_INTERVAL_MS) {
       sendRtspKeepalive();
     }
-    if (wifiConnected &&
+    if ((CAMERA_HTTP_KEEPALIVE_ENABLED != 0) &&
+        wifiConnected &&
         millis() - lastHttpKeepaliveMs > HTTP_KEEPALIVE_INTERVAL_MS) {
       const bool keepaliveOk = sendHttpKeepalive();
       if (!streamSessionActive &&
@@ -7384,16 +7436,18 @@ void loop() {
       Serial.println("[tunnel] attempting reconnect");
       connectTunnelSocket();
     }
-    if (streamSessionActive && !wifiConnected) {
+    if ((CAMERA_AUTO_RECOVERY_ENABLED != 0) && streamSessionActive && !wifiConnected) {
       recoverActiveStream("camera_wifi_lost");
     }
-    if (streamSessionActive && wifiConnected &&
+    if ((CAMERA_AUTO_RECOVERY_ENABLED != 0) &&
+        streamSessionActive && wifiConnected &&
         lastPrimaryPacketMs > 0 &&
         millis() - lastPrimaryPacketMs > STREAM_STALL_TIMEOUT_MS) {
       Serial.printf("[stream] primary RTP stalled for %lu ms\n", msSince(lastPrimaryPacketMs));
       recoverActiveStream("rtp_stall");
     }
-    if (!streamSessionActive && !wifiConnected && cameraWifiEverConnected && !isControlActionActive() &&
+    if ((CAMERA_AUTO_RECOVERY_ENABLED != 0) &&
+        !streamSessionActive && !wifiConnected && cameraWifiEverConnected && !isControlActionActive() &&
         millis() - lastRescanMs > 15000) {
       lastRescanMs = millis();
       Serial.printf("[state] ble_attempted=%s ble_ok=%s notify_count=%u last=%s\n",
@@ -7413,7 +7467,7 @@ void loop() {
     return;
   }
 
-  server.handleClient();
+  serviceBoardHttp();
 
   if (halowConnected && !onboardClockValid() &&
       (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {

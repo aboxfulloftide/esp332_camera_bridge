@@ -64,6 +64,7 @@ Run these from the house/server side:
 ```bash
 ping -c 50 192.168.1.160
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/status
+curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/healthz
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/system/status
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/halow/status
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/wifi/status
@@ -84,6 +85,8 @@ curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/scanner/c
 Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP server is small and the HaLow link has shown jitter; sequential requests are reliable.
 
 Recent trail-camera field tests show camera operations can pass while a few ESP32 HTTP status polls reset or time out during active live view. Treat `/stream/status` media counters and the stream functional gate as the signal for live-view success; occasional `/control/status` poll failures under stream load are a board responsiveness issue to improve separately.
+
+Current hardening disables automatic trail-camera HTTP keepalive and automatic camera recovery by default. This keeps an unreliable trail-camera connection from running BLE/Wi-Fi recovery work inside the main HTTP service loop. Use explicit control endpoints for camera work and use `/healthz` plus `http_service.max_gap_ms` to confirm whether the board application loop is staying responsive.
 
 ## Old `/status` field coverage
 

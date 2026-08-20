@@ -57,6 +57,7 @@ server with the current:
 ## Current HTTP Endpoints
 
 - `/status`
+- `GET /healthz`
 - `GET /system/status`
 - `GET /halow/status`
 - `GET /wifi/status`
