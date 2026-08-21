@@ -67,6 +67,15 @@ function formatBytes(n) {
   return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // --- Header status pill ---
 const statusPill = document.getElementById('status-pill');
 
@@ -90,6 +99,7 @@ function renderStatusGrid(data) {
   statusGrid.innerHTML = [
     ['WiFi',     badge(data.wifi_connected, 'connected', 'offline')],
     ['HaLow',    badge(data.halow_connected, 'connected', 'offline')],
+    ['Target',   escapeHtml(data.camera_target_wifi_ssid || data.camera_target_ble_mac || '—')],
     ['Camera IP',data.camera_ip  || '—'],
     ['BLE Stage',data.ble_stage  || '—'],
     ['Tunnel',   badge(data.tunnel_connected, 'up', 'down')],
@@ -102,6 +112,73 @@ function renderStatusGrid(data) {
     `<span class="status-label">${k}</span><span class="status-value">${v}</span>`
   ).join('');
 }
+
+// --- Camera target ---
+const cameraTargetSelect = document.getElementById('camera-target-select');
+const reloadCameraTargetBtn = document.getElementById('reload-camera-target-btn');
+const applyCameraTargetBtn = document.getElementById('apply-camera-target-btn');
+const cameraTargetLog = document.getElementById('camera-target-log');
+
+function renderCameraTarget(payload) {
+  const target = payload?.target || payload?.data?.target || payload;
+  const active = target?.active || {};
+  const profiles = target?.profiles || [];
+  if (!profiles.length) {
+    cameraTargetSelect.innerHTML = '<option value="">No profiles reported</option>';
+    return;
+  }
+  cameraTargetSelect.innerHTML = profiles.map(profile => {
+    const selected = profile.selected || profile.ble_mac === active.ble_mac;
+    const label = `${profile.label || profile.id} · ${profile.wifi_ssid || profile.ble_mac}`;
+    return `<option value="${escapeHtml(profile.id)}"${selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
+  setLog(
+    cameraTargetLog,
+    `active: ${active.wifi_ssid || '—'} · ${active.ble_mac || '—'}`,
+    'ok'
+  );
+}
+
+async function loadCameraTarget() {
+  setBusy(reloadCameraTargetBtn, true, 'Loading…');
+  try {
+    const res = await API.get('/api/camera/target');
+    if (res.ok) {
+      renderCameraTarget(res.data);
+    } else {
+      setLog(cameraTargetLog, res.error?.message || 'Failed', 'err');
+    }
+  } catch (e) {
+    setLog(cameraTargetLog, e.message, 'err');
+  } finally {
+    setBusy(reloadCameraTargetBtn, false);
+  }
+}
+
+reloadCameraTargetBtn.addEventListener('click', loadCameraTarget);
+
+applyCameraTargetBtn.addEventListener('click', async () => {
+  const id = cameraTargetSelect.value;
+  if (!id) {
+    setLog(cameraTargetLog, 'Select a camera first', 'err');
+    return;
+  }
+  setBusy(applyCameraTargetBtn, true, 'Applying…');
+  setLog(cameraTargetLog, 'Selecting camera target…');
+  try {
+    const res = await API.post('/api/camera/target', { id });
+    if (res.ok) {
+      renderCameraTarget(res.data);
+      refreshStatus();
+    } else {
+      setLog(cameraTargetLog, res.error?.message || 'Failed', 'err');
+    }
+  } catch (e) {
+    setLog(cameraTargetLog, e.message, 'err');
+  } finally {
+    setBusy(applyCameraTargetBtn, false);
+  }
+});
 
 // --- Status polling ---
 async function refreshStatus() {
@@ -120,6 +197,7 @@ async function refreshStatus() {
 }
 
 refreshStatus();
+loadCameraTarget();
 setInterval(refreshStatus, 5000);
 
 // --- Connection ---

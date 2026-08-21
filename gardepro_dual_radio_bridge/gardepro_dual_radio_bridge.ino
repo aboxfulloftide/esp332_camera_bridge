@@ -224,6 +224,17 @@ int bleRecentRssis[BLE_RECENT_DEVICE_SLOTS] = {
   -127, -127, -127, -127,
   -127, -127, -127, -127
 };
+struct CameraProfile {
+  const char *id;
+  const char *label;
+  const char *bleMac;
+  const char *bleName;
+  const char *wifiSsid;
+};
+static const CameraProfile CAMERA_PROFILES[] = {
+  {"e6_original", "GardePro E6 original", "a4:6d:d4:9e:47:32", "CAM8Z8_NoName_G_E6", "CAM8Z8_A46DD49E4732"},
+  {"e6_plus", "GardePro E6+", "a4:c1:38:98:81:48", "CAM8Z8_NoName_G_E6+", "CAM8Z8_A4C138988148"},
+};
 String serialCommandBuffer;
 bool udpInspectorsStarted = false;
 bool streamSessionActive = false;
@@ -3141,6 +3152,103 @@ void setCameraTargetFromAdvertisement(const String &mac, const String &name) {
                 cameraTargetBleMac.c_str(),
                 cameraTargetBleName.c_str(),
                 cameraTargetWifiSsid.c_str());
+}
+
+bool setCameraTarget(const String &rawBleMac,
+                     const String &rawWifiSsid,
+                     const String &rawName,
+                     String &error) {
+  String mac = rawBleMac;
+  String ssid = rawWifiSsid;
+  String name = rawName;
+  mac.trim();
+  ssid.trim();
+  name.trim();
+  mac.toLowerCase();
+
+  if (mac.isEmpty()) {
+    error = "missing_ble_mac";
+    return false;
+  }
+
+  int colonCount = 0;
+  for (size_t i = 0; i < mac.length(); ++i) {
+    if (mac[i] == ':') {
+      ++colonCount;
+    }
+  }
+  if (!(mac.length() == 17 && colonCount == 5) && mac.length() != 12) {
+    error = "invalid_ble_mac";
+    return false;
+  }
+  if (mac.length() == 12) {
+    String formatted;
+    for (size_t i = 0; i < mac.length(); ++i) {
+      if (i > 0 && (i % 2) == 0) {
+        formatted += ":";
+      }
+      formatted += mac[i];
+    }
+    mac = formatted;
+  }
+
+  if (ssid.isEmpty()) {
+    ssid = cameraWifiSsidFromBleMac(mac);
+  }
+  if (ssid.isEmpty()) {
+    error = "missing_wifi_ssid";
+    return false;
+  }
+
+  const bool changed = !mac.equalsIgnoreCase(cameraTargetBleMac) || ssid != cameraTargetWifiSsid;
+  if (changed) {
+    closeBleWakeSession();
+    if (wifiConnected || WiFi.status() == WL_CONNECTED) {
+      WiFi.disconnect(true, true);
+      cooperativeDelay(200);
+      refreshWifiState();
+    }
+    standbyRequested = false;
+    cameraWifiEverConnected = false;
+    streamSessionActive = false;
+    bleTargetDeviceFound = false;
+  }
+
+  cameraTargetBleMac = mac;
+  cameraTargetBleName = name;
+  cameraTargetWifiSsid = ssid;
+  error = "";
+  Serial.printf("[camera-target] selected ble_mac=%s name=%s wifi_ssid=%s changed=%s\n",
+                cameraTargetBleMac.c_str(),
+                cameraTargetBleName.c_str(),
+                cameraTargetWifiSsid.c_str(),
+                changed ? "yes" : "no");
+  return true;
+}
+
+String buildCameraTargetJson() {
+  String payload = "{";
+  payload += "\"active\":{";
+  payload += "\"ble_mac\":\"" + jsonEscape(cameraTargetBleMac) + "\"";
+  payload += ",\"ble_name\":\"" + jsonEscape(cameraTargetBleName) + "\"";
+  payload += ",\"wifi_ssid\":\"" + jsonEscape(cameraTargetWifiSsid) + "\"";
+  payload += "}";
+  payload += ",\"profiles\":[";
+  for (size_t i = 0; i < sizeof(CAMERA_PROFILES) / sizeof(CAMERA_PROFILES[0]); ++i) {
+    if (i > 0) payload += ",";
+    payload += "{";
+    payload += "\"id\":\"" + String(CAMERA_PROFILES[i].id) + "\"";
+    payload += ",\"label\":\"" + jsonEscape(String(CAMERA_PROFILES[i].label)) + "\"";
+    payload += ",\"ble_mac\":\"" + String(CAMERA_PROFILES[i].bleMac) + "\"";
+    payload += ",\"ble_name\":\"" + jsonEscape(String(CAMERA_PROFILES[i].bleName)) + "\"";
+    payload += ",\"wifi_ssid\":\"" + jsonEscape(String(CAMERA_PROFILES[i].wifiSsid)) + "\"";
+    payload += ",\"selected\":" + String(cameraTargetBleMac.equalsIgnoreCase(CAMERA_PROFILES[i].bleMac) ? "true" : "false");
+    payload += "}";
+  }
+  payload += "]";
+  payload += ",\"recent_ble_devices\":" + buildBleRecentDevicesJson();
+  payload += "}";
+  return payload;
 }
 
 bool advertisedDeviceLooksLikeCamera(const String &mac, const String &name, const String &serviceUuid) {
@@ -6942,6 +7050,89 @@ void handleCameraInfo6() {
   server.send(statusCode, "application/json", body);
 }
 
+String extractJsonStringField(const String &body, const String &key) {
+  const String needle = "\"" + key + "\"";
+  int pos = body.indexOf(needle);
+  if (pos < 0) {
+    return "";
+  }
+  pos = body.indexOf(':', pos + needle.length());
+  if (pos < 0) {
+    return "";
+  }
+  pos = body.indexOf('"', pos + 1);
+  if (pos < 0) {
+    return "";
+  }
+  String value;
+  bool escaped = false;
+  for (int i = pos + 1; i < body.length(); ++i) {
+    const char c = body[i];
+    if (escaped) {
+      value += c;
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      break;
+    } else {
+      value += c;
+    }
+  }
+  return value;
+}
+
+void handleCameraTargetGet() {
+  String payload = "{\"ok\":true,\"target\":";
+  payload += buildCameraTargetJson();
+  payload += "}";
+  server.send(200, "application/json", payload);
+}
+
+void handleCameraTargetPost() {
+  String id = server.hasArg("id") ? server.arg("id") : "";
+  String bleMac = server.hasArg("ble_mac") ? server.arg("ble_mac") : "";
+  String wifiSsid = server.hasArg("wifi_ssid") ? server.arg("wifi_ssid") : "";
+  String bleName = server.hasArg("ble_name") ? server.arg("ble_name") : "";
+
+  if (server.hasArg("plain")) {
+    const String body = server.arg("plain");
+    if (id.isEmpty()) id = extractJsonStringField(body, "id");
+    if (bleMac.isEmpty()) bleMac = extractJsonStringField(body, "ble_mac");
+    if (wifiSsid.isEmpty()) wifiSsid = extractJsonStringField(body, "wifi_ssid");
+    if (bleName.isEmpty()) bleName = extractJsonStringField(body, "ble_name");
+  }
+
+  id.trim();
+  if (!id.isEmpty()) {
+    for (size_t i = 0; i < sizeof(CAMERA_PROFILES) / sizeof(CAMERA_PROFILES[0]); ++i) {
+      if (id == CAMERA_PROFILES[i].id) {
+        bleMac = CAMERA_PROFILES[i].bleMac;
+        bleName = CAMERA_PROFILES[i].bleName;
+        wifiSsid = CAMERA_PROFILES[i].wifiSsid;
+        break;
+      }
+    }
+  }
+
+  String error;
+  const bool ok = setCameraTarget(bleMac, wifiSsid, bleName, error);
+  if (!ok) {
+    String payload = "{\"ok\":false,\"error\":\"invalid_request\",\"detail\":\"";
+    payload += jsonEscape(error);
+    payload += "\",\"target\":";
+    payload += buildCameraTargetJson();
+    payload += "}";
+    server.send(400, "application/json", payload);
+    return;
+  }
+
+  String payload = "{\"ok\":true,\"target\":";
+  payload += buildCameraTargetJson();
+  payload += "}";
+  server.send(200, "application/json", payload);
+}
+
 void controlWorkerTask(void *pvParameters) {
   (void)pvParameters;
   while (true) {
@@ -6990,6 +7181,8 @@ void startHttpServer() {
   server.on("/halow/status", HTTP_GET, handleHaLowStatusHttp);
   server.on("/wifi/status", HTTP_GET, handleWifiStatus);
   server.on("/camera/status", HTTP_GET, handleCameraBridgeStatus);
+  server.on("/camera/target", HTTP_GET, handleCameraTargetGet);
+  server.on("/camera/target", HTTP_POST, handleCameraTargetPost);
   server.on("/timing/status", HTTP_GET, handleTimingStatus);
   server.on("/stream/status", HTTP_GET, handleStreamRuntimeStatus);
   server.on("/ble/status", HTTP_GET, handleBleStatus);

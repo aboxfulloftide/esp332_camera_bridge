@@ -155,6 +155,12 @@ The main bridge firmware now supports GardePro camera target selection from BLE 
   - `camera_target_ble_mac`
   - `camera_target_ble_name`
   - `camera_target_wifi_ssid`
+- `/camera/target` exposes the active target and known profiles, and accepts
+  profile selection over HTTP for website/server use
+- website flow:
+  - choose target in the `Camera Target` panel
+  - click `Use Selected Camera`
+  - then click `Connect`
 - USB serial command:
 
 ```text

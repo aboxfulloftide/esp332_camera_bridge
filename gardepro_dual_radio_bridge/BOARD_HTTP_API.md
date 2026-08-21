@@ -112,6 +112,63 @@ Trail-camera bridge state:
 - `standby_requested`
 - `session`
 
+### `GET /camera/target`
+
+Returns the active trail-camera target and the built-in known camera profiles.
+
+Representative response shape:
+
+```json
+{
+  "ok": true,
+  "target": {
+    "active": {
+      "ble_mac": "a4:c1:38:98:81:48",
+      "ble_name": "CAM8Z8_NoName_G_E6+",
+      "wifi_ssid": "CAM8Z8_A4C138988148"
+    },
+    "profiles": [
+      {
+        "id": "e6_original",
+        "label": "GardePro E6 original",
+        "ble_mac": "a4:6d:d4:9e:47:32",
+        "ble_name": "CAM8Z8_NoName_G_E6",
+        "wifi_ssid": "CAM8Z8_A46DD49E4732",
+        "selected": false
+      }
+    ],
+    "recent_ble_devices": []
+  }
+}
+```
+
+### `POST /camera/target`
+
+Selects which trail camera the bridge should wake/connect to.
+
+Accepted inputs:
+
+- query/form fields, or JSON body
+- `id` matching one of the built-in profiles, for example `e6_original` or `e6_plus`
+- or explicit `ble_mac` plus optional `wifi_ssid` and `ble_name`
+
+Examples:
+
+```bash
+curl -sS -X POST "http://192.168.1.160:18080/camera/target?id=e6_plus"
+
+curl -sS -X POST "http://192.168.1.160:18080/camera/target" \
+  -H 'Content-Type: application/json' \
+  -d '{"ble_mac":"a4:c1:38:98:81:48"}'
+```
+
+If `wifi_ssid` is omitted, the firmware derives it from the BLE MAC as
+`CAM8Z8_<BLE_MAC_WITHOUT_COLONS>`.
+
+Changing target closes any cached BLE wake session and disconnects from the
+current camera Wi-Fi. After selecting a target, run `POST /control/bringup` or
+`POST /jobs?action=bringup`.
+
 ### `GET /timing/status`
 
 Last bringup timing:

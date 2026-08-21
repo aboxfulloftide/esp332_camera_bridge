@@ -163,6 +163,28 @@ Stability work completed in the current sketch:
 - local serial mode now brings up HaLow and the HTTP bridge immediately on boot so remote status/control does not wait for the camera wake path
 - after a successful `/cmd/standby/now`, the bridge now suppresses idle `/cmd/standby/reset` keepalives and idle auto-recovery until the next explicit bringup or standby reset
 
+Camera target selection:
+
+- The normal operator path is now website-driven:
+  1. open the local GardePro web UI
+  2. choose the camera in the `Camera Target` panel
+  3. click `Use Selected Camera`
+  4. click `Connect`
+- The board exposes the same control directly:
+
+```bash
+curl -sS http://192.168.1.160:18080/camera/target
+curl -sS -X POST "http://192.168.1.160:18080/camera/target?id=e6_original"
+curl -sS -X POST "http://192.168.1.160:18080/camera/target?id=e6_plus"
+```
+
+- Selecting a different target intentionally closes the cached BLE session and
+  disconnects the current trail-camera Wi-Fi session. This avoids sending
+  commands to the wrong camera after a target switch.
+- Built-in camera profiles:
+  - `e6_original`: BLE `a4:6d:d4:9e:47:32`, Wi-Fi `CAM8Z8_A46DD49E4732`
+  - `e6_plus`: BLE `a4:c1:38:98:81:48`, Wi-Fi `CAM8Z8_A4C138988148`
+
 Settings write behavior:
 
 - `setting-set` and `setting-update-json` send the patch, re-read `/cmd/getSetting`, and report which requested keys actually changed

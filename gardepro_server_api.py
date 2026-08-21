@@ -190,6 +190,34 @@ class GardeProServerAPI:
     def status(self) -> Any:
         return self.request_json("GET", "/status")[2]
 
+    def camera_target(self) -> Any:
+        return self.request_json("GET", "/camera/target")[2]
+
+    def set_camera_target(
+        self,
+        *,
+        profile_id: str = "",
+        ble_mac: str = "",
+        wifi_ssid: str = "",
+        ble_name: str = "",
+    ) -> Any:
+        body = json.dumps({
+            "id": profile_id,
+            "ble_mac": ble_mac,
+            "wifi_ssid": wifi_ssid,
+            "ble_name": ble_name,
+        }).encode("utf-8")
+        status, _headers, payload = self.request_json(
+            "POST",
+            "/camera/target",
+            body=body,
+            content_type="application/json",
+        )
+        if not (200 <= status < 300):
+            detail = payload.get("detail") if isinstance(payload, dict) else None
+            raise RuntimeError(detail or f"camera target update failed HTTP {status}")
+        return payload
+
     def _wait_for_control_state(
         self,
         *,

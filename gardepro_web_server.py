@@ -90,6 +90,9 @@ def _normalize_status(raw: Any) -> dict[str, Any]:
             "halow_connected": False,
             "wifi_connected": False,
             "camera_ip": None,
+            "camera_target_ble_mac": None,
+            "camera_target_ble_name": None,
+            "camera_target_wifi_ssid": None,
             "bridge_ip": None,
             "ble_stage": None,
             "standby_requested": False,
@@ -105,6 +108,9 @@ def _normalize_status(raw: Any) -> dict[str, Any]:
         "halow_connected": bool(raw.get("halow_connected", False)),
         "wifi_connected": wifi,
         "camera_ip": raw.get("camera_ip"),
+        "camera_target_ble_mac": raw.get("camera_target_ble_mac"),
+        "camera_target_ble_name": raw.get("camera_target_ble_name"),
+        "camera_target_wifi_ssid": raw.get("camera_target_wifi_ssid"),
         "bridge_ip": raw.get("bridge_ip"),
         "ble_stage": raw.get("ble_stage"),
         "standby_requested": bool(raw.get("standby_requested", False)),
@@ -173,6 +179,25 @@ def session_close():
         "standby_requested": result.get("standby_requested", False),
         "status": _normalize_status(result.get("after", {})),
     })
+
+
+@app.get("/api/camera/target")
+@catch_errors
+def camera_target_get():
+    return ok(_make_api().camera_target())
+
+
+@app.post("/api/camera/target")
+@catch_errors
+def camera_target_post():
+    body = request.get_json(silent=True) or {}
+    result = _make_api().set_camera_target(
+        profile_id=str(body.get("id", "")),
+        ble_mac=str(body.get("ble_mac", "")),
+        wifi_ssid=str(body.get("wifi_ssid", "")),
+        ble_name=str(body.get("ble_name", "")),
+    )
+    return ok(result)
 
 
 # --- Settings ---

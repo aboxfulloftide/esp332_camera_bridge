@@ -35,6 +35,26 @@
       </div>
     </div>
 
+    <!-- ── Camera Target ─────────────────────────────────────── -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Camera Target</span>
+        <button class="btn btn-sm btn-secondary" id="reload-camera-target-btn">Reload</button>
+      </div>
+      <div class="panel-body">
+        <div class="field-row">
+          <label class="field-label" for="camera-target-select">Select camera</label>
+          <select class="field-input" id="camera-target-select">
+            <option value="">Loading…</option>
+          </select>
+        </div>
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn btn-primary" id="apply-camera-target-btn">Use Selected Camera</button>
+        </div>
+        <div id="camera-target-log" class="log-line">—</div>
+      </div>
+    </div>
+
     <!-- ── Bridge / Camera Status ─────────────────────────────── -->
     <div class="panel">
       <div class="panel-header">
