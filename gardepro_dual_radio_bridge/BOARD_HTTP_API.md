@@ -237,6 +237,56 @@ Camera target behavior:
 
 Background action queue state: busy/pending/current/last action, last result, active time, finished age, and message.
 
+Absent action/error/message fields are JSON `null`, not sentinel strings such
+as `"none"`.
+
+Important fields:
+
+- `control_busy`
+- `control_state`
+- `control_pending`
+- `control_action`
+- `control_last_action`
+- `control_last_ok`
+- `control_error`
+- `control_message`
+- `control_progress`
+- `control_progress_text`
+- `control_active_ms`
+- `control_last_finished_ms`
+
+### `GET /control/summary`
+
+Lightweight polling endpoint for the webserver/PHP/Python wait loops. Prefer
+this endpoint over `/status` while waiting for `bringup`, `stream_start`,
+`stream_stop`, or `trigger_photo`.
+
+Representative response:
+
+```json
+{
+  "ok": true,
+  "control_busy": false,
+  "control_state": "connected",
+  "control_action": null,
+  "control_pending": null,
+  "control_last_action": "bringup",
+  "control_last_ok": true,
+  "control_error": null,
+  "control_message": "bringup_complete",
+  "control_progress": "camera_wifi_connected",
+  "control_progress_text": "Camera Wi-Fi connected",
+  "eta_sec": 0,
+  "wifi_connected": true,
+  "stream_active": false,
+  "tunnel_connected": false,
+  "ble_stage": "wake_ok"
+}
+```
+
+Use `control_error` for fail-fast behavior. It is `null` when there is no
+current/last failure.
+
 ### `GET /battery/status`
 
 Battery and charger pins:
@@ -278,11 +328,19 @@ OTA status: firmware name/version, update endpoint, in-progress flag, last resul
 
 Queues camera bringup: BLE wake, camera hotspot wait, trail-camera Wi-Fi join, and camera HTTP verification.
 
-Poll `/control/status`, `/wifi/status`, `/ble/status`, and `/timing/status` for completion details.
+The accepted response includes:
+
+- `eta_sec`
+- `poll_path`, currently `/control/summary`
+
+Poll `/control/summary` for wait-loop completion and fail-fast errors. Use
+`/wifi/status`, `/ble/status`, and `/timing/status` for deeper diagnostics.
 
 ### `POST /control/stream_start`
 
 Queues live-view start. This can queue behind active bringup.
+
+The accepted response includes `eta_sec` and `poll_path`.
 
 Live view is split into two independent states:
 
@@ -294,6 +352,8 @@ If the trail-camera RTSP session starts but HaLow or the tunnel is unavailable, 
 ### `POST /control/stream_stop`
 
 Stops active live view and closes the tunnel path.
+
+The accepted response includes `eta_sec` and `poll_path`.
 
 ### `POST /session/lease`
 

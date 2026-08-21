@@ -101,6 +101,11 @@ function renderStatusGrid(data) {
     ['HaLow',    badge(data.halow_connected, 'connected', 'offline')],
     ['Target',   escapeHtml(data.camera_target_wifi_ssid || data.camera_target_ble_mac || '—')],
     ['Camera IP',data.camera_ip  || '—'],
+    ['Control',  escapeHtml(data.control_state || '—')],
+    ['Progress', escapeHtml(data.control_progress_text || data.control_progress || '—')],
+    ['Error',    data.control_error
+      ? `<span class="badge badge-err">${escapeHtml(data.control_error)}</span>`
+      : '<span class="badge badge-muted">none</span>'],
     ['BLE Stage',data.ble_stage  || '—'],
     ['Tunnel',   badge(data.tunnel_connected, 'up', 'down')],
     ['Live View',badge(data.live_view_active, 'active', 'inactive')],

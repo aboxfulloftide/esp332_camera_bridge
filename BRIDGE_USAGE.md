@@ -128,16 +128,24 @@ Important control behavior:
 - `POST /control/bringup`, `POST /control/stream_start`, and `POST /control/stream_stop` are now queued background actions
 - the HTTP request returns immediately with `202 Accepted`
 - the board executes the requested action in a worker task
-- `bringup`, `stream-start`, and `stream-stop` wait on the board status APIs by default and now accept `--timeout` and `--poll-interval` to tune that wait
+- `bringup`, `stream-start`, and `stream-stop` wait on the lightweight `/control/summary` API by default and now accept `--timeout` and `--poll-interval` to tune that wait
 - `session-close` now polls status after standby instead of taking one immediate snapshot, so delayed WiFi drop is reported correctly
 - in the current local-serial-mode sketch, HaLow and the HTTP control plane now boot immediately instead of waiting for the camera wake path to finish first
-- poll `/control/status` to watch:
+- poll `/control/summary` during wait loops; it is smaller than `/status` and includes:
   - `control_busy`
+  - `control_state`
   - `control_pending`
   - `control_action`
   - `control_last_action`
   - `control_last_ok`
-  - `control_last_message`
+  - `control_error`
+  - `control_message`
+  - `control_progress`
+  - `control_progress_text`
+  - `wifi_connected`
+  - `stream_active`
+  - `tunnel_connected`
+- absent action/error/message fields are JSON `null`, not the string `"none"`
 
 Raw camera fetch behavior:
 

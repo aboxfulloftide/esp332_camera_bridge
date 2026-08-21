@@ -190,6 +190,9 @@ class GardeProServerAPI:
     def status(self) -> Any:
         return self.request_json("GET", "/status")[2]
 
+    def control_summary(self) -> Any:
+        return self.request_json("GET", "/control/summary")[2]
+
     def camera_target(self) -> Any:
         return self.request_json("GET", "/camera/target")[2]
 
@@ -229,17 +232,22 @@ class GardeProServerAPI:
         deadline = time.time() + float(timeout or self.control_timeout)
         last_status: Any = {}
         while time.time() < deadline:
-            last_status = self.status()
+            last_status = self.control_summary()
             if predicate(last_status):
                 return last_status
             if (
                 isinstance(last_status, dict)
                 and not last_status.get("control_busy", False)
-                and last_status.get("control_pending") == "none"
+                and last_status.get("control_pending") is None
                 and last_status.get("control_last_action") == expect_action
                 and not last_status.get("control_last_ok", False)
             ):
-                raise RuntimeError(last_status.get("control_last_message", f"{expect_action} failed"))
+                raise RuntimeError(
+                    last_status.get("control_error")
+                    or last_status.get("control_message")
+                    or last_status.get("control_last_message")
+                    or f"{expect_action} failed"
+                )
             time.sleep(poll_interval)
         raise TimeoutError(f"timed out waiting for {expect_action}")
 

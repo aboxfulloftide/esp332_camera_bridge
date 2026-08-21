@@ -98,6 +98,10 @@ def _normalize_status(raw: Any) -> dict[str, Any]:
             "standby_requested": False,
             "tunnel_connected": False,
             "control_last_message": None,
+            "control_error": None,
+            "control_state": None,
+            "control_progress": None,
+            "control_progress_text": None,
             "raw": raw,
         }
     wifi = bool(raw.get("wifi_connected", False))
@@ -116,6 +120,10 @@ def _normalize_status(raw: Any) -> dict[str, Any]:
         "standby_requested": bool(raw.get("standby_requested", False)),
         "tunnel_connected": bool(raw.get("tunnel_connected", False)),
         "control_last_message": raw.get("control_last_message"),
+        "control_error": raw.get("control_error"),
+        "control_state": raw.get("control_state"),
+        "control_progress": raw.get("control_progress"),
+        "control_progress_text": raw.get("control_progress_text"),
         "raw": raw,
     }
 

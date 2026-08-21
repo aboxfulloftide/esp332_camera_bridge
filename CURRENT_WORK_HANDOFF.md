@@ -157,6 +157,20 @@ The main bridge firmware now supports GardePro camera target selection from BLE 
   - `camera_target_wifi_ssid`
 - `/camera/target` exposes the active target and known profiles, and accepts
   profile selection over HTTP for website/server use
+- `/control/summary` is the lightweight webserver polling endpoint for
+  set-and-forget actions; it avoids polling the larger `/status` payload every
+  second over HaLow
+- absent action/error/message fields are JSON `null`, not string sentinels like
+  `"none"`
+- `/status` also exposes top-level control summary fields:
+  - `control_state`
+  - `control_error`
+  - `control_progress`
+  - `control_progress_text`
+  - nullable `control_action`, `control_pending`, and `control_last_action`
+- accepted control/job responses include:
+  - `eta_sec`
+  - `poll_path`, currently `/control/summary`
 - website flow:
   - choose target in the `Camera Target` panel
   - click `Use Selected Camera`

@@ -612,6 +612,7 @@ struct ControlState {
   unsigned long activeSinceMs;
   unsigned long lastFinishedMs;
   char lastMessage[96];
+  char lastError[64];
 };
 
 static ControlState controlState = {
@@ -623,6 +624,7 @@ static ControlState controlState = {
   false,
   0,
   0,
+  "",
   ""
 };
 
@@ -2937,6 +2939,157 @@ const char *controlActionName(ControlAction action) {
   }
 }
 
+String controlActionJson(ControlAction action) {
+  if (action == CONTROL_ACTION_NONE) {
+    return "null";
+  }
+  return "\"" + String(controlActionName(action)) + "\"";
+}
+
+uint16_t controlActionEtaSec(ControlAction action) {
+  switch (action) {
+    case CONTROL_ACTION_BRINGUP:
+      return 45;
+    case CONTROL_ACTION_STREAM_START:
+      return 60;
+    case CONTROL_ACTION_STREAM_STOP:
+      return 10;
+    case CONTROL_ACTION_TRIGGER_PHOTO:
+      return 45;
+    case CONTROL_ACTION_NONE:
+    default:
+      return 0;
+  }
+}
+
+String controlErrorFromMessage(ControlAction action, const String &message) {
+  if (message.isEmpty()) {
+    return "control_action_failed";
+  }
+  if (message.indexOf("scan_not_found") >= 0) return "ble_scan_not_found";
+  if (message.indexOf("connect failed") >= 0 || message.indexOf("connect_failed") >= 0) return "ble_connect_failed";
+  if (message.indexOf("wake") >= 0 || message.indexOf("bringup_failed") >= 0) {
+    if (action == CONTROL_ACTION_BRINGUP) return "ble_wake_failed";
+    if (action == CONTROL_ACTION_TRIGGER_PHOTO) return "trigger_photo_bringup_failed";
+  }
+  if (message.indexOf("hotspot") >= 0) return "camera_hotspot_not_found";
+  if (message.indexOf("wifi") >= 0) return "camera_wifi_join_failed";
+  if (message.indexOf("rtsp_describe") >= 0) return "rtsp_describe_failed";
+  if (message.indexOf("rtsp_setup") >= 0) return "rtsp_setup_failed";
+  if (message.indexOf("rtsp_play") >= 0) return "rtsp_play_failed";
+  if (message.indexOf("tunnel") >= 0) return "tunnel_connect_failed";
+  if (message.indexOf("trigger_photo_take") >= 0) return "trigger_photo_take_failed";
+  if (message.indexOf("trigger_photo_result") >= 0) return "trigger_photo_result_timeout";
+  if (message.indexOf("camera_http") >= 0) return "camera_http_failed";
+  switch (action) {
+    case CONTROL_ACTION_BRINGUP:
+      return "bringup_failed";
+    case CONTROL_ACTION_STREAM_START:
+      return "stream_start_failed";
+    case CONTROL_ACTION_STREAM_STOP:
+      return "stream_stop_failed";
+    case CONTROL_ACTION_TRIGGER_PHOTO:
+      return "trigger_photo_failed";
+    case CONTROL_ACTION_NONE:
+    default:
+      return "control_action_failed";
+  }
+}
+
+String controlStateFromSnapshot(const ControlState &snapshot) {
+  if (snapshot.busy) {
+    switch (snapshot.activeAction) {
+      case CONTROL_ACTION_BRINGUP:
+        return "bringing_up";
+      case CONTROL_ACTION_STREAM_START:
+        return "stream_starting";
+      case CONTROL_ACTION_STREAM_STOP:
+        return "going_standby";
+      case CONTROL_ACTION_TRIGGER_PHOTO:
+        return "triggering_photo";
+      case CONTROL_ACTION_NONE:
+      default:
+        return "idle";
+    }
+  }
+  if (snapshot.pendingAction != CONTROL_ACTION_NONE) {
+    switch (snapshot.pendingAction) {
+      case CONTROL_ACTION_BRINGUP:
+        return "bringing_up";
+      case CONTROL_ACTION_STREAM_START:
+        return "stream_starting";
+      case CONTROL_ACTION_STREAM_STOP:
+        return "going_standby";
+      case CONTROL_ACTION_TRIGGER_PHOTO:
+        return "triggering_photo";
+      case CONTROL_ACTION_NONE:
+      default:
+        break;
+    }
+  }
+  if (!snapshot.lastOk && snapshot.lastAction != CONTROL_ACTION_NONE) {
+    return "error";
+  }
+  if (streamSessionActive) {
+    return "streaming";
+  }
+  if (wifiConnected) {
+    return "connected";
+  }
+  return "idle";
+}
+
+String controlProgressFromSnapshot(const ControlState &snapshot) {
+  if (!snapshot.busy) {
+    if (snapshot.pendingAction != CONTROL_ACTION_NONE) {
+      return "queued";
+    }
+    if (!snapshot.lastOk && snapshot.lastAction != CONTROL_ACTION_NONE) {
+      return "failed";
+    }
+    if (streamSessionActive) return "streaming";
+    if (wifiConnected) return "camera_wifi_connected";
+    return "idle";
+  }
+  if (snapshot.activeAction == CONTROL_ACTION_BRINGUP) {
+    if (bleStage == "scan") return "ble_scanning";
+    if (bleStage == "reuse_wake" || bleStage == "wake") return "ble_waking";
+    if (bleStage == "connect") return "ble_connecting";
+    if (bleStage == "wake_ok") return "waiting_for_camera_hotspot";
+    return "bringing_up";
+  }
+  if (snapshot.activeAction == CONTROL_ACTION_STREAM_START) {
+    if (!lastStreamStartStage.isEmpty() && lastStreamStartStage != "idle") {
+      return lastStreamStartStage;
+    }
+    return "starting_rtsp";
+  }
+  if (snapshot.activeAction == CONTROL_ACTION_STREAM_STOP) {
+    return "going_standby";
+  }
+  if (snapshot.activeAction == CONTROL_ACTION_TRIGGER_PHOTO) {
+    return wifiConnected ? "triggering_photo" : "bringing_up";
+  }
+  return "working";
+}
+
+String controlProgressText(const String &progress) {
+  if (progress == "idle") return "Idle";
+  if (progress == "queued") return "Queued";
+  if (progress == "ble_scanning") return "Scanning for camera BLE";
+  if (progress == "ble_connecting") return "Connecting BLE";
+  if (progress == "ble_waking") return "Waking camera over BLE";
+  if (progress == "waiting_for_camera_hotspot") return "Waiting for camera Wi-Fi hotspot";
+  if (progress == "bringing_up") return "Bringing camera up";
+  if (progress == "camera_wifi_connected") return "Camera Wi-Fi connected";
+  if (progress == "starting_rtsp") return "Starting live view";
+  if (progress == "streaming") return "Streaming";
+  if (progress == "going_standby") return "Going standby";
+  if (progress == "triggering_photo") return "Triggering photo";
+  if (progress == "failed") return "Failed";
+  return progress;
+}
+
 void snapshotControlState(ControlState &snapshot) {
   portENTER_CRITICAL(&controlState.lock);
   snapshot = controlState;
@@ -2978,6 +3131,10 @@ bool queueControlAction(ControlAction action, String &message) {
     controlState.pendingAction = action;
     accepted = true;
   }
+  if (accepted) {
+    controlState.lastError[0] = '\0';
+    controlState.lastMessage[0] = '\0';
+  }
   portEXIT_CRITICAL(&controlState.lock);
   message = String(messageType) + ":" + controlActionName(messageAction);
   return accepted;
@@ -2999,6 +3156,8 @@ ControlAction takePendingControlAction() {
 }
 
 void finishControlAction(ControlAction action, bool ok, const char *message) {
+  const String messageText = message == nullptr ? String("") : String(message);
+  const String errorText = ok ? String("") : controlErrorFromMessage(action, messageText);
   portENTER_CRITICAL(&controlState.lock);
   controlState.busy = false;
   controlState.activeAction = CONTROL_ACTION_NONE;
@@ -3009,12 +3168,17 @@ void finishControlAction(ControlAction action, bool ok, const char *message) {
   snprintf(controlState.lastMessage,
            sizeof(controlState.lastMessage),
            "%s",
-           message == nullptr ? "" : message);
+           messageText.c_str());
+  snprintf(controlState.lastError,
+           sizeof(controlState.lastError),
+           "%s",
+           errorText.c_str());
   portEXIT_CRITICAL(&controlState.lock);
 
   String details = "{";
   details += "\"action\":\"" + String(controlActionName(action)) + "\"";
-  details += ",\"message\":\"" + jsonEscape(message == nullptr ? String("") : String(message)) + "\"";
+  details += ",\"message\":\"" + jsonEscape(messageText) + "\"";
+  details += ",\"error\":" + jsonNullableString(errorText);
   details += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
   details += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
   details += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
@@ -5681,20 +5845,59 @@ String buildBleStatusJson() {
 String buildControlStatusJson() {
   ControlState controlSnapshot{};
   snapshotControlState(controlSnapshot);
+  const String state = controlStateFromSnapshot(controlSnapshot);
+  const String progress = controlProgressFromSnapshot(controlSnapshot);
   String payload = "{";
   payload += "\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
-  payload += ",\"control_pending\":\"" + String(controlActionName(controlSnapshot.pendingAction)) + "\"";
-  payload += ",\"control_action\":\"" + String(controlActionName(controlSnapshot.activeAction)) + "\"";
-  payload += ",\"control_last_action\":\"" + String(controlActionName(controlSnapshot.lastAction)) + "\"";
+  payload += ",\"control_state\":\"" + state + "\"";
+  payload += ",\"control_pending\":" + controlActionJson(controlSnapshot.pendingAction);
+  payload += ",\"control_action\":" + controlActionJson(controlSnapshot.activeAction);
+  payload += ",\"control_last_action\":" + controlActionJson(controlSnapshot.lastAction);
   payload += ",\"control_last_ok\":" + String(controlSnapshot.lastOk ? "true" : "false");
+  payload += ",\"control_error\":" + jsonNullableString(String(controlSnapshot.lastError));
+  payload += ",\"control_message\":" + jsonNullableString(String(controlSnapshot.lastMessage));
+  payload += ",\"control_progress\":\"" + jsonEscape(progress) + "\"";
+  payload += ",\"control_progress_text\":\"" + jsonEscape(controlProgressText(progress)) + "\"";
   payload += ",\"control_active_ms\":" + String(msSince(controlSnapshot.activeSinceMs));
   payload += ",\"control_last_finished_ms\":" + String(msSince(controlSnapshot.lastFinishedMs));
-  payload += ",\"control_last_message\":\"" + jsonEscape(String(controlSnapshot.lastMessage)) + "\"";
+  payload += ",\"control_last_message\":" + jsonNullableString(String(controlSnapshot.lastMessage));
+  payload += "}";
+  return payload;
+}
+
+String buildControlSummaryJson() {
+  ControlState controlSnapshot{};
+  snapshotControlState(controlSnapshot);
+  const String state = controlStateFromSnapshot(controlSnapshot);
+  const String progress = controlProgressFromSnapshot(controlSnapshot);
+  String payload = "{";
+  payload += "\"ok\":true";
+  payload += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
+  payload += ",\"control_state\":\"" + state + "\"";
+  payload += ",\"control_action\":" + controlActionJson(controlSnapshot.activeAction);
+  payload += ",\"control_pending\":" + controlActionJson(controlSnapshot.pendingAction);
+  payload += ",\"control_last_action\":" + controlActionJson(controlSnapshot.lastAction);
+  payload += ",\"control_last_ok\":" + String(controlSnapshot.lastOk ? "true" : "false");
+  payload += ",\"control_error\":" + jsonNullableString(String(controlSnapshot.lastError));
+  payload += ",\"control_message\":" + jsonNullableString(String(controlSnapshot.lastMessage));
+  payload += ",\"control_progress\":\"" + jsonEscape(progress) + "\"";
+  payload += ",\"control_progress_text\":\"" + jsonEscape(controlProgressText(progress)) + "\"";
+  payload += ",\"control_active_ms\":" + String(msSince(controlSnapshot.activeSinceMs));
+  payload += ",\"control_last_finished_ms\":" + String(msSince(controlSnapshot.lastFinishedMs));
+  payload += ",\"eta_sec\":" + String(controlSnapshot.busy ? controlActionEtaSec(controlSnapshot.activeAction) : 0);
+  payload += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
+  payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
+  payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
   payload += "}";
   return payload;
 }
 
 void handleStatus() {
+  ControlState controlSnapshot{};
+  snapshotControlState(controlSnapshot);
+  const String controlStateValue = controlStateFromSnapshot(controlSnapshot);
+  const String controlProgress = controlProgressFromSnapshot(controlSnapshot);
   String basic = "{";
   basic += "\"uptime_ms\":" + String(millis());
   basic += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
@@ -5704,8 +5907,24 @@ void handleStatus() {
   basic += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   basic += ",\"halow_rssi\":" + String(halowConnected ? HaLow.RSSI() : 0);
   basic += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  basic += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
+  basic += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
   basic += ",\"camera_target_wifi_ssid\":\"" + jsonEscape(cameraTargetWifiSsid) + "\"";
   basic += ",\"camera_target_ble_mac\":\"" + jsonEscape(cameraTargetBleMac) + "\"";
+  basic += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
+  basic += ",\"control_state\":\"" + controlStateValue + "\"";
+  basic += ",\"control_action\":" + controlActionJson(controlSnapshot.activeAction);
+  basic += ",\"control_pending\":" + controlActionJson(controlSnapshot.pendingAction);
+  basic += ",\"control_last_action\":" + controlActionJson(controlSnapshot.lastAction);
+  basic += ",\"control_last_ok\":" + String(controlSnapshot.lastOk ? "true" : "false");
+  basic += ",\"control_error\":" + jsonNullableString(String(controlSnapshot.lastError));
+  basic += ",\"control_message\":" + jsonNullableString(String(controlSnapshot.lastMessage));
+  basic += ",\"control_progress\":\"" + jsonEscape(controlProgress) + "\"";
+  basic += ",\"control_progress_text\":\"" + jsonEscape(controlProgressText(controlProgress)) + "\"";
+  basic += ",\"control_last_message\":" + jsonNullableString(String(controlSnapshot.lastMessage));
+  basic += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
+  basic += ",\"control\":";
+  basic += buildControlSummaryJson();
   basic += ",\"clock_valid\":" + String(onboardClockValid() ? "true" : "false");
   basic += ",\"storage_type\":\"" + String(persistentStorageType()) + "\"";
   basic += ",\"storage_ready\":" + String(onboardStorageReady ? "true" : "false");
@@ -5742,74 +5961,6 @@ void handleStatus() {
   basic += "}";
   server.send(200, "application/json", basic);
   return;
-
-  ControlState controlSnapshot{};
-  snapshotControlState(controlSnapshot);
-  String payload = "{";
-  payload += "\"uptime_ms\":" + String(millis());
-  payload += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
-  payload += ",\"boot_count\":" + String(persistentBootCount);
-  payload += ",\"boot_session_id\":" + String(bootSessionId);
-  payload += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
-  payload += ",\"wifi_ip\":\"" + WiFi.localIP().toString() + "\"";
-  payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
-  payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
-  payload += ",\"halow_mac\":\"" + HaLow.macAddress() + "\"";
-  payload += ",\"halow\":" + buildHaLowStatusJson();
-  payload += ",\"psram_found\":" + String(psramFound() ? "true" : "false");
-  payload += ",\"psram_size\":" + String(ESP.getPsramSize());
-  payload += ",\"psram_free\":" + String(ESP.getFreePsram());
-  payload += ",\"chip_temperature_c\":" + String(readChipTemperatureC(), 1);
-  payload += ",\"camera_ip\":\"" + CAMERA_IP.toString() + "\"";
-  payload += ",\"camera_wifi_ever_connected\":" + String(cameraWifiEverConnected ? "true" : "false");
-  payload += ",\"standby_requested\":" + String(standbyRequested ? "true" : "false");
-  payload += ",\"camera_session\":" + buildCameraSessionJson();
-  payload += ",\"timing\":" + buildTimingJson();
-  payload += ",\"stream_status\":" + buildStreamStatusJson();
-  payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
-  payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
-  payload += ",\"recoveries\":" + String(streamRecoveryAttempts);
-  payload += ",\"idle_recoveries\":" + String(idleRecoveryAttempts);
-  payload += ",\"http_keepalive_failures\":" + String(httpKeepaliveFailures);
-  payload += ",\"idle_recovery_last_ms\":" + String(msSince(lastIdleRecoveryMs));
-  payload += ",\"media_primary_packets\":" + String(mediaPrimaryPackets);
-  payload += ",\"media_primary_bytes\":" + String(mediaPrimaryBytes);
-  payload += ",\"media_secondary_packets\":" + String(mediaSecondaryPackets);
-  payload += ",\"media_secondary_bytes\":" + String(mediaSecondaryBytes);
-  payload += ",\"battery\":" + buildBatteryJson();
-  payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
-  payload += ",\"upload\":" + buildUploadStatusJson();
-  payload += ",\"wifi_scan_busy\":" + String(wifiScanBusy ? "true" : "false");
-  payload += ",\"wifi_scan_last_count\":" + String(wifiScanLastCount);
-  payload += ",\"wifi_scan_last_age_ms\":" + String(msSince(wifiScanLastMs));
-  payload += ",\"ble_wake_attempted\":" + String(bleWakeAttempted ? "true" : "false");
-  payload += ",\"ble_wake_confirmed\":" + String(bleWakeConfirmed ? "true" : "false");
-  payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
-  payload += ",\"ble_scan_mode\":\"" + jsonEscape(bleScanMode) + "\"";
-  payload += ",\"ble_scan_results\":" + String(bleScanResultCount);
-  payload += ",\"ble_scan_attempts\":" + String(bleScanAttemptCounter);
-  payload += ",\"ble_target_seen_count\":" + String(bleTargetSeenCount);
-  payload += ",\"ble_connect_attempts\":" + String(bleConnectAttempts);
-  payload += ",\"ble_last_connect_error\":" + String(bleLastConnectError);
-  payload += ",\"ble_last_seen_mac\":\"" + jsonEscape(bleLastSeenMac) + "\"";
-  payload += ",\"ble_last_seen_name\":\"" + jsonEscape(bleLastSeenName) + "\"";
-  payload += ",\"ble_last_seen_rssi\":" + String(bleLastSeenRssi);
-  payload += ",\"ble_best_seen_mac\":\"" + jsonEscape(bleBestSeenMac) + "\"";
-  payload += ",\"ble_best_seen_name\":\"" + jsonEscape(bleBestSeenName) + "\"";
-  payload += ",\"ble_best_seen_rssi\":" + String(bleBestSeenRssi);
-  payload += ",\"ble_recent_devices\":" + buildBleRecentDevicesJson();
-  payload += ",\"ble_notify_count\":" + String(bleNotifyCount);
-  payload += ",\"ble_last_notify\":\"" + jsonEscape(bleLastNotifyText) + "\"";
-  payload += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
-  payload += ",\"control_pending\":\"" + String(controlActionName(controlSnapshot.pendingAction)) + "\"";
-  payload += ",\"control_action\":\"" + String(controlActionName(controlSnapshot.activeAction)) + "\"";
-  payload += ",\"control_last_action\":\"" + String(controlActionName(controlSnapshot.lastAction)) + "\"";
-  payload += ",\"control_last_ok\":" + String(controlSnapshot.lastOk ? "true" : "false");
-  payload += ",\"control_active_ms\":" + String(msSince(controlSnapshot.activeSinceMs));
-  payload += ",\"control_last_finished_ms\":" + String(msSince(controlSnapshot.lastFinishedMs));
-  payload += ",\"control_last_message\":\"" + jsonEscape(String(controlSnapshot.lastMessage)) + "\"";
-  payload += "}";
-  server.send(200, "application/json", payload);
 }
 
 void handleBatteryStatus() {
@@ -5863,6 +6014,10 @@ void handleBleStatus() {
 
 void handleControlStatus() {
   server.send(200, "application/json", buildControlStatusJson());
+}
+
+void handleControlSummary() {
+  server.send(200, "application/json", buildControlSummaryJson());
 }
 
 void handleOnboardCameraStatus() {
@@ -6737,7 +6892,9 @@ void handleControlBringup() {
   payload += "\"ok\":" + String(accepted ? "true" : "false");
   payload += ",\"accepted\":" + String(accepted ? "true" : "false");
   payload += ",\"action\":\"bringup\"";
-  payload += ",\"message\":\"" + jsonEscape(message) + "\"";
+  payload += ",\"message\":" + jsonNullableString(message);
+  payload += ",\"eta_sec\":" + String(controlActionEtaSec(CONTROL_ACTION_BRINGUP));
+  payload += ",\"poll_path\":\"/control/summary\"";
   payload += "}";
   server.send(accepted ? 202 : 409, "application/json", payload);
 }
@@ -6749,7 +6906,9 @@ void handleControlStreamStart() {
   payload += "\"ok\":" + String(accepted ? "true" : "false");
   payload += ",\"accepted\":" + String(accepted ? "true" : "false");
   payload += ",\"action\":\"stream_start\"";
-  payload += ",\"message\":\"" + jsonEscape(message) + "\"";
+  payload += ",\"message\":" + jsonNullableString(message);
+  payload += ",\"eta_sec\":" + String(controlActionEtaSec(CONTROL_ACTION_STREAM_START));
+  payload += ",\"poll_path\":\"/control/summary\"";
   payload += "}";
   server.send(accepted ? 202 : 409, "application/json", payload);
 }
@@ -6761,7 +6920,9 @@ void handleControlStreamStop() {
   payload += "\"ok\":" + String(accepted ? "true" : "false");
   payload += ",\"accepted\":" + String(accepted ? "true" : "false");
   payload += ",\"action\":\"stream_stop\"";
-  payload += ",\"message\":\"" + jsonEscape(message) + "\"";
+  payload += ",\"message\":" + jsonNullableString(message);
+  payload += ",\"eta_sec\":" + String(controlActionEtaSec(CONTROL_ACTION_STREAM_STOP));
+  payload += ",\"poll_path\":\"/control/summary\"";
   payload += "}";
   server.send(accepted ? 202 : 409, "application/json", payload);
 }
@@ -6818,7 +6979,9 @@ void handleJobsPost() {
   payload += ",\"accepted\":" + String(accepted ? "true" : "false");
   payload += ",\"durable\":false";
   payload += ",\"action\":\"" + String(controlActionName(action)) + "\"";
-  payload += ",\"message\":\"" + jsonEscape(message) + "\"";
+  payload += ",\"message\":" + jsonNullableString(message);
+  payload += ",\"eta_sec\":" + String(controlActionEtaSec(action));
+  payload += ",\"poll_path\":\"/control/summary\"";
   payload += ",\"control\":";
   payload += buildControlStatusJson();
   payload += "}";
@@ -7187,6 +7350,7 @@ void startHttpServer() {
   server.on("/stream/status", HTTP_GET, handleStreamRuntimeStatus);
   server.on("/ble/status", HTTP_GET, handleBleStatus);
   server.on("/control/status", HTTP_GET, handleControlStatus);
+  server.on("/control/summary", HTTP_GET, handleControlSummary);
   server.on("/camera/raw", HTTP_GET, handleCameraRawGet);
   server.on("/camera/request", HTTP_GET, handleCameraRequest);
   server.on("/camera/request", HTTP_POST, handleCameraRequest);
