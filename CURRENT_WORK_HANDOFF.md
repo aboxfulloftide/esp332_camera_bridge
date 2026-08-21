@@ -14,6 +14,17 @@ Trail camera Wi-Fi SSID: CAM8Z8_A46DD49E4732
 Trail camera Wi-Fi password: 1234567890
 ```
 
+Second camera bench profile confirmed on 2026-08-20:
+
+```text
+Model: GardePro E6+
+BLE MAC: a4:c1:38:98:81:48
+BLE name: CAM8Z8_NoName_G_E6+
+Wi-Fi SSID: CAM8Z8_A4C138988148
+Wi-Fi password: 1234567890
+Camera HTTP: 192.168.8.1:8080
+```
+
 Browser repo:
 
 ```text
@@ -22,11 +33,19 @@ https://github.com/aboxfulloftide/esp332_camera_bridge
 
 ## Current flashed firmware
 
-Flashed over USB on 2026-08-20:
+Main bridge flashed over USB on 2026-08-20:
 
 ```text
 e7b41fa Add board HTTP listener recovery
 ```
+
+Current firmware flashed after second-camera validation:
+
+```text
+gardepro_dual_radio_bridge
+```
+
+The temporary `gardepro_camera_discovery` sketch was flashed first for bench profiling, then the main bridge was flashed back after multi-camera support was added.
 
 This includes:
 
@@ -123,6 +142,27 @@ Current limitation:
 - Jobs queue into the in-memory control worker.
 - SD-backed durable job persistence is still planned, not implemented.
 
+### Multi-camera GardePro target support
+
+The main bridge firmware now supports GardePro camera target selection from BLE discovery:
+
+- default target remains the original camera unless discovery finds a compatible camera
+- compatible cameras are detected by BLE name prefix `CAM8Z8_` or advertised service `6e000100-b5a3-f393-e0a9-e50e24dcca9e`
+- once a camera is selected, the bridge derives the matching Wi-Fi SSID from the BLE MAC:
+  - `a4:6d:d4:9e:47:32` -> `CAM8Z8_A46DD49E4732`
+  - `a4:c1:38:98:81:48` -> `CAM8Z8_A4C138988148`
+- `/status`, `/camera/status`, and `/ble/status` expose:
+  - `camera_target_ble_mac`
+  - `camera_target_ble_name`
+  - `camera_target_wifi_ssid`
+- USB serial command:
+
+```text
+camera_target [ble_mac] [wifi_ssid]
+```
+
+If `wifi_ssid` is omitted, the firmware derives `CAM8Z8_<BLE_MAC_WITHOUT_COLONS>`.
+
 ### Live view decoupling
 
 Live view is now treated as two layers:
@@ -161,6 +201,30 @@ Current post-flash state from serial:
 - battery estimate around `3.928V`
 - trail-camera Wi-Fi idle/down
 - scanner disabled
+
+Second-camera post-flash validation from main bridge:
+
+- serial `camera_target a4:c1:38:98:81:48` set:
+  - `camera_target_ble_mac`: `a4:c1:38:98:81:48`
+  - `camera_target_wifi_ssid`: `CAM8Z8_A4C138988148`
+- serial `bringup` succeeded:
+  - BLE advertisement found with name `CAM8Z8_NoName_G_E6+`
+  - BLE wake received three `OK` notifications
+  - camera hotspot became visible after about `7.76s`
+  - bridge joined camera Wi-Fi as `192.168.8.30`
+  - HaLow stayed up at `192.168.1.160`
+- HTTP over HaLow responded after bringup:
+  - `GET /healthz`
+  - `GET /status`
+  - `GET /camera/status`
+  - `GET /ble/status`
+- `/status` reported:
+  - `camera_target_wifi_ssid`: `CAM8Z8_A4C138988148`
+  - `camera_target_ble_mac`: `a4:c1:38:98:81:48`
+  - `wifi_connected`: `true`
+  - `clock_valid`: `true`
+  - `storage_ready`: `true`
+  - `scanner_schedule_enabled`: `false`
 
 ## What to test next
 

@@ -493,6 +493,22 @@ Latest live validation findings after the current stability patches:
   - advertised service `6e000100-b5a3-f393-e0a9-e50e24dcca9e`
   - wake write `AT+WAKEPULSE=10\r\n` to `6e400004`
   - three `OK` notifications received on `6e400004`
+- second-camera bench validation on 2026-08-20 confirmed a GardePro E6+ uses
+  the same BLE wake and camera HTTP API:
+  - BLE MAC `a4:c1:38:98:81:48`
+  - BLE name `CAM8Z8_NoName_G_E6+`
+  - Wi-Fi SSID `CAM8Z8_A4C138988148`
+  - camera HTTP `192.168.8.1:8080`
+  - `/cmd/info/1` reports brand `GardePro`, product/model `E6+`,
+    version `V82.2.152 MCU V84`
+  - `/media/pic/take` returned OK and `/media/pic/result` returned
+    `fileIdx: 1`
+- bridge firmware now tracks the active camera target from BLE discovery and
+  derives the Wi-Fi SSID from the selected camera MAC, so a second E6/E6+
+  camera can be used without changing the hardcoded Wi-Fi SSID
+- serial `camera_target [ble_mac] [wifi_ssid]` can force a specific camera
+  during USB debugging; if `wifi_ssid` is omitted the firmware derives
+  `CAM8Z8_<BLE_MAC_WITHOUT_COLONS>`
 - unified firmware validation after the NimBLE migration succeeded:
   - board hostname `trail_esp32`
   - HaLow IP `192.168.1.160`

@@ -54,8 +54,12 @@ extern "C" {
  */
 
 // 2.4 GHz camera hotspot
-static const char *CAMERA_WIFI_SSID = "CAM8Z8_A46DD49E4732";
-static const char *CAMERA_WIFI_PASS = "1234567890";
+#ifndef CAMERA_WIFI_SSID
+#define CAMERA_WIFI_SSID "CAM8Z8_A46DD49E4732"
+#endif
+#ifndef CAMERA_WIFI_PASS
+#define CAMERA_WIFI_PASS "1234567890"
+#endif
 static const IPAddress CAMERA_IP(192, 168, 8, 1);
 static const uint16_t CAMERA_HTTP_PORT = 8080;
 static const uint16_t CAMERA_RTSP_PORT = 554;
@@ -121,14 +125,33 @@ static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
 static const char *FIRMWARE_VERSION = "0.1.0";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
-static const char *CAMERA_BLE_MAC = "a4:6d:d4:9e:47:32";
-static const char *CAMERA_BLE_WAKE = "AT+WAKEPULSE=10\r\n";
-static const char *CAMERA_BLE_NAME = "CAM8Z8_NoName_G_E6";
-static const char *CAMERA_BLE_NAME_PREFIX = "CAM8Z8_";
-static const char *CAMERA_BLE_SERVICE_UUID = "6e000100-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *CAMERA_BLE_GATT_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *CAMERA_BLE_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *CAMERA_BLE_DATA_UUID = "6e400004-b5a3-f393-e0a9-e50e24dcca9e";
+#ifndef CAMERA_BLE_MAC
+#define CAMERA_BLE_MAC "a4:6d:d4:9e:47:32"
+#endif
+#ifndef CAMERA_BLE_WAKE
+#define CAMERA_BLE_WAKE "AT+WAKEPULSE=10\r\n"
+#endif
+#ifndef CAMERA_BLE_NAME
+#define CAMERA_BLE_NAME "CAM8Z8_NoName_G_E6"
+#endif
+#ifndef CAMERA_BLE_NAME_PREFIX
+#define CAMERA_BLE_NAME_PREFIX "CAM8Z8_"
+#endif
+#ifndef CAMERA_BLE_SERVICE_UUID
+#define CAMERA_BLE_SERVICE_UUID "6e000100-b5a3-f393-e0a9-e50e24dcca9e"
+#endif
+#ifndef CAMERA_BLE_GATT_SERVICE_UUID
+#define CAMERA_BLE_GATT_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#endif
+#ifndef CAMERA_BLE_NOTIFY_UUID
+#define CAMERA_BLE_NOTIFY_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+#endif
+#ifndef CAMERA_BLE_DATA_UUID
+#define CAMERA_BLE_DATA_UUID "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
+#endif
+#ifndef CAMERA_DISCOVER_ANY_GARDEPRO
+#define CAMERA_DISCOVER_ANY_GARDEPRO 1
+#endif
 static const size_t BLE_RECENT_DEVICE_SLOTS = 16;
 
 #ifndef ONBOARD_CAPTURE_INTERVAL_MS
@@ -186,6 +209,9 @@ int bleLastSeenRssi = -127;
 int bleBestSeenRssi = -127;
 String bleBestSeenMac;
 String bleBestSeenName;
+String cameraTargetBleMac = CAMERA_BLE_MAC;
+String cameraTargetBleName = CAMERA_BLE_NAME;
+String cameraTargetWifiSsid = CAMERA_WIFI_SSID;
 uint32_t bleScanResultCount = 0;
 uint32_t bleTargetSeenCount = 0;
 uint32_t bleScanAttemptCounter = 0;
@@ -3094,16 +3120,41 @@ String buildBleRecentDevicesJson() {
   return payload;
 }
 
+String cameraWifiSsidFromBleMac(const String &mac) {
+  String suffix = mac;
+  suffix.replace(":", "");
+  suffix.toUpperCase();
+  if (suffix.length() != 12) {
+    return "";
+  }
+  return String(CAMERA_BLE_NAME_PREFIX) + suffix;
+}
+
+void setCameraTargetFromAdvertisement(const String &mac, const String &name) {
+  cameraTargetBleMac = mac;
+  cameraTargetBleName = name;
+  const String derivedSsid = cameraWifiSsidFromBleMac(mac);
+  if (!derivedSsid.isEmpty()) {
+    cameraTargetWifiSsid = derivedSsid;
+  }
+  Serial.printf("[camera-target] ble_mac=%s name=%s wifi_ssid=%s\n",
+                cameraTargetBleMac.c_str(),
+                cameraTargetBleName.c_str(),
+                cameraTargetWifiSsid.c_str());
+}
+
 bool advertisedDeviceLooksLikeCamera(const String &mac, const String &name, const String &serviceUuid) {
-  if (mac.equalsIgnoreCase(CAMERA_BLE_MAC)) {
+  if (!cameraTargetBleMac.isEmpty() && mac.equalsIgnoreCase(cameraTargetBleMac)) {
     return true;
   }
   if (!name.isEmpty() && (name == CAMERA_BLE_NAME || name.startsWith(CAMERA_BLE_NAME_PREFIX))) {
     return true;
   }
+#if CAMERA_DISCOVER_ANY_GARDEPRO
   if (!serviceUuid.isEmpty() && serviceUuid == CAMERA_BLE_SERVICE_UUID) {
     return true;
   }
+#endif
   return false;
 }
 
@@ -3241,6 +3292,7 @@ class BridgeBleAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
       Serial.println();
       bleTargetDevice = *advertisedDevice;
       bleTargetDeviceFound = true;
+      setCameraTargetFromAdvertisement(mac, name);
       NimBLEDevice::getScan()->stop();
     } else if (bleScanResultCount <= 5 || (bleScanResultCount % 25) == 0) {
       Serial.printf("[BLE] saw advertisement mac=%s rssi=%d", mac.c_str(), rssi);
@@ -3707,7 +3759,9 @@ bool runExactBleWake() {
   bleStage = "scan";
   resetBleScanStats();
 
-  Serial.printf("[BLE] scanning for target %s\n", CAMERA_BLE_MAC);
+  Serial.printf("[BLE] scanning for camera target current=%s discover_any=%s\n",
+                cameraTargetBleMac.c_str(),
+                CAMERA_DISCOVER_ANY_GARDEPRO ? "yes" : "no");
   closeBleWakeSession();
   NimBLEDevice::deinit(true);
   bleInitialized = false;
@@ -3846,6 +3900,7 @@ void printSerialHelp() {
   Serial.println("  upload_telemetry");
   Serial.println("  upload_events");
   Serial.println("  upload_all");
+  Serial.println("  camera_target [ble_mac] [wifi_ssid]");
   Serial.println("  rtsp <METHOD> <url>");
   Serial.println("  wake");
   Serial.println("  bleclose");
@@ -3853,7 +3908,7 @@ void printSerialHelp() {
 
 void connectCameraWifi() {
   const unsigned long connectStartedMs = millis();
-  Serial.printf("Connecting camera WiFi SSID %s\n", CAMERA_WIFI_SSID);
+  Serial.printf("Connecting camera WiFi SSID %s\n", cameraTargetWifiSsid.c_str());
   WiFi.persistent(false);
   WiFi.mode(WIFI_MODE_STA);
   WiFi.setHostname(BOARD_HOSTNAME);
@@ -3868,16 +3923,16 @@ void connectCameraWifi() {
   for (int i = 0; i < count; ++i) {
     const String ssid = WiFi.SSID(i);
     const int rssi = WiFi.RSSI(i);
-    if (ssid == CAMERA_WIFI_SSID) {
+    if (ssid == cameraTargetWifiSsid) {
       foundTarget = true;
       Serial.printf("Found target SSID %s RSSI=%d\n", ssid.c_str(), rssi);
     }
   }
   if (!foundTarget) {
-    Serial.printf("Target SSID %s not seen in scan\n", CAMERA_WIFI_SSID);
+    Serial.printf("Target SSID %s not seen in scan\n", cameraTargetWifiSsid.c_str());
   }
 
-  WiFi.begin(CAMERA_WIFI_SSID, CAMERA_WIFI_PASS);
+  WiFi.begin(cameraTargetWifiSsid.c_str(), CAMERA_WIFI_PASS);
 
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
@@ -3984,7 +4039,7 @@ void scanCameraWifiPresence() {
   bool foundTarget = false;
   for (int i = 0; i < count; ++i) {
     const String ssid = WiFi.SSID(i);
-    if (ssid == CAMERA_WIFI_SSID) {
+    if (ssid == cameraTargetWifiSsid) {
       foundTarget = true;
       Serial.printf("Target SSID %s visible RSSI=%d channel=%d\n",
                     ssid.c_str(),
@@ -3993,7 +4048,7 @@ void scanCameraWifiPresence() {
     }
   }
   if (!foundTarget) {
-    Serial.printf("Target SSID %s still not visible\n", CAMERA_WIFI_SSID);
+    Serial.printf("Target SSID %s still not visible\n", cameraTargetWifiSsid.c_str());
   }
 }
 
@@ -4004,7 +4059,7 @@ bool waitForCameraWifiPresence(unsigned long timeoutMs, unsigned long intervalMs
     const int count = WiFi.scanNetworks();
     for (int i = 0; i < count; ++i) {
       const String ssid = WiFi.SSID(i);
-      if (ssid == CAMERA_WIFI_SSID) {
+      if (ssid == cameraTargetWifiSsid) {
         lastHotspotWaitElapsedMs = millis() - start;
         Serial.printf("Target SSID %s became visible RSSI=%d channel=%d after %lu ms\n",
                       ssid.c_str(),
@@ -4015,7 +4070,7 @@ bool waitForCameraWifiPresence(unsigned long timeoutMs, unsigned long intervalMs
       }
     }
     Serial.printf("Target SSID %s not visible yet after %lu ms\n",
-                  CAMERA_WIFI_SSID,
+                  cameraTargetWifiSsid.c_str(),
                   millis() - start);
     const unsigned long pollMs = elapsedMs < BRINGUP_HOTSPOT_FAST_WINDOW_MS
                                    ? BRINGUP_HOTSPOT_FAST_POLL_MS
@@ -5446,6 +5501,9 @@ String buildWifiStatusJson() {
 String buildCameraBridgeStatusJson() {
   String payload = "{";
   payload += "\"camera_ip\":\"" + CAMERA_IP.toString() + "\"";
+  payload += ",\"camera_target_ble_mac\":\"" + jsonEscape(cameraTargetBleMac) + "\"";
+  payload += ",\"camera_target_ble_name\":\"" + jsonEscape(cameraTargetBleName) + "\"";
+  payload += ",\"camera_target_wifi_ssid\":\"" + jsonEscape(cameraTargetWifiSsid) + "\"";
   payload += ",\"camera_wifi_ever_connected\":" + String(cameraWifiEverConnected ? "true" : "false");
   payload += ",\"standby_requested\":" + String(standbyRequested ? "true" : "false");
   payload += ",\"session\":" + buildCameraSessionJson();
@@ -5473,6 +5531,9 @@ String buildStreamRuntimeStatusJson() {
 String buildBleStatusJson() {
   String payload = "{";
   payload += "\"scheduled_scans_enabled\":" + String(scannerScheduleEnabled ? "true" : "false");
+  payload += ",\"camera_target_ble_mac\":\"" + jsonEscape(cameraTargetBleMac) + "\"";
+  payload += ",\"camera_target_ble_name\":\"" + jsonEscape(cameraTargetBleName) + "\"";
+  payload += ",\"camera_target_wifi_ssid\":\"" + jsonEscape(cameraTargetWifiSsid) + "\"";
   payload += ",\"ble_wake_attempted\":" + String(bleWakeAttempted ? "true" : "false");
   payload += ",\"ble_wake_confirmed\":" + String(bleWakeConfirmed ? "true" : "false");
   payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
@@ -5535,6 +5596,8 @@ void handleStatus() {
   basic += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   basic += ",\"halow_rssi\":" + String(halowConnected ? HaLow.RSSI() : 0);
   basic += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  basic += ",\"camera_target_wifi_ssid\":\"" + jsonEscape(cameraTargetWifiSsid) + "\"";
+  basic += ",\"camera_target_ble_mac\":\"" + jsonEscape(cameraTargetBleMac) + "\"";
   basic += ",\"clock_valid\":" + String(onboardClockValid() ? "true" : "false");
   basic += ",\"storage_type\":\"" + String(persistentStorageType()) + "\"";
   basic += ",\"storage_ready\":" + String(onboardStorageReady ? "true" : "false");
@@ -7361,6 +7424,34 @@ void handleSerialCommand(const String &line) {
                   telemetryStatus,
                   eventsOk ? "ok" : "failed",
                   eventsStatus);
+    return;
+  }
+  if (cmd.startsWith("camera_target")) {
+    String args = cmd.substring(strlen("camera_target"));
+    args.trim();
+    if (!args.isEmpty()) {
+      const int split = args.indexOf(' ');
+      String mac = split >= 0 ? args.substring(0, split) : args;
+      String ssid = split >= 0 ? args.substring(split + 1) : "";
+      mac.trim();
+      ssid.trim();
+      mac.toLowerCase();
+      cameraTargetBleMac = mac;
+      cameraTargetBleName = "";
+      if (!ssid.isEmpty()) {
+        cameraTargetWifiSsid = ssid;
+      } else {
+        const String derivedSsid = cameraWifiSsidFromBleMac(mac);
+        if (!derivedSsid.isEmpty()) {
+          cameraTargetWifiSsid = derivedSsid;
+        }
+      }
+      bleTargetDeviceFound = false;
+    }
+    Serial.printf("[camera-target] ble_mac=%s name=%s wifi_ssid=%s\n",
+                  cameraTargetBleMac.c_str(),
+                  cameraTargetBleName.c_str(),
+                  cameraTargetWifiSsid.c_str());
     return;
   }
   if (cmd == "selftest") {

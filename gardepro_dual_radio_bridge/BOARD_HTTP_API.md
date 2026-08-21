@@ -22,6 +22,8 @@ Representative fields:
 - `halow_ip`
 - `halow_rssi`
 - `wifi_connected`
+- `camera_target_wifi_ssid`
+- `camera_target_ble_mac`
 - `clock_valid`
 - `storage_type`
 - `storage_ready`
@@ -103,6 +105,9 @@ The firmware currently does not expose trail-camera Wi-Fi RSSI here. BLE RSSI fo
 Trail-camera bridge state:
 
 - `camera_ip`
+- `camera_target_ble_mac`
+- `camera_target_ble_name`
+- `camera_target_wifi_ssid`
 - `camera_wifi_ever_connected`
 - `standby_requested`
 - `session`
@@ -142,6 +147,9 @@ Trail-camera BLE wake/discovery plus BLE scanner counters.
 
 Important fields:
 
+- `camera_target_ble_mac`
+- `camera_target_ble_name`
+- `camera_target_wifi_ssid`
 - `ble_wake_attempted`
 - `ble_wake_confirmed`
 - `ble_stage`
@@ -161,6 +169,12 @@ Important fields:
 - `scanner`
 
 Camera BLE signal strength is currently exposed as `ble_last_seen_rssi` / `ble_best_seen_rssi`.
+
+Camera target behavior:
+
+- Default target remains the original E6 profile unless overridden in `local_config.h`.
+- The bridge can discover compatible GardePro cameras by BLE name prefix `CAM8Z8_` or advertised service `6e000100-b5a3-f393-e0a9-e50e24dcca9e`.
+- When a compatible camera is selected from BLE advertising, the firmware derives the Wi-Fi SSID from the BLE MAC. Example: `a4:c1:38:98:81:48` -> `CAM8Z8_A4C138988148`.
 
 ### `GET /control/status`
 

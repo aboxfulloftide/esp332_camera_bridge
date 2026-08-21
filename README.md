@@ -4,6 +4,8 @@ This repository contains the current GardePro ESP32 bridge work:
 
 - `gardepro_dual_radio_bridge/`
   - ESP32 dual-radio bridge sketch
+- `gardepro_camera_discovery/`
+  - small USB-serial firmware for profiling another GardePro camera model before adding it to the main bridge
 - `gardepro_server_api.py`
   - Python client for the board HTTP bridge
 - `gardepro_server_jobs.py`
