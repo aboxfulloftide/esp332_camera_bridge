@@ -24,9 +24,83 @@ heltec:esp_halow:HT-HC33:PSRAM=opi
 
 `PSRAM=opi` is required for the onboard camera’s UXGA mode.
 
-## Recommended Windows setup
+## Linux quick setup (Debian/Ubuntu)
 
-Use WSL2 Ubuntu if possible. It most closely matches the current development machine.
+The project is developed with Arduino CLI. Arduino IDE is optional.
+
+Install basic host tools:
+
+```bash
+sudo apt update
+sudo apt install -y git curl python3 python3-pip python3-venv
+```
+
+Install the current Arduino CLI release from the official
+[Arduino CLI releases](https://github.com/arduino/arduino-cli/releases). Put the
+`arduino-cli` binary in `~/.local/bin`, and make sure that directory is in
+`PATH`. Verify it with:
+
+```bash
+arduino-cli version
+```
+
+The HT-HC33 does **not** use the normal Espressif core or Heltec's ordinary
+ESP32 core. Install Heltec's separate HaLow core:
+
+```bash
+mkdir -p ~/Arduino/hardware/heltec
+git clone https://github.com/HelTecAutomation/ESP_HaLow.git \
+  ~/Arduino/hardware/heltec/esp_halow
+git -C ~/Arduino/hardware/heltec/esp_halow checkout v2.8.2.0
+cd ~/Arduino/hardware/heltec/esp_halow/tools
+python3 get.py
+
+# Heltec's Linux sources use inconsistent filename capitalization.
+test -e ../libraries/wifi-halow/src/Halow.h || \
+  ln -s HaLow.h ../libraries/wifi-halow/src/Halow.h
+cd -
+```
+
+Run `get.py` from its `tools` directory as shown: the script extracts relative
+to the current directory. Release `v2.8.2.0` is pinned because its HaLow event
+API matches this firmware; the upstream `main` branch currently does not.
+
+Then initialize Arduino CLI and install the firmware's external BLE library:
+
+```bash
+arduino-cli config init
+arduino-cli lib install "NimBLE-Arduino@2.5.1"
+arduino-cli core list
+arduino-cli board listall heltec:esp_halow
+```
+
+Expected output includes `heltec:esp_halow 3.0.0` and both `HT-HC33` board
+definitions. Do not also install `esp32:esp32` merely for this firmware; it is
+not required by the HT-HC33 build.
+
+### Linux USB permissions
+
+On Debian/Ubuntu, add your login to `dialout` once:
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+Log out and back in after changing group membership. Check the connection with:
+
+```bash
+groups
+arduino-cli board list
+ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
+```
+
+The board has normally appeared as `/dev/ttyUSB0`. If no port appears, try a
+known data-capable USB cable and check `dmesg --follow` while reconnecting it.
+Do not run Arduino CLI with `sudo`; fix device permissions instead.
+
+## Optional Windows setup
+
+Use WSL2 Ubuntu if possible. It most closely matches the Linux setup above.
 
 ### Windows prerequisites
 
@@ -88,11 +162,10 @@ Do not commit `local_config.h`.
 
 Install Arduino CLI, then install/configure:
 
-- ESP32 core
 - Heltec ESP32 HaLow core
 - NimBLE-Arduino
 
-The current Linux machine has toolchain pieces under:
+Arduino CLI and the Heltec installer place toolchain pieces under:
 
 ```text
 /home/matheau/.arduino15/
@@ -107,10 +180,9 @@ Check installed cores:
 arduino-cli core list
 ```
 
-Expected current cores on the working machine:
+Expected core for this project:
 
 ```text
-esp32:esp32      3.3.7
 heltec:esp_halow 3.0.0
 ```
 
@@ -138,13 +210,25 @@ The current board normally appears as:
 
 ## Build and flash over USB
 
-From the repo root in WSL:
+From the repo root on Linux or in WSL:
 
 ```bash
-./build.sh /home/<user>/esp332_camera_bridge/gardepro_dual_radio_bridge /dev/ttyUSB0
+./build.sh gardepro_dual_radio_bridge /dev/ttyUSB0
 ```
 
-If your local path differs, adjust the first argument.
+The sketch argument is optional because `build.sh` defaults to the main firmware:
+
+```bash
+./build.sh
+```
+
+Compile without a connected board or without uploading:
+
+```bash
+arduino-cli compile \
+  --fqbn heltec:esp_halow:HT-HC33:PSRAM=opi \
+  gardepro_dual_radio_bridge
+```
 
 Equivalent Arduino CLI command:
 

@@ -12,10 +12,12 @@
 #include <halow_SD.h>
 #include <SPI.h>
 #include <Update.h>
+#include <esp_system.h>
 #include <uri/UriRegex.h>
 #include <algorithm>
 #include <vector>
 #include <stdint.h>
+#include <stddef.h>
 #include <time.h>
 #include <sys/time.h>
 #include <errno.h>
@@ -123,8 +125,17 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 // API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
-static const char *FIRMWARE_VERSION = "0.1.0";
+static const char *FIRMWARE_VERSION = "0.2.5";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
+static const char *DIAGNOSTIC_DIR = "/diagnostics";
+static const char *DIAGNOSTIC_LOG_PATH = "/diagnostics/health.jsonl";
+static const char *DURABLE_JOB_DIR = "/jobs";
+static const char *DURABLE_JOB_STATE_PATH = "/jobs/media_job.bin";
+static const char *DURABLE_JOB_STATE_TEMP_PATH = "/jobs/media_job.tmp";
+static const char *DURABLE_JOB_MANIFEST_PATH = "/jobs/media_manifest.bin";
+static const char *TRAIL_MEDIA_DIR = "/trail_media";
+static const unsigned long DIAGNOSTIC_SD_INTERVAL_MS = 300000UL;
+static const unsigned long DIAGNOSTIC_NVS_INTERVAL_MS = 21600000UL;
 #ifndef CAMERA_BLE_MAC
 #define CAMERA_BLE_MAC "a4:6d:d4:9e:47:32"
 #endif
@@ -281,7 +292,7 @@ static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
 #define CAMERA_AUTO_RECOVERY_ENABLED 0
 #endif
 #ifndef HTTP_SERVER_IDLE_RESTART_MS
-#define HTTP_SERVER_IDLE_RESTART_MS 120000UL
+#define HTTP_SERVER_IDLE_RESTART_MS 0UL
 #endif
 static const BaseType_t CONTROL_WORKER_CORE = 0;
 static const uint8_t BLE_SCAN_ATTEMPTS = 3;
@@ -497,6 +508,21 @@ size_t bleObservationEntryCount = 0;
 Preferences runtimePrefs;
 uint32_t persistentBootCount = 0;
 uint32_t bootSessionId = 0;
+esp_reset_reason_t currentResetReason = ESP_RST_UNKNOWN;
+String currentResetReasonName = "unknown";
+String firmwareSketchMd5;
+bool previousBootOperational = false;
+uint32_t previousBootUptimeMs = 0;
+uint32_t previousBootBatteryMv = 0;
+int16_t previousBootTemperatureDeciC = 0;
+uint32_t previousBootFreeHeap = 0;
+bool previousBootHaLowConnected = false;
+bool bootMarkedOperational = false;
+unsigned long lastDiagnosticSdMs = 0;
+unsigned long lastDiagnosticNvsMs = 0;
+uint32_t diagnosticSdWriteCount = 0;
+uint32_t diagnosticSdWriteFailures = 0;
+uint32_t diagnosticNvsWriteCount = 0;
 
 static const size_t UPLOAD_EVENT_QUEUE_SIZE = 12;
 String uploadEventQueue[UPLOAD_EVENT_QUEUE_SIZE];
@@ -601,6 +627,62 @@ enum ControlAction : uint8_t {
   CONTROL_ACTION_STREAM_STOP = 3,
   CONTROL_ACTION_TRIGGER_PHOTO = 4,
 };
+
+enum DurableMediaJobAction : uint8_t {
+  DURABLE_MEDIA_ACTION_NONE = 0,
+  DURABLE_MEDIA_ACTION_DOWNLOAD_ALL = 1,
+  DURABLE_MEDIA_ACTION_DOWNLOAD_AND_DELETE = 2,
+};
+
+enum DurableMediaJobStatus : uint8_t {
+  DURABLE_MEDIA_IDLE = 0,
+  DURABLE_MEDIA_QUEUED = 1,
+  DURABLE_MEDIA_RUNNING = 2,
+  DURABLE_MEDIA_WAITING_RETRY = 3,
+  DURABLE_MEDIA_SUCCEEDED = 4,
+  DURABLE_MEDIA_FAILED = 5,
+  DURABLE_MEDIA_CANCELLED = 6,
+};
+
+struct DurableMediaJobState {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t action;
+  uint8_t status;
+  uint32_t jobId;
+  uint32_t createdBoot;
+  uint32_t updatedBoot;
+  uint32_t manifestCount;
+  uint32_t currentIndex;
+  uint32_t downloadedCount;
+  uint32_t skippedCount;
+  uint32_t deletedCount;
+  uint32_t retryCount;
+  uint32_t bytesDownloaded;
+  uint32_t currentMediaId;
+  char stage[32];
+  char lastError[96];
+  uint32_t checksum;
+} __attribute__((packed));
+
+struct DurableMediaRecord {
+  uint32_t id;
+  uint8_t type;
+  uint8_t reserved[3];
+  uint32_t expectedBytes;
+  char uid[24];
+  char date[24];
+} __attribute__((packed));
+
+static const uint32_t DURABLE_MEDIA_JOB_MAGIC = 0x47504A42UL;
+static const uint16_t DURABLE_MEDIA_JOB_VERSION = 1;
+static const unsigned long DURABLE_MEDIA_RETRY_MS = 10000UL;
+DurableMediaJobState durableMediaJob{};
+bool durableMediaJobLoaded = false;
+unsigned long durableMediaNextRetryMs = 0;
+SemaphoreHandle_t durableMediaJobMutex = nullptr;
+
+String buildDurableMediaJobJson();
 
 struct ControlState {
   portMUX_TYPE lock;
@@ -1224,21 +1306,51 @@ String buildHaLowStatusJson() {
   return payload;
 }
 
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external_pin";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT: return "task_watchdog";
+    case ESP_RST_WDT: return "other_watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
+
 void initBootIdentity() {
+  currentResetReason = esp_reset_reason();
+  currentResetReasonName = resetReasonName(currentResetReason);
+  firmwareSketchMd5 = ESP.getSketchMD5();
   if (!runtimePrefs.begin("runtime", false)) {
     Serial.println("[boot] failed to open runtime preferences");
     persistentBootCount = 0;
     bootSessionId = millis();
     return;
   }
+  previousBootOperational = runtimePrefs.getBool("boot_ok", false);
+  previousBootUptimeMs = runtimePrefs.getUInt("last_up_ms", 0);
+  previousBootBatteryMv = runtimePrefs.getUInt("last_bat_mv", 0);
+  previousBootTemperatureDeciC = runtimePrefs.getShort("last_temp", 0);
+  previousBootFreeHeap = runtimePrefs.getUInt("last_heap", 0);
+  previousBootHaLowConnected = runtimePrefs.getBool("last_halow", false);
   persistentBootCount = runtimePrefs.getUInt("boot_count", 0) + 1;
   runtimePrefs.putUInt("boot_count", persistentBootCount);
+  runtimePrefs.putBool("boot_ok", false);
   runtimePrefs.end();
   bootSessionId = persistentBootCount;
-  Serial.printf("[boot] boot_count=%u boot_session_id=%u uptime_ms=%lu\n",
+  Serial.printf("[boot] boot_count=%u boot_session_id=%u reset=%s(%d) previous_operational=%s previous_uptime_ms=%u firmware_md5=%s\n",
                 persistentBootCount,
                 bootSessionId,
-                millis());
+                currentResetReasonName.c_str(),
+                static_cast<int>(currentResetReason),
+                previousBootOperational ? "yes" : "no",
+                previousBootUptimeMs,
+                firmwareSketchMd5.c_str());
 }
 
 String minuteOfDayToString(uint16_t minuteOfDay) {
@@ -1948,6 +2060,117 @@ bool mountSdCard(uint32_t frequency = 4000000UL) {
                 SD.totalBytes() / (1024ULL * 1024ULL),
                 SD.usedBytes() / (1024ULL * 1024ULL));
   return true;
+}
+
+String buildDiagnosticStatusJson() {
+  const uint32_t adcMv = readBatteryAdcMilliVolts(16);
+  const uint32_t batteryMv = adcMv * 2;
+  const int16_t temperatureDeciC = static_cast<int16_t>(readChipTemperatureC() * 10.0f);
+  String payload = "{";
+  payload += "\"boot_count\":" + String(persistentBootCount);
+  payload += ",\"boot_session_id\":" + String(bootSessionId);
+  payload += ",\"uptime_ms\":" + String(millis());
+  payload += ",\"reset_reason_code\":" + String(static_cast<int>(currentResetReason));
+  payload += ",\"reset_reason\":\"" + jsonEscape(currentResetReasonName) + "\"";
+  payload += ",\"boot_operational\":" + String(bootMarkedOperational ? "true" : "false");
+  payload += ",\"firmware_version\":\"" + jsonEscape(FIRMWARE_VERSION) + "\"";
+  payload += ",\"firmware_build\":\"" + jsonEscape(FIRMWARE_BUILD) + "\"";
+  payload += ",\"firmware_md5\":\"" + jsonEscape(firmwareSketchMd5) + "\"";
+  payload += ",\"battery_mv\":" + String(batteryMv);
+  payload += ",\"chip_temperature_c\":" + String(temperatureDeciC / 10.0f, 1);
+  payload += ",\"free_heap\":" + String(ESP.getFreeHeap());
+  payload += ",\"minimum_free_heap\":" + String(ESP.getMinFreeHeap());
+  payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
+  payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
+  payload += ",\"sd_ready\":" + String(sdReady ? "true" : "false");
+  payload += ",\"sd_write_count\":" + String(diagnosticSdWriteCount);
+  payload += ",\"sd_write_failures\":" + String(diagnosticSdWriteFailures);
+  payload += ",\"nvs_write_count\":" + String(diagnosticNvsWriteCount);
+  payload += ",\"previous_boot\":{";
+  payload += "\"operational\":" + String(previousBootOperational ? "true" : "false");
+  payload += ",\"last_checkpoint_uptime_ms\":" + String(previousBootUptimeMs);
+  payload += ",\"battery_mv\":" + String(previousBootBatteryMv);
+  payload += ",\"chip_temperature_c\":" + String(previousBootTemperatureDeciC / 10.0f, 1);
+  payload += ",\"free_heap\":" + String(previousBootFreeHeap);
+  payload += ",\"halow_connected\":" + String(previousBootHaLowConnected ? "true" : "false");
+  payload += "}}";
+  return payload;
+}
+
+bool writeDiagnosticCheckpointNvs(bool operational) {
+  const uint32_t adcMv = readBatteryAdcMilliVolts(16);
+  if (!runtimePrefs.begin("runtime", false)) {
+    Serial.println("[diagnostics] failed to open runtime preferences");
+    return false;
+  }
+  runtimePrefs.putBool("boot_ok", operational);
+  runtimePrefs.putUInt("last_up_ms", millis());
+  runtimePrefs.putUInt("last_bat_mv", adcMv * 2);
+  runtimePrefs.putShort("last_temp", static_cast<int16_t>(readChipTemperatureC() * 10.0f));
+  runtimePrefs.putUInt("last_heap", ESP.getFreeHeap());
+  runtimePrefs.putBool("last_halow", halowConnected);
+  runtimePrefs.end();
+  ++diagnosticNvsWriteCount;
+  lastDiagnosticNvsMs = millis();
+  return true;
+}
+
+bool appendDiagnosticJournal(const char *eventName) {
+  if (!sdReady) {
+    ++diagnosticSdWriteFailures;
+    return false;
+  }
+  if (!ensureFsDir(SD, DIAGNOSTIC_DIR)) {
+    ++diagnosticSdWriteFailures;
+    return false;
+  }
+  File existing = SD.open(DIAGNOSTIC_LOG_PATH, FILE_READ);
+  const size_t existingSize = existing ? existing.size() : 0;
+  if (existing) existing.close();
+  if (existingSize > 2UL * 1024UL * 1024UL) {
+    SD.remove("/diagnostics/health.previous.jsonl");
+    SD.rename(DIAGNOSTIC_LOG_PATH, "/diagnostics/health.previous.jsonl");
+  }
+  File log = SD.open(DIAGNOSTIC_LOG_PATH, FILE_APPEND);
+  if (!log) {
+    ++diagnosticSdWriteFailures;
+    return false;
+  }
+  String record = "{";
+  record += "\"event\":\"" + jsonEscape(String(eventName)) + "\"";
+  record += ",\"epoch\":" + String(onboardClockValid() ? static_cast<unsigned long>(time(nullptr)) : 0UL);
+  record += ",\"diagnostics\":" + buildDiagnosticStatusJson();
+  record += "}\n";
+  const bool ok = log.print(record) == record.length();
+  log.flush();
+  log.close();
+  if (ok) {
+    ++diagnosticSdWriteCount;
+    lastDiagnosticSdMs = millis();
+  } else {
+    ++diagnosticSdWriteFailures;
+  }
+  return ok;
+}
+
+void markBootOperational() {
+  if (bootMarkedOperational) return;
+  bootMarkedOperational = true;
+  writeDiagnosticCheckpointNvs(true);
+  appendDiagnosticJournal("boot_operational");
+  Serial.printf("[diagnostics] boot operational reset=%s previous_operational=%s\n",
+                currentResetReasonName.c_str(),
+                previousBootOperational ? "yes" : "no");
+}
+
+void servicePersistentDiagnostics() {
+  if (sdReady && (lastDiagnosticSdMs == 0 || millis() - lastDiagnosticSdMs >= DIAGNOSTIC_SD_INTERVAL_MS)) {
+    appendDiagnosticJournal("health");
+  }
+  if (bootMarkedOperational &&
+      (lastDiagnosticNvsMs == 0 || millis() - lastDiagnosticNvsMs >= DIAGNOSTIC_NVS_INTERVAL_MS)) {
+    writeDiagnosticCheckpointNvs(true);
+  }
 }
 
 String buildSdStatusJson() {
@@ -4155,6 +4378,7 @@ void printSerialHelp() {
   Serial.println("  stream_start");
   Serial.println("  stream_stop");
   Serial.println("  battery");
+  Serial.println("  diagnostics");
   Serial.println("  onboard_status");
   Serial.println("  onboard_capture");
   Serial.println("  onboard_delete_all");
@@ -5746,6 +5970,7 @@ String buildSystemStatusJson() {
   payload += ",\"psram_free\":" + String(ESP.getFreePsram());
   payload += ",\"chip_temperature_c\":" + String(readChipTemperatureC(), 1);
   payload += ",\"http_service\":" + buildHttpServiceJson();
+  payload += ",\"diagnostics\":" + buildDiagnosticStatusJson();
   payload += "}";
   return payload;
 }
@@ -5893,6 +6118,26 @@ String buildControlSummaryJson() {
   return payload;
 }
 
+String buildControlSummaryJson() {
+  ControlState controlSnapshot{};
+  snapshotControlState(controlSnapshot);
+  String payload = "{";
+  payload += "\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
+  payload += ",\"wifi_ip\":\"" + WiFi.localIP().toString() + "\"";
+  payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
+  payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
+  payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
+  payload += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
+  payload += ",\"control_pending\":\"" + String(controlActionName(controlSnapshot.pendingAction)) + "\"";
+  payload += ",\"control_action\":\"" + String(controlActionName(controlSnapshot.activeAction)) + "\"";
+  payload += ",\"control_last_action\":\"" + String(controlActionName(controlSnapshot.lastAction)) + "\"";
+  payload += ",\"control_last_ok\":" + String(controlSnapshot.lastOk ? "true" : "false");
+  payload += ",\"control_last_message\":\"" + jsonEscape(String(controlSnapshot.lastMessage)) + "\"";
+  payload += ",\"durable_media_job\":" + buildDurableMediaJobJson();
+  payload += "}";
+  return payload;
+}
+
 void handleStatus() {
   ControlState controlSnapshot{};
   snapshotControlState(controlSnapshot);
@@ -5988,6 +6233,10 @@ void handleSystemStatus() {
   server.send(200, "application/json", buildSystemStatusJson());
 }
 
+void handleDiagnosticStatus() {
+  server.send(200, "application/json", buildDiagnosticStatusJson());
+}
+
 void handleHaLowStatusHttp() {
   server.send(200, "application/json", buildHaLowStatusJson());
 }
@@ -6020,6 +6269,68 @@ void handleControlSummary() {
   server.send(200, "application/json", buildControlSummaryJson());
 }
 
+void handleTrailMediaStatus() {
+  String payload = "{";
+  payload += "\"ready\":" + String(sdReady ? "true" : "false");
+  payload += ",\"job\":" + buildDurableMediaJobJson();
+  if (sdReady) {
+    const uint64_t freeBytes = SD.totalBytes() > SD.usedBytes() ? SD.totalBytes() - SD.usedBytes() : 0;
+    payload += ",\"free_bytes\":" + String(static_cast<unsigned long long>(freeBytes));
+  }
+  payload += "}";
+  server.send(200, "application/json", payload);
+}
+
+void handleTrailMediaList() {
+  if (!sdReady) {
+    server.send(503, "application/json", "{\"error\":\"sd_unavailable\"}");
+    return;
+  }
+  String payload = "{\"items\":[";
+  bool first = true;
+  File dir = SD.open(TRAIL_MEDIA_DIR, FILE_READ);
+  if (dir && dir.isDirectory()) {
+    File file = dir.openNextFile(FILE_READ);
+    while (file) {
+      const String name = file.name();
+      if (!file.isDirectory() && !name.endsWith(".part")) {
+        const int slash = name.lastIndexOf('/');
+        const String filename = slash >= 0 ? name.substring(slash + 1) : name;
+        if (!first) payload += ',';
+        first = false;
+        payload += "{\"filename\":\"" + jsonEscape(filename) + "\"";
+        payload += ",\"bytes\":" + String(static_cast<unsigned long>(file.size()));
+        payload += ",\"url\":\"/trail-media/file/" + jsonEscape(filename) + "\"}";
+      }
+      file.close();
+      file = dir.openNextFile(FILE_READ);
+    }
+    dir.close();
+  }
+  payload += "]}";
+  server.send(200, "application/json", payload);
+}
+
+void handleTrailMediaFile() {
+  const String filename = server.pathArg(0);
+  if (filename.isEmpty() || filename.indexOf("..") >= 0 || filename.indexOf('/') >= 0 ||
+      !(filename.endsWith(".JPG") || filename.endsWith(".mp4"))) {
+    server.send(400, "application/json", "{\"error\":\"invalid_filename\"}");
+    return;
+  }
+  const String path = String(TRAIL_MEDIA_DIR) + "/" + filename;
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+  server.streamFile(file, filename.endsWith(".JPG") ? "image/jpeg" : "video/mp4");
+  file.close();
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+}
 void handleOnboardCameraStatus() {
   server.send(200, "application/json", buildOnboardCameraStatusJson());
 }
@@ -6927,6 +7238,125 @@ void handleControlStreamStop() {
   server.send(accepted ? 202 : 409, "application/json", payload);
 }
 
+uint32_t durableJobChecksum(const DurableMediaJobState &state) {
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&state);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < offsetof(DurableMediaJobState, checksum); ++i) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+const char *durableMediaActionName(uint8_t action) {
+  switch (action) {
+    case DURABLE_MEDIA_ACTION_DOWNLOAD_ALL: return "download_all_media";
+    case DURABLE_MEDIA_ACTION_DOWNLOAD_AND_DELETE: return "download_and_delete_media";
+    default: return "none";
+  }
+}
+
+const char *durableMediaStatusName(uint8_t status) {
+  switch (status) {
+    case DURABLE_MEDIA_QUEUED: return "queued";
+    case DURABLE_MEDIA_RUNNING: return "running";
+    case DURABLE_MEDIA_WAITING_RETRY: return "waiting_retry";
+    case DURABLE_MEDIA_SUCCEEDED: return "succeeded";
+    case DURABLE_MEDIA_FAILED: return "failed";
+    case DURABLE_MEDIA_CANCELLED: return "cancelled";
+    default: return "idle";
+  }
+}
+
+void setDurableJobText(char *target, size_t targetSize, const String &value) {
+  if (targetSize == 0) return;
+  strlcpy(target, value.c_str(), targetSize);
+}
+
+bool saveDurableMediaJob() {
+  if (!sdReady || !ensureFsDir(SD, DURABLE_JOB_DIR)) return false;
+  if (durableMediaJobMutex != nullptr) xSemaphoreTake(durableMediaJobMutex, portMAX_DELAY);
+  durableMediaJob.magic = DURABLE_MEDIA_JOB_MAGIC;
+  durableMediaJob.version = DURABLE_MEDIA_JOB_VERSION;
+  durableMediaJob.updatedBoot = bootSessionId;
+  durableMediaJob.checksum = durableJobChecksum(durableMediaJob);
+  SD.remove(DURABLE_JOB_STATE_TEMP_PATH);
+  File file = SD.open(DURABLE_JOB_STATE_TEMP_PATH, FILE_WRITE);
+  const bool wrote = file && file.write(reinterpret_cast<const uint8_t *>(&durableMediaJob), sizeof(durableMediaJob)) == sizeof(durableMediaJob);
+  if (file) {
+    file.flush();
+    file.close();
+  }
+  bool ok = wrote;
+  if (ok) {
+    SD.remove(DURABLE_JOB_STATE_PATH);
+    ok = SD.rename(DURABLE_JOB_STATE_TEMP_PATH, DURABLE_JOB_STATE_PATH);
+  }
+  if (!ok) SD.remove(DURABLE_JOB_STATE_TEMP_PATH);
+  if (durableMediaJobMutex != nullptr) xSemaphoreGive(durableMediaJobMutex);
+  return ok;
+}
+
+bool loadDurableMediaJob() {
+  durableMediaJob = {};
+  durableMediaJob.magic = DURABLE_MEDIA_JOB_MAGIC;
+  durableMediaJob.version = DURABLE_MEDIA_JOB_VERSION;
+  if (!sdReady) return false;
+  ensureFsDir(SD, DURABLE_JOB_DIR);
+  ensureFsDir(SD, TRAIL_MEDIA_DIR);
+  File file = SD.open(DURABLE_JOB_STATE_PATH, FILE_READ);
+  if (!file) {
+    durableMediaJobLoaded = true;
+    return saveDurableMediaJob();
+  }
+  DurableMediaJobState loaded{};
+  const bool readOk = file.read(reinterpret_cast<uint8_t *>(&loaded), sizeof(loaded)) == sizeof(loaded);
+  file.close();
+  if (!readOk || loaded.magic != DURABLE_MEDIA_JOB_MAGIC ||
+      loaded.version != DURABLE_MEDIA_JOB_VERSION || loaded.checksum != durableJobChecksum(loaded)) {
+    Serial.println("[durable-job] invalid state file; preserving as media_job.bad");
+    SD.remove("/jobs/media_job.bad");
+    SD.rename(DURABLE_JOB_STATE_PATH, "/jobs/media_job.bad");
+    durableMediaJobLoaded = true;
+    return saveDurableMediaJob();
+  }
+  durableMediaJob = loaded;
+  durableMediaJobLoaded = true;
+  if (durableMediaJob.status == DURABLE_MEDIA_RUNNING) {
+    durableMediaJob.status = DURABLE_MEDIA_WAITING_RETRY;
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "resume_after_reset");
+    setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), "board_reset_during_job");
+    saveDurableMediaJob();
+  }
+  Serial.printf("[durable-job] loaded id=%u action=%s status=%s index=%u/%u\n",
+                durableMediaJob.jobId,
+                durableMediaActionName(durableMediaJob.action),
+                durableMediaStatusName(durableMediaJob.status),
+                durableMediaJob.currentIndex,
+                durableMediaJob.manifestCount);
+  return true;
+}
+
+String buildDurableMediaJobJson() {
+  String payload = "{";
+  payload += "\"job_id\":" + String(durableMediaJob.jobId);
+  payload += ",\"action\":\"" + String(durableMediaActionName(durableMediaJob.action)) + "\"";
+  payload += ",\"status\":\"" + String(durableMediaStatusName(durableMediaJob.status)) + "\"";
+  payload += ",\"stage\":\"" + jsonEscape(String(durableMediaJob.stage)) + "\"";
+  payload += ",\"total\":" + String(durableMediaJob.manifestCount);
+  payload += ",\"processed\":" + String(durableMediaJob.currentIndex);
+  payload += ",\"current_media_id\":" + String(durableMediaJob.currentMediaId);
+  payload += ",\"downloaded\":" + String(durableMediaJob.downloadedCount);
+  payload += ",\"skipped\":" + String(durableMediaJob.skippedCount);
+  payload += ",\"deleted\":" + String(durableMediaJob.deletedCount);
+  payload += ",\"retry_count\":" + String(durableMediaJob.retryCount);
+  payload += ",\"bytes_downloaded\":" + String(durableMediaJob.bytesDownloaded);
+  payload += ",\"last_error\":\"" + jsonEscape(String(durableMediaJob.lastError)) + "\"";
+  payload += ",\"staging_directory\":\"" + String(TRAIL_MEDIA_DIR) + "\"";
+  payload += "}";
+  return payload;
+}
+
 ControlAction parseJobAction(const String &rawAction) {
   String action = rawAction;
   action.trim();
@@ -6941,9 +7371,9 @@ ControlAction parseJobAction(const String &rawAction) {
 void handleJobsGet() {
   String payload = "{";
   payload += "\"ok\":true";
-  payload += ",\"durable\":false";
-  payload += ",\"note\":\"jobs currently queue into the in-memory camera control worker; SD-backed persistence is planned\"";
-  payload += ",\"supported_actions\":[\"bringup\",\"live_view_start\",\"live_view_stop\",\"trigger_photo\"]";
+  payload += ",\"durable\":true";
+  payload += ",\"supported_actions\":[\"bringup\",\"live_view_start\",\"live_view_stop\",\"trigger_photo\",\"download_all_media\",\"download_and_delete_media\"]";
+  payload += ",\"durable_media_job\":" + buildDurableMediaJobJson();
   payload += ",\"control\":";
   payload += buildControlStatusJson();
   payload += "}";
@@ -6961,14 +7391,38 @@ void handleJobsPost() {
       actionArg = "live_view_stop";
     } else if (body.indexOf("trigger_photo") >= 0 || body.indexOf("take_picture") >= 0) {
       actionArg = "trigger_photo";
+    } else if (body.indexOf("download_and_delete") >= 0) {
+      actionArg = "download_and_delete_media";
+    } else if (body.indexOf("download_all") >= 0) {
+      actionArg = "download_all_media";
     } else if (body.indexOf("bringup") >= 0 || body.indexOf("open_session") >= 0) {
       actionArg = "bringup";
     }
   }
 
+  String durableAction = actionArg;
+  durableAction.toLowerCase();
+  if (durableAction == "download_all" || durableAction == "download_all_media" ||
+      durableAction == "download_and_delete" || durableAction == "download_and_delete_media") {
+    const DurableMediaJobAction action = durableAction.indexOf("and_delete") >= 0
+                                           ? DURABLE_MEDIA_ACTION_DOWNLOAD_AND_DELETE
+                                           : DURABLE_MEDIA_ACTION_DOWNLOAD_ALL;
+    String message;
+    const bool accepted = queueDurableMediaJob(action, message);
+    String payload = "{";
+    payload += "\"ok\":" + String(accepted ? "true" : "false");
+    payload += ",\"accepted\":" + String(accepted ? "true" : "false");
+    payload += ",\"durable\":true";
+    payload += ",\"message\":\"" + jsonEscape(message) + "\"";
+    payload += ",\"job\":" + buildDurableMediaJobJson();
+    payload += "}";
+    server.send(accepted ? 202 : 409, "application/json", payload);
+    return;
+  }
+
   const ControlAction action = parseJobAction(actionArg);
   if (action == CONTROL_ACTION_NONE) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_request\",\"detail\":\"expected action=bringup|live_view_start|live_view_stop|trigger_photo\"}");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_request\",\"detail\":\"unsupported job action\"}");
     return;
   }
 
@@ -7110,6 +7564,485 @@ String extractLatestMediaItemJson(const String &galleryJson, int typeFilter, boo
     }
   }
   return "";
+}
+
+long jsonObjectIntField(const String &objectJson, const char *fieldName, long fallback = 0) {
+  const String key = String("\"") + fieldName + "\"";
+  const int keyAt = objectJson.indexOf(key);
+  if (keyAt < 0) return fallback;
+  const int colon = objectJson.indexOf(':', keyAt + key.length());
+  if (colon < 0) return fallback;
+  int start = colon + 1;
+  while (start < static_cast<int>(objectJson.length()) &&
+         (objectJson[start] == ' ' || objectJson[start] == '\t' || objectJson[start] == '"')) ++start;
+  return strtol(objectJson.c_str() + start, nullptr, 10);
+}
+
+String jsonObjectStringField(const String &objectJson, const char *fieldName) {
+  const String key = String("\"") + fieldName + "\"";
+  const int keyAt = objectJson.indexOf(key);
+  if (keyAt < 0) return "";
+  const int colon = objectJson.indexOf(':', keyAt + key.length());
+  if (colon < 0) return "";
+  const int quote = objectJson.indexOf('"', colon + 1);
+  if (quote < 0) return "";
+  String value;
+  bool escaped = false;
+  for (int i = quote + 1; i < static_cast<int>(objectJson.length()); ++i) {
+    const char c = objectJson[i];
+    if (escaped) {
+      value += c;
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      break;
+    } else {
+      value += c;
+    }
+  }
+  return value;
+}
+
+bool appendDurableManifestPage(const String &galleryJson, bool truncate,
+                               uint32_t &recordCount, uint32_t &minimumId) {
+  recordCount = 0;
+  minimumId = UINT32_MAX;
+  const int dataKey = galleryJson.indexOf("\"data\"");
+  const int arrayStart = dataKey >= 0 ? galleryJson.indexOf('[', dataKey) : -1;
+  if (arrayStart < 0 || !sdReady) return false;
+  if (truncate) SD.remove(DURABLE_JOB_MANIFEST_PATH);
+  File manifest = SD.open(DURABLE_JOB_MANIFEST_PATH, truncate ? FILE_WRITE : FILE_APPEND);
+  if (!manifest) return false;
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
+  int objectStart = -1;
+  for (int i = arrayStart + 1; i < static_cast<int>(galleryJson.length()); ++i) {
+    const char c = galleryJson[i];
+    if (escaped) { escaped = false; continue; }
+    if (c == '\\' && inString) { escaped = true; continue; }
+    if (c == '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c == '{') {
+      if (depth == 0) objectStart = i;
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0 && objectStart >= 0) {
+        const String item = galleryJson.substring(objectStart, i + 1);
+        DurableMediaRecord record{};
+        record.id = static_cast<uint32_t>(jsonObjectIntField(item, "id", 0));
+        record.type = static_cast<uint8_t>(jsonObjectIntField(item, "type", 0));
+        record.expectedBytes = static_cast<uint32_t>(jsonObjectIntField(item, "size", 0));
+        const String uid = jsonObjectStringField(item, "uid");
+        const String date = jsonObjectStringField(item, "date");
+        strlcpy(record.uid, uid.c_str(), sizeof(record.uid));
+        strlcpy(record.date, date.c_str(), sizeof(record.date));
+        if (record.id > 0 && (record.type == 1 || record.type == 2) &&
+            manifest.write(reinterpret_cast<const uint8_t *>(&record), sizeof(record)) == sizeof(record)) {
+          ++recordCount;
+          if (record.id < minimumId) minimumId = record.id;
+        }
+        objectStart = -1;
+      }
+    } else if (c == ']' && depth == 0) {
+      break;
+    }
+  }
+  manifest.flush();
+  manifest.close();
+  return recordCount > 0 || galleryJson.indexOf("[]", arrayStart) >= 0;
+}
+
+bool readDurableManifestRecord(uint32_t index, DurableMediaRecord &record) {
+  File manifest = SD.open(DURABLE_JOB_MANIFEST_PATH, FILE_READ);
+  if (!manifest) return false;
+  const size_t offset = static_cast<size_t>(index) * sizeof(DurableMediaRecord);
+  const bool ok = offset + sizeof(record) <= manifest.size() && manifest.seek(offset) &&
+                  manifest.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) == sizeof(record);
+  manifest.close();
+  return ok;
+}
+
+String durableMediaFilePath(const DurableMediaRecord &record, bool partial = false) {
+  String path = String(TRAIL_MEDIA_DIR) + "/" + String(record.id) + (record.type == 1 ? ".JPG" : ".mp4");
+  if (partial) path += ".part";
+  return path;
+}
+
+bool flushCameraSdBuffer(File &output, uint8_t *sdBuffer, size_t &buffered) {
+  if (buffered == 0) return true;
+  const bool ok = output.write(sdBuffer, buffered) == buffered;
+  if (ok) buffered = 0;
+  return ok;
+}
+
+bool writeCameraBytesToFile(WiFiClient &client, File &output, size_t count, size_t &written,
+                            uint8_t *sdBuffer, size_t sdBufferSize, size_t &buffered) {
+  uint8_t buffer[1024];
+  size_t remaining = count;
+  while (remaining > 0) {
+    const size_t wanted = std::min(remaining, sizeof(buffer));
+    const size_t got = client.readBytes(buffer, wanted);
+    if (got == 0) return false;
+    size_t copied = 0;
+    while (copied < got) {
+      const size_t space = sdBufferSize - buffered;
+      const size_t take = std::min(space, got - copied);
+      memcpy(sdBuffer + buffered, buffer + copied, take);
+      buffered += take;
+      copied += take;
+      if (buffered == sdBufferSize && !flushCameraSdBuffer(output, sdBuffer, buffered)) return false;
+    }
+    written += static_cast<size_t>(got);
+    remaining -= static_cast<size_t>(got);
+  }
+  return true;
+}
+
+bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, uint32_t &bytesWritten) {
+  bytesWritten = 0;
+  const String finalPath = durableMediaFilePath(record, false);
+  const String partialPath = durableMediaFilePath(record, true);
+  File existing = SD.open(finalPath, FILE_READ);
+  if (existing) {
+    const size_t size = existing.size();
+    existing.close();
+    if (size > 0 && (record.expectedBytes == 0 || size == record.expectedBytes)) {
+      bytesWritten = size;
+      error = "already_staged";
+      return true;
+    }
+    SD.remove(finalPath);
+  }
+  size_t resumeOffset = 0;
+  File partial = SD.open(partialPath, FILE_READ);
+  if (partial) {
+    resumeOffset = partial.size();
+    partial.close();
+    if (record.expectedBytes > 0 && resumeOffset == record.expectedBytes) {
+      SD.remove(finalPath);
+      if (SD.rename(partialPath, finalPath)) {
+        bytesWritten = resumeOffset;
+        error = "already_staged";
+        return true;
+      }
+      error = "stage_rename_failed";
+      return false;
+    }
+    if (record.expectedBytes > 0 && resumeOffset > record.expectedBytes) {
+      SD.remove(partialPath);
+      resumeOffset = 0;
+    }
+  }
+  WiFiClient client;
+  if (!client.connect(CAMERA_IP, CAMERA_HTTP_PORT)) {
+    error = "camera_connect_failed";
+    return false;
+  }
+  const String cameraPath = "/file/" + String(record.id) + (record.type == 1 ? "/JPG" : "/mp4");
+  String request = "GET " + cameraPath + " HTTP/1.1\r\nHost: " + CAMERA_IP.toString() + ":" + String(CAMERA_HTTP_PORT) +
+                   "\r\nUser-Agent: esp32-gardepro-durable/1\r\n";
+  if (resumeOffset > 0) request += "Range: bytes=" + String(resumeOffset) + "-\r\n";
+  request += "Connection: close\r\n\r\n";
+  client.print(request);
+  unsigned long waitStart = millis();
+  while (!client.available() && client.connected() && millis() - waitStart < 10000UL) cooperativeDelay(10);
+  if (!client.available()) {
+    client.stop();
+    error = "camera_header_timeout";
+    return false;
+  }
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  const int firstSpace = statusLine.indexOf(' ');
+  const int statusCode = firstSpace >= 0 ? statusLine.substring(firstSpace + 1).toInt() : 0;
+  int contentLength = -1;
+  bool chunked = false;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.isEmpty()) break;
+    String lower = line;
+    lower.toLowerCase();
+    if (lower.startsWith("content-length:")) contentLength = line.substring(15).toInt();
+    if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0) chunked = true;
+  }
+  if (statusCode < 200 || statusCode >= 300) {
+    client.stop();
+    error = "camera_http_" + String(statusCode);
+    return false;
+  }
+  const bool rangeAccepted = resumeOffset > 0 && statusCode == 206;
+  if (resumeOffset > 0 && !rangeAccepted) {
+    SD.remove(partialPath);
+    resumeOffset = 0;
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  File output = SD.open(partialPath, rangeAccepted ? FILE_APPEND : FILE_WRITE);
+  bool ok = static_cast<bool>(output);
+  size_t written = resumeOffset;
+  size_t sdBufferSize = 32768;
+  uint8_t *sdBuffer = static_cast<uint8_t *>(heap_caps_malloc(sdBufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (sdBuffer == nullptr) {
+    sdBufferSize = 8192;
+    sdBuffer = static_cast<uint8_t *>(malloc(sdBufferSize));
+  }
+  size_t buffered = 0;
+  if (sdBuffer == nullptr) { ok = false; error = "sd_buffer_allocation_failed"; }
+  if (ok && chunked) {
+    while (true) {
+      String sizeLine = client.readStringUntil('\n');
+      const long chunkSize = parseHttpChunkSize(sizeLine);
+      if (chunkSize < 0) { ok = false; error = "invalid_chunk"; break; }
+      if (chunkSize == 0) break;
+      if (!writeCameraBytesToFile(client, output, static_cast<size_t>(chunkSize), written,
+                                  sdBuffer, sdBufferSize, buffered)) {
+        ok = false;
+        error = "chunk_read_failed_size_" + String(chunkSize) + "_total_" + String(written);
+        break;
+      }
+      uint8_t chunkTerminator[2];
+      if (client.readBytes(chunkTerminator, sizeof(chunkTerminator)) != sizeof(chunkTerminator)) {
+        ok = false; error = "chunk_terminator_failed"; break;
+      }
+    }
+  } else if (ok && contentLength >= 0) {
+    ok = writeCameraBytesToFile(client, output, static_cast<size_t>(contentLength), written,
+                                sdBuffer, sdBufferSize, buffered);
+    if (!ok) error = "body_read_failed";
+  } else if (ok) {
+    uint8_t buffer[2048];
+    unsigned long lastDataMs = millis();
+    while (client.connected() || client.available()) {
+      const int available = client.available();
+      if (available <= 0) {
+        if (millis() - lastDataMs > 15000UL) { ok = false; error = "body_timeout"; break; }
+        cooperativeDelay(5); continue;
+      }
+      const size_t wanted = std::min(static_cast<size_t>(available), sizeof(buffer));
+      const int got = client.read(buffer, wanted);
+      if (got > 0) {
+        size_t copied = 0;
+        while (copied < static_cast<size_t>(got)) {
+          const size_t space = sdBufferSize - buffered;
+          const size_t take = std::min(space, static_cast<size_t>(got) - copied);
+          memcpy(sdBuffer + buffered, buffer + copied, take);
+          buffered += take;
+          copied += take;
+          if (buffered == sdBufferSize && !flushCameraSdBuffer(output, sdBuffer, buffered)) {
+            ok = false; error = "sd_write_failed"; break;
+          }
+        }
+        if (!ok) break;
+        written += got;
+        lastDataMs = millis();
+      }
+    }
+  }
+  if (output && !flushCameraSdBuffer(output, sdBuffer, buffered)) {
+    ok = false;
+    error = "sd_flush_failed";
+  }
+  if (sdBuffer != nullptr) free(sdBuffer);
+  if (output) { output.flush(); output.close(); }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  client.stop();
+  if (ok && written > 0 && record.expectedBytes > 0 && written != record.expectedBytes) {
+    ok = false;
+    error = "size_mismatch_expected_" + String(record.expectedBytes) + "_got_" + String(written);
+  }
+  if (ok && written > 0) {
+    SD.remove(finalPath);
+    ok = SD.rename(partialPath, finalPath);
+    if (!ok) error = "stage_rename_failed";
+  }
+  bytesWritten = static_cast<uint32_t>(written);
+  return ok;
+}
+
+bool galleryJsonContainsRecord(const String &galleryJson, const DurableMediaRecord &record) {
+  int position = 0;
+  while (true) {
+    const int objectStart = galleryJson.indexOf('{', position);
+    if (objectStart < 0) return false;
+    int depth = 0;
+    bool inString = false;
+    bool escaped = false;
+    int objectEnd = -1;
+    for (int i = objectStart; i < static_cast<int>(galleryJson.length()); ++i) {
+      const char c = galleryJson[i];
+      if (escaped) { escaped = false; continue; }
+      if (c == '\\' && inString) { escaped = true; continue; }
+      if (c == '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (c == '{') ++depth;
+      else if (c == '}' && --depth == 0) { objectEnd = i; break; }
+    }
+    if (objectEnd < 0) return false;
+    const String objectJson = galleryJson.substring(objectStart, objectEnd + 1);
+    if (jsonObjectIntField(objectJson, "id", -1) == static_cast<long>(record.id) &&
+        jsonObjectIntField(objectJson, "type", -1) == static_cast<long>(record.type)) return true;
+    position = objectEnd + 1;
+  }
+}
+
+bool deleteCameraMediaRecord(const DurableMediaRecord &record, String &error) {
+  String body;
+  int statusCode = 0;
+  const String ext = record.type == 1 ? "JPG" : "mp4";
+  proxyCameraRequest("GET", "/cmd/delete/" + String(record.id) + "/" + ext, body, statusCode);
+  if (statusCode >= 200 && statusCode < 300 && jsonObjectIntField(body, "code", -1) == 0) return true;
+  proxyCameraRequest("GET", "/cmd/delete/" + String(record.type) + "/" + String(record.id), body, statusCode);
+  if (statusCode >= 200 && statusCode < 300 && jsonObjectIntField(body, "code", -1) == 0) return true;
+  String gallery;
+  int galleryStatus = 0;
+  if (proxyCameraRequest("GET", "/list/detail/backward/900000/60", gallery, galleryStatus) &&
+      galleryStatus >= 200 && galleryStatus < 300 && !galleryJsonContainsRecord(gallery, record)) {
+    return true;
+  }
+  error = "delete_failed_http_" + String(statusCode);
+  return false;
+}
+
+bool durableMediaJobIsActive() {
+  return durableMediaJob.status == DURABLE_MEDIA_QUEUED ||
+         durableMediaJob.status == DURABLE_MEDIA_RUNNING ||
+         durableMediaJob.status == DURABLE_MEDIA_WAITING_RETRY;
+}
+
+bool queueDurableMediaJob(DurableMediaJobAction action, String &message) {
+  if (!sdReady || !durableMediaJobLoaded) {
+    message = "sd_unavailable";
+    return false;
+  }
+  if (durableMediaJobIsActive()) {
+    message = "durable_job_busy:" + String(durableMediaJob.jobId);
+    return false;
+  }
+  durableMediaJob = {};
+  durableMediaJob.magic = DURABLE_MEDIA_JOB_MAGIC;
+  durableMediaJob.version = DURABLE_MEDIA_JOB_VERSION;
+  durableMediaJob.action = action;
+  durableMediaJob.status = DURABLE_MEDIA_QUEUED;
+  durableMediaJob.jobId = persistentBootCount * 1000UL + (millis() % 1000UL);
+  durableMediaJob.createdBoot = bootSessionId;
+  setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "queued");
+  SD.remove(DURABLE_JOB_MANIFEST_PATH);
+  const bool saved = saveDurableMediaJob();
+  message = saved ? "queued:" + String(durableMediaJob.jobId) : "persist_failed";
+  return saved;
+}
+
+void durableMediaJobRetry(const String &error) {
+  durableMediaJob.status = DURABLE_MEDIA_WAITING_RETRY;
+  ++durableMediaJob.retryCount;
+  setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "waiting_retry");
+  setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), error);
+  durableMediaNextRetryMs = millis() + DURABLE_MEDIA_RETRY_MS;
+  saveDurableMediaJob();
+  Serial.printf("[durable-job] id=%u retry=%u error=%s\n",
+                durableMediaJob.jobId, durableMediaJob.retryCount, error.c_str());
+}
+
+void serviceDurableMediaJob() {
+  if (!durableMediaJobLoaded || !durableMediaJobIsActive()) return;
+  if (durableMediaJob.status == DURABLE_MEDIA_WAITING_RETRY &&
+      static_cast<long>(millis() - durableMediaNextRetryMs) < 0) return;
+  durableMediaJob.status = DURABLE_MEDIA_RUNNING;
+  setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), "");
+  if (!wifiConnected) {
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "camera_bringup");
+    saveDurableMediaJob();
+    if (!runBringupSequence()) {
+      durableMediaJobRetry("camera_bringup_failed");
+      return;
+    }
+  }
+  if (durableMediaJob.manifestCount == 0 && durableMediaJob.currentIndex == 0) {
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "building_manifest");
+    saveDurableMediaJob();
+    uint32_t totalCount = 0;
+    uint32_t cursor = 900000;
+    bool manifestOk = true;
+    for (uint16_t page = 0; page < 256; ++page) {
+      String gallery;
+      int statusCode = 0;
+      const String galleryPath = "/list/detail/backward/" + String(cursor) + "/60";
+      if (!proxyCameraRequest("GET", galleryPath, gallery, statusCode) ||
+          statusCode < 200 || statusCode >= 300) {
+        durableMediaJobRetry("gallery_request_failed_" + String(statusCode));
+        return;
+      }
+      uint32_t pageCount = 0;
+      uint32_t minimumId = UINT32_MAX;
+      if (!appendDurableManifestPage(gallery, page == 0, pageCount, minimumId)) {
+        manifestOk = false;
+        break;
+      }
+      totalCount += pageCount;
+      if (pageCount < 60 || minimumId <= 1 || minimumId == UINT32_MAX) break;
+      cursor = minimumId - 1;
+      cooperativeDelay(25);
+    }
+    if (!manifestOk) {
+      durableMediaJobRetry("manifest_write_failed");
+      return;
+    }
+    durableMediaJob.manifestCount = totalCount;
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), totalCount == 0 ? "complete" : "downloading");
+    saveDurableMediaJob();
+    if (totalCount == 0) {
+      durableMediaJob.status = DURABLE_MEDIA_SUCCEEDED;
+      saveDurableMediaJob();
+      return;
+    }
+  }
+  if (durableMediaJob.currentIndex >= durableMediaJob.manifestCount) {
+    durableMediaJob.status = DURABLE_MEDIA_SUCCEEDED;
+    durableMediaJob.currentMediaId = 0;
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "complete");
+    saveDurableMediaJob();
+    Serial.printf("[durable-job] id=%u complete downloaded=%u skipped=%u deleted=%u bytes=%u\n",
+                  durableMediaJob.jobId, durableMediaJob.downloadedCount,
+                  durableMediaJob.skippedCount, durableMediaJob.deletedCount,
+                  durableMediaJob.bytesDownloaded);
+    return;
+  }
+  DurableMediaRecord record{};
+  if (!readDurableManifestRecord(durableMediaJob.currentIndex, record)) {
+    durableMediaJobRetry("manifest_read_failed");
+    return;
+  }
+  durableMediaJob.currentMediaId = record.id;
+  setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "downloading");
+  saveDurableMediaJob();
+  String transferMessage;
+  uint32_t bytesWritten = 0;
+  if (!downloadCameraMediaToSd(record, transferMessage, bytesWritten)) {
+    durableMediaJobRetry(transferMessage);
+    return;
+  }
+  if (transferMessage == "already_staged") ++durableMediaJob.skippedCount;
+  else {
+    ++durableMediaJob.downloadedCount;
+    durableMediaJob.bytesDownloaded += bytesWritten;
+  }
+  if (durableMediaJob.action == DURABLE_MEDIA_ACTION_DOWNLOAD_AND_DELETE) {
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "deleting_verified_item");
+    saveDurableMediaJob();
+    String deleteError;
+    if (!deleteCameraMediaRecord(record, deleteError)) {
+      durableMediaJobRetry(deleteError);
+      return;
+    }
+    ++durableMediaJob.deletedCount;
+  }
+  ++durableMediaJob.currentIndex;
+  durableMediaJob.currentMediaId = 0;
+  setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "item_complete");
+  saveDurableMediaJob();
 }
 
 void handleCameraLatest() {
@@ -7301,6 +8234,7 @@ void controlWorkerTask(void *pvParameters) {
   while (true) {
     const ControlAction action = takePendingControlAction();
     if (action == CONTROL_ACTION_NONE) {
+      serviceDurableMediaJob();
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
@@ -7341,6 +8275,7 @@ void startHttpServer() {
   server.on("/system/http_restart", HTTP_POST, handleHttpRestart);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/system/status", HTTP_GET, handleSystemStatus);
+  server.on("/diagnostics/status", HTTP_GET, handleDiagnosticStatus);
   server.on("/halow/status", HTTP_GET, handleHaLowStatusHttp);
   server.on("/wifi/status", HTTP_GET, handleWifiStatus);
   server.on("/camera/status", HTTP_GET, handleCameraBridgeStatus);
@@ -7351,6 +8286,9 @@ void startHttpServer() {
   server.on("/ble/status", HTTP_GET, handleBleStatus);
   server.on("/control/status", HTTP_GET, handleControlStatus);
   server.on("/control/summary", HTTP_GET, handleControlSummary);
+  server.on("/trail-media/status", HTTP_GET, handleTrailMediaStatus);
+  server.on("/trail-media/files", HTTP_GET, handleTrailMediaList);
+  server.on(UriRegex("^\\/trail-media\\/file\\/([^/]+)$"), HTTP_GET, handleTrailMediaFile);
   server.on("/camera/raw", HTTP_GET, handleCameraRawGet);
   server.on("/camera/request", HTTP_GET, handleCameraRequest);
   server.on("/camera/request", HTTP_POST, handleCameraRequest);
@@ -7592,6 +8530,10 @@ void handleSerialCommand(const String &line) {
   }
   if (cmd == "battery") {
     Serial.println(buildBatteryJson());
+    return;
+  }
+  if (cmd == "diagnostics") {
+    Serial.println(buildDiagnosticStatusJson());
     return;
   }
   if (cmd == "onboard_status") {
@@ -7923,8 +8865,11 @@ void setup() {
   onboardFrameMutex = xSemaphoreCreateMutex();
   onboardStorageMutex = xSemaphoreCreateMutex();
   observationUploadMutex = xSemaphoreCreateMutex();
+  durableMediaJobMutex = xSemaphoreCreateMutex();
   initOnboardStorage();
   mountSdCard();
+  loadDurableMediaJob();
+  appendDiagnosticJournal("boot");
   loadOnboardConfig();
   loadScannerConfig();
   initOnboardCamera();
@@ -7948,6 +8893,7 @@ void setup() {
     Serial.println("Local serial test mode active; starting HaLow control plane before camera wake");
     connectHaLow();
     startHttpServer();
+    markBootOperational();
     if (!halowConnected) {
       Serial.println("[HaLow] local serial mode boot did not reach control plane");
     }
@@ -7993,6 +8939,7 @@ void setup() {
   }
   connectHaLow();
   startHttpServer();
+  markBootOperational();
   if (controlWorkerTaskHandle == nullptr) {
     xTaskCreatePinnedToCore(controlWorkerTask,
                             "control-worker",
@@ -8010,6 +8957,7 @@ void setup() {
 
 void loop() {
   pollSerialConsole();
+  servicePersistentDiagnostics();
   if (otaRestartPending && millis() >= otaRestartAtMs) {
     Serial.println("[ota] restarting after successful firmware update");
     delay(100);

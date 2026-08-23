@@ -419,7 +419,7 @@ Some camera firmware returns `fileIdx:0` even when the capture succeeded. In tha
 
 ### `GET /jobs`
 
-Returns the current in-memory camera worker queue/control state and supported actions.
+Returns the current camera worker state plus the SD-backed durable media job.
 
 Current supported actions:
 
@@ -427,10 +427,14 @@ Current supported actions:
 - `live_view_start`
 - `live_view_stop`
 - `trigger_photo`
+- `download_all_media`
+- `download_and_delete_media`
 
 ### `POST /jobs`
 
-Queues camera work and returns immediately. This is the first set-and-forget API layer. The current implementation queues into the in-memory control worker; SD-backed durable persistence is the next planned increment.
+Queues camera work and returns immediately. Media download jobs persist their state and
+camera manifest on SD, resume after resets, and retry camera bring-up without requiring
+HaLow. Download-and-delete verifies the staged SD file before deleting each camera item.
 
 Examples:
 
@@ -438,7 +442,18 @@ Examples:
 curl -sS -X POST "http://192.168.1.160:18080/jobs?action=trigger_photo"
 curl -sS -X POST "http://192.168.1.160:18080/jobs?action=live_view_start"
 curl -sS -X POST "http://192.168.1.160:18080/jobs?action=live_view_stop"
+curl -sS -X POST "http://192.168.1.160:18080/jobs?action=download_all_media"
+curl -sS -X POST "http://192.168.1.160:18080/jobs?action=download_and_delete_media"
 ```
+
+## Staged trail-camera media
+
+- `GET /trail-media/status` — durable job progress and SD free space
+- `GET /trail-media/files` — files safely staged on the ESP32 SD card
+- `GET /trail-media/file/<filename>` — download a staged file over HaLow when available
+
+Staged files remain on the ESP32 until a separate retention/upload policy removes them.
+Loss of HaLow does not stop camera-to-SD staging or verified camera deletion.
 
 ## Onboard media endpoints
 

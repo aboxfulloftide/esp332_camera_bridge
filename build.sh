@@ -2,7 +2,8 @@
 # Build and upload for HT-HC33 with OPI PSRAM enabled (required for UXGA 1600x1200)
 set -e
 
-SKETCH="${1:-/home/matheau/esp32_camera/take_photo}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SKETCH="${1:-$SCRIPT_DIR/gardepro_dual_radio_bridge}"
 PORT="${2:-/dev/ttyUSB0}"
 FQBN="heltec:esp_halow:HT-HC33:PSRAM=opi"
 
