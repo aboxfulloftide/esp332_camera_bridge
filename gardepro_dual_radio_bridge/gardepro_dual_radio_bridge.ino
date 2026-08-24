@@ -125,7 +125,7 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 // API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
-static const char *FIRMWARE_VERSION = "0.2.5";
+static const char *FIRMWARE_VERSION = "0.2.6";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
 static const char *DIAGNOSTIC_DIR = "/diagnostics";
 static const char *DIAGNOSTIC_LOG_PATH = "/diagnostics/health.jsonl";
@@ -6111,28 +6111,13 @@ String buildControlSummaryJson() {
   payload += ",\"control_last_finished_ms\":" + String(msSince(controlSnapshot.lastFinishedMs));
   payload += ",\"eta_sec\":" + String(controlSnapshot.busy ? controlActionEtaSec(controlSnapshot.activeAction) : 0);
   payload += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
-  payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
-  payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
-  payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
-  payload += "}";
-  return payload;
-}
-
-String buildControlSummaryJson() {
-  ControlState controlSnapshot{};
-  snapshotControlState(controlSnapshot);
-  String payload = "{";
-  payload += "\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
   payload += ",\"wifi_ip\":\"" + WiFi.localIP().toString() + "\"";
   payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
+  payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
+  payload += ",\"live_view_active\":" + String(streamSessionActive ? "true" : "false");
+  payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
   payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
-  payload += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
-  payload += ",\"control_pending\":\"" + String(controlActionName(controlSnapshot.pendingAction)) + "\"";
-  payload += ",\"control_action\":\"" + String(controlActionName(controlSnapshot.activeAction)) + "\"";
-  payload += ",\"control_last_action\":\"" + String(controlActionName(controlSnapshot.lastAction)) + "\"";
-  payload += ",\"control_last_ok\":" + String(controlSnapshot.lastOk ? "true" : "false");
-  payload += ",\"control_last_message\":\"" + jsonEscape(String(controlSnapshot.lastMessage)) + "\"";
   payload += ",\"durable_media_job\":" + buildDurableMediaJobJson();
   payload += "}";
   return payload;

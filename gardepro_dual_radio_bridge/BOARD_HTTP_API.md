@@ -198,6 +198,19 @@ Important fields:
 
 During active live view the stream can still be functional even if occasional ESP32 control/status HTTP polls reset or time out. Treat packet counters as the functional signal.
 
+### `GET /control/summary`
+
+Lightweight connectivity, control-worker, durable-job, and live-view state. Live-view
+consumers should use the explicit fields:
+
+- `live_view_active` — authoritative trail-camera live-view session state
+- `tunnel_connected` — whether the HaLow stream tunnel is currently connected
+
+Do not infer live-view state from `control_last_action`. A later unrelated control action
+can replace that bookkeeping value while live view remains active. Servers supporting
+older firmware can fall back to `GET /stream/status`; if neither endpoint supplies an
+explicit state, report it as unknown.
+
 ### `GET /ble/status`
 
 Trail-camera BLE wake/discovery plus BLE scanner counters.
