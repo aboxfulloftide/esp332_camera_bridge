@@ -84,11 +84,11 @@ curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/firmware/
 curl -sS --connect-timeout 10 --max-time 30 http://192.168.1.160:18080/scanner/config
 ```
 
-Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP server is small and the HaLow link has shown jitter; sequential requests are reliable.
+Avoid firing several curls at the board at exactly the same time. The ESP32 HTTP server is small and the HaLow link has shown jitter; sequential requests are the safest default.
 
-Recent trail-camera field tests show camera operations can pass while a few ESP32 HTTP status polls reset or time out during active live view. Treat `/stream/status` media counters and the stream functional gate as the signal for live-view success; occasional `/control/status` poll failures under stream load are a board responsiveness issue to improve separately.
+Firmware build `Aug 25 2026 11:30:21` moves `server.handleClient()` ownership to a dedicated HTTP service task. The previous multi-context attempt could panic-reset the board; the corrected build avoids calling the WebServer from the main loop once the HTTP task is running. Field validation after OTA showed `/control/status` and `/healthz` stayed responsive through a full BLE wake and camera-hotspot wait, with `http_service.max_gap_ms` staying at 13 ms.
 
-Current hardening disables automatic trail-camera HTTP keepalive and automatic camera recovery by default. This keeps an unreliable trail-camera connection from running BLE/Wi-Fi recovery work inside the main HTTP service loop. Use explicit control endpoints for camera work and use `/healthz` plus `http_service.max_gap_ms` to confirm whether the board application loop is staying responsive.
+Current hardening disables automatic trail-camera HTTP keepalive and automatic camera recovery by default. This keeps an unreliable trail-camera connection from running BLE/Wi-Fi recovery work inside the board main loop. Use explicit control endpoints for camera work and use `/healthz` plus `http_service.max_gap_ms` to confirm whether the board HTTP task is staying responsive.
 
 USB diagnostic finding on 2026-08-20: after the field HTTP failure, the ESP32 serial console and HaLow association were still alive, but the board WebServer/TCP listener stopped serving new HTTP clients. Firmware now exposes `POST /system/http_restart`, serial command `http_restart`, and idle periodic HTTP listener restart telemetry under `http_service`.
 

@@ -4,7 +4,7 @@ Base URL: `http://<board-ip>:18080`
 
 Current field unit address: `http://192.168.1.160:18080`
 
-The board HTTP server is intentionally small. Prefer sequential requests with conservative timeouts on the HaLow link, especially during BLE wake, camera Wi-Fi join, media download, and live view.
+The board HTTP server is intentionally small. Prefer sequential requests with conservative timeouts on the HaLow link, especially during BLE wake, camera Wi-Fi join, media download, and live view. Current firmware services the HTTP listener from a dedicated task so long control-worker waits, BLE wake, and camera hotspot polling do not starve basic status endpoints.
 
 ## Status endpoints
 
@@ -66,7 +66,7 @@ Representative fields:
 - `camera_http_keepalive_enabled`
 - `camera_auto_recovery_enabled`
 
-Current firmware defaults both automatic camera HTTP keepalive and automatic camera recovery to disabled so an unreliable trail-camera connection cannot run blocking recovery work from the board HTTP service loop. Explicit `POST /control/bringup` and `POST /control/stream_start` still run through the control worker.
+Current firmware defaults both automatic camera HTTP keepalive and automatic camera recovery to disabled so an unreliable trail-camera connection cannot run blocking recovery work from the board main loop. Explicit `POST /control/bringup` and `POST /control/stream_start` still run through the control worker while status endpoints continue to be serviced by the HTTP task.
 
 ### `GET /system/status`
 
@@ -306,14 +306,63 @@ Battery and charger pins:
 
 - `adc_pin`
 - `adc_ctrl_pin`
+- `adc_ctrl_active_level`
+- `adc_ctrl_idle_level`
+- `adc_ctrl_idle_after_read`
 - `adc_mv`
 - `battery_est_v`
 - `charging_gpio15`
 - `done_gpio16`
 
+The battery ADC control pin is asserted only while sampling and returned to
+`adc_ctrl_idle_level` after each read. This avoids leaving the battery-divider
+or ADC enable circuit active between status polls.
+
+Low-voltage boot recovery:
+
+- If boot voltage is below `3400 mV`, the firmware enters a low-battery boot hold before starting HaLow, BLE, trail-camera Wi-Fi, SD-heavy work, or the onboard camera.
+- If the previous boot failed early with battery below `3400 mV`, the next boot waits for a stronger recovery threshold of `3600 mV`.
+- The voltage must be at/above the recovery threshold for 3 consecutive checks before the board restarts for a clean normal boot.
+- During the hold the board intentionally does not expose the normal HTTP API because HaLow is not started. Progress is visible over serial.
+- If it remains in hold for 30 minutes, it performs a timed restart and checks again.
+
+After a successful boot, `/diagnostics/status` includes `low_battery_boot_hold`
+with the thresholds and the previous-boot low-voltage-wedge flag.
+
+### `GET /diagnostics/log`
+
+Streams the SD-backed diagnostic journal at `/diagnostics/health.jsonl` as
+newline-delimited JSON. Use this after a recovery to inspect boot, health, and
+operational checkpoints.
+
+Query parameters:
+
+- `previous=1`: stream `/diagnostics/health.previous.jsonl` when the active log
+  has rotated
+
+### `POST /system/restart`
+
+Requests a full ESP32 software restart. Use this only when a subsystem is
+wedged and narrower recovery endpoints are insufficient.
+
 ### `GET /onboard/status`
 
-Onboard ESP camera configuration, schedule, storage, and timelapse state. See [ONBOARD_MEDIA_API.md](ONBOARD_MEDIA_API.md) for media-specific details.
+Onboard ESP camera configuration, schedule, power state, storage, and timelapse state. Scheduled capture defaults to once per day in the configured noon window (`12:00`–`12:30`) using the selected sunny-day settings. Outside that window the firmware powers the onboard camera down and leaves stored media available from SD/LittleFS. See [ONBOARD_MEDIA_API.md](ONBOARD_MEDIA_API.md) for media-specific details.
+
+Power/schedule fields include:
+
+- `ready`
+- `power_state`
+- `powered_down_by_schedule`
+- `power_up_count`
+- `power_down_count`
+- `enabled`
+- `interval_ms`
+- `window_start`
+- `window_end`
+- `clock_valid`
+- `schedule_mode`
+- `window_active`
 
 ### `GET /upload/status`
 
@@ -449,6 +498,14 @@ Queues camera work and returns immediately. Media download jobs persist their st
 camera manifest on SD, resume after resets, and retry camera bring-up without requiring
 HaLow. Download-and-delete verifies the staged SD file before deleting each camera item.
 
+Power behavior:
+
+- `trigger_photo` brings the trail camera up only for the photo when no explicit session lease is active, then requests standby and turns the ESP32 2.4 GHz Wi-Fi radio off.
+- Active session leases keep the trail-camera Wi-Fi path available until the lease expires.
+- Expired leases are processed in normal field mode and request standby/power-down.
+- Durable media jobs keep the trail-camera Wi-Fi path active while transferring, but request standby and power the ESP32 2.4 GHz Wi-Fi radio off between retries and after completion.
+- Live view keeps the trail-camera Wi-Fi path active until `live_view_stop` / `stream_stop`.
+
 Examples:
 
 ```bash
@@ -466,6 +523,12 @@ curl -sS -X POST "http://192.168.1.160:18080/jobs?action=download_and_delete_med
 - `GET /trail-media/file/<filename>` — download a staged file over HaLow when available
 
 Staged files remain on the ESP32 until a separate retention/upload policy removes them.
+
+Video staging is intentionally strict. MP4 downloads are not promoted from `.part` to
+final `.mp4` unless the firmware can determine the complete byte count from the camera
+gallery, `Content-Range`, or `Content-Length`, and the staged file passes a basic MP4
+atom-structure validation. This prevents short camera-side transfers from being
+reported as complete playable videos.
 Loss of HaLow does not stop camera-to-SD staging or verified camera deletion.
 
 ## Onboard media endpoints
@@ -483,6 +546,7 @@ Routes:
 - `DELETE /onboard/media/{id}`
 - `POST /onboard/media/delete_all`
 - `POST /onboard/config`
+- `POST /onboard/reinit`
 - `POST /onboard/timelapse/start`
 - `POST /onboard/timelapse/stop`
 

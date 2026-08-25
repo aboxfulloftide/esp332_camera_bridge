@@ -8,7 +8,39 @@ Current field unit address: `http://192.168.1.160:18080`
 
 ### `GET /onboard/status`
 
-Returns camera configuration and storage state. Storage fields:
+Returns camera configuration, schedule/power state, and storage state.
+
+The scheduled onboard camera is configured for one sunny-day capture at noon by default:
+
+- interval: `86400000` ms / 24 hours
+- active window: `12:00` through `12:30`
+- outside the active window, the firmware deinitializes the ESP32 camera and leaves persisted media available from storage
+- at the next active window, the scheduler initializes the camera again and captures once
+- if network time is not valid yet, the scheduler uses an uptime-based 24-hour fallback window instead of capturing unrestricted 24 hours/day
+- default sunny-day image settings: `ae_level=-2`, `brightness=-1`, `contrast=1`, `sharpness=3`, `saturation=0`, `jpeg_quality=5`
+
+Power/schedule fields:
+
+```json
+{
+  "ready": false,
+  "power_state": "scheduled_window_inactive",
+  "powered_down_by_schedule": true,
+  "power_up_count": 1,
+  "power_down_count": 1,
+  "enabled": true,
+  "interval_ms": 86400000,
+  "window_start": "12:00",
+  "window_end": "12:30",
+  "clock_valid": true,
+  "schedule_mode": "clock_window",
+  "local_minute": 1265,
+  "actual_local_minute": 1265,
+  "window_active": false
+}
+```
+
+Storage fields:
 
 ```json
 {
@@ -28,6 +60,11 @@ Returns camera configuration and storage state. Storage fields:
 ### `POST /onboard/capture`
 
 Captures and persists a JPEG.
+
+If frame capture fails, firmware attempts one onboard-camera deinit/reinit and
+then retries the frame capture once. `/onboard/status` exposes
+`camera_reinit_count`, `capture_recovery_count`, `last_capture_error`, and
+`last_recovery_reason` for diagnosis.
 
 ```json
 {
@@ -104,6 +141,12 @@ Currently returns HTTP `404` with `{"error":"thumbnail_not_available"}`. Thumbna
 ```json
 {"ok":true,"deleted":3,"failed":0}
 ```
+
+### `POST /onboard/reinit`
+
+Forces an ESP32 onboard-camera driver deinit/reinit without rebooting the whole
+board. Use this when `/onboard/status` says the camera is ready but capture
+returns `capture_failed` or settings return `sensor_unavailable`.
 
 ## Errors
 

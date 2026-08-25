@@ -166,20 +166,27 @@ static const unsigned long DIAGNOSTIC_NVS_INTERVAL_MS = 21600000UL;
 static const size_t BLE_RECENT_DEVICE_SLOTS = 16;
 
 #ifndef ONBOARD_CAPTURE_INTERVAL_MS
-#define ONBOARD_CAPTURE_INTERVAL_MS 1800000UL
+#define ONBOARD_CAPTURE_INTERVAL_MS 86400000UL
 #endif
 #ifndef ONBOARD_CAPTURE_ENABLED
 #define ONBOARD_CAPTURE_ENABLED 1
 #endif
 #ifndef ONBOARD_CAPTURE_START_MINUTE
-#define ONBOARD_CAPTURE_START_MINUTE 360
+#define ONBOARD_CAPTURE_START_MINUTE 720
 #endif
 #ifndef ONBOARD_CAPTURE_END_MINUTE
-#define ONBOARD_CAPTURE_END_MINUTE 1080
+#define ONBOARD_CAPTURE_END_MINUTE 750
 #endif
 
 static const int BAT_ADC_PIN = 1;
 static const int BAT_ADC_CTRL_PIN = 20;
+static const int BAT_ADC_CTRL_ACTIVE_LEVEL = LOW;
+static const int BAT_ADC_CTRL_IDLE_LEVEL = HIGH;
+static const uint32_t BATTERY_BOOT_MIN_MV = 3400;
+static const uint32_t BATTERY_BOOT_RECOVER_MV = 3600;
+static const uint8_t BATTERY_BOOT_STABLE_SAMPLES = 3;
+static const unsigned long BATTERY_LOW_POWER_RECHECK_MS = 60000UL;
+static const unsigned long BATTERY_LOW_POWER_RESTART_MS = 30UL * 60UL * 1000UL;
 static const int BAT_CHRG_PIN = 15;
 static const int BAT_DONE_PIN = 16;
 static const int SD_MOSI_PIN = 11;
@@ -295,6 +302,7 @@ static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
 #define HTTP_SERVER_IDLE_RESTART_MS 0UL
 #endif
 static const BaseType_t CONTROL_WORKER_CORE = 0;
+static const BaseType_t HTTP_SERVICE_CORE = 1;
 static const uint8_t BLE_SCAN_ATTEMPTS = 3;
 static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
 static const unsigned long BLE_SCAN_RETRY_DELAY_MS = 1000;
@@ -321,6 +329,9 @@ static const uint32_t UDP_LOG_FIRST_PACKETS = 8;
 static const uint32_t UDP_LOG_EVERY_N_PACKETS = 120;
 uint32_t streamRecoveryAttempts = 0;
 uint32_t idleRecoveryAttempts = 0;
+
+unsigned long msSince(unsigned long timestampMs);
+void serviceBoardHttp();
 uint32_t httpKeepaliveFailures = 0;
 String lastStreamStartStage = "idle";
 String lastStreamStartMessage = "";
@@ -352,14 +363,18 @@ unsigned long lastHttpServerRestartMs = 0;
 uint32_t httpServiceCount = 0;
 uint32_t httpServerRestartCount = 0;
 String httpServerLastRestartReason = "boot";
+SemaphoreHandle_t httpServiceMutex = nullptr;
 SemaphoreHandle_t tunnelWriteMutex = nullptr;
 TaskHandle_t controlWorkerTaskHandle = nullptr;
 TaskHandle_t wifiScannerTaskHandle = nullptr;
+TaskHandle_t httpServiceTaskHandle = nullptr;
 SemaphoreHandle_t observationUploadMutex = nullptr;
 
 SemaphoreHandle_t onboardFrameMutex = nullptr;
 SemaphoreHandle_t onboardStorageMutex = nullptr;
+SemaphoreHandle_t onboardCameraMutex = nullptr;
 TaskHandle_t onboardCaptureTaskHandle = nullptr;
+SemaphoreHandle_t onboardJobMutex = nullptr;
 bool onboardCameraReady = false;
 bool onboardStorageReady = false;
 String onboardStorageError;
@@ -381,6 +396,12 @@ unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
 uint16_t onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
 uint16_t onboardCaptureEndMinute = ONBOARD_CAPTURE_END_MINUTE;
 int16_t onboardCaptureTzOffsetMin = 0;
+bool onboardCameraPoweredDownBySchedule = false;
+String onboardCameraPowerState = "boot";
+unsigned long onboardCameraLastPowerUpMs = 0;
+unsigned long onboardCameraLastPowerDownMs = 0;
+uint32_t onboardCameraPowerUpCount = 0;
+uint32_t onboardCameraPowerDownCount = 0;
 static const unsigned long ONBOARD_SCHEDULER_TICK_MS = 1000;
 static const unsigned long ONBOARD_TIMELAPSE_DEFAULT_INTERVAL_MS = 300000;
 static const unsigned long ONBOARD_TIMELAPSE_MIN_INTERVAL_MS = 5000;
@@ -398,15 +419,19 @@ size_t onboardLatestJpegLen = 0;
 uint32_t onboardCaptureCount = 0;
 uint32_t onboardCaptureFailures = 0;
 uint32_t onboardCaptureScheduleSkips = 0;
+uint32_t onboardCameraReinitCount = 0;
+uint32_t onboardCaptureRecoveryCount = 0;
+String onboardLastCaptureError = "";
+String onboardLastRecoveryReason = "";
 unsigned long onboardLastCaptureMs = 0;
 unsigned long onboardLastScheduleAttemptMs = 0;
 unsigned long onboardLastClockInvalidSkipLogMs = 0;
 framesize_t onboardFrameSize = FRAMESIZE_UXGA;
-int onboardJpegQuality = 8;
-int onboardBrightness = 0;
+int onboardJpegQuality = 5;
+int onboardBrightness = -1;
 int onboardContrast = 1;
 int onboardSaturation = 0;
-int onboardSharpness = 1;
+int onboardSharpness = 3;
 bool onboardVflip = true;
 bool onboardHmirror = false;
 bool onboardAwb = true;
@@ -414,8 +439,8 @@ bool onboardAwbGain = true;
 int onboardWbMode = 0;
 bool onboardAec = true;
 bool onboardAec2 = true;
-int onboardAeLevel = -1;
-int onboardAecValue = 300;
+int onboardAeLevel = -2;
+int onboardAecValue = 1200;
 bool onboardAgc = true;
 int onboardAgcGain = 0;
 int onboardSpecialEffect = 0;
@@ -462,6 +487,28 @@ struct OnboardCameraSettings {
   int agcGain;
   int specialEffect;
 };
+
+enum OnboardJobType : uint8_t {
+  ONBOARD_JOB_NONE = 0,
+  ONBOARD_JOB_CAPTURE = 1,
+  ONBOARD_JOB_REINIT = 2,
+};
+
+struct OnboardJobState {
+  OnboardJobType type;
+  bool pending;
+  bool running;
+  bool done;
+  bool ok;
+  bool oneShotSettings;
+  bool settingsRestored;
+  char captureKind[16];
+  char error[48];
+  OnboardCameraSettings settings;
+  OnboardMediaInfo media;
+};
+
+OnboardJobState onboardJob{};
 
 String wifiScanLastJson = "{\"networks\":[]}";
 String wifiObservationsLastJson = "";
@@ -518,6 +565,12 @@ int16_t previousBootTemperatureDeciC = 0;
 uint32_t previousBootFreeHeap = 0;
 bool previousBootHaLowConnected = false;
 bool bootMarkedOperational = false;
+bool lowBatteryBootHold = false;
+uint32_t lowBatteryBootHoldEntryMv = 0;
+uint32_t lowBatteryLastMv = 0;
+uint8_t lowBatteryStableSampleCount = 0;
+unsigned long lowBatteryBootHoldStartedMs = 0;
+unsigned long lowBatteryLastCheckMs = 0;
 unsigned long lastDiagnosticSdMs = 0;
 unsigned long lastDiagnosticNvsMs = 0;
 uint32_t diagnosticSdWriteCount = 0;
@@ -877,6 +930,10 @@ void serviceBoardHttp() {
   if (!httpServerStarted) {
     return;
   }
+  if (httpServiceMutex != nullptr &&
+      xSemaphoreTake(httpServiceMutex, 0) != pdTRUE) {
+    return;
+  }
   const unsigned long now = millis();
   if (lastHttpServiceMs != 0) {
     httpServiceLastGapMs = now - lastHttpServiceMs;
@@ -887,6 +944,26 @@ void serviceBoardHttp() {
   server.handleClient();
   lastHttpServiceMs = millis();
   ++httpServiceCount;
+  if (httpServiceMutex != nullptr) xSemaphoreGive(httpServiceMutex);
+}
+
+void httpServiceTask(void *pvParameters) {
+  (void)pvParameters;
+  while (true) {
+    serviceBoardHttp();
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+void startHttpServiceTask() {
+  if (httpServiceTaskHandle != nullptr) return;
+  xTaskCreatePinnedToCore(httpServiceTask,
+                          "http-service",
+                          8192,
+                          nullptr,
+                          2,
+                          &httpServiceTaskHandle,
+                          HTTP_SERVICE_CORE);
 }
 
 void restartHttpServer(const char *reason) {
@@ -1255,13 +1332,14 @@ String buildStreamStatusJson() {
 }
 
 uint32_t readBatteryAdcMilliVolts(int samples = 64) {
-  digitalWrite(BAT_ADC_CTRL_PIN, LOW);
+  digitalWrite(BAT_ADC_CTRL_PIN, BAT_ADC_CTRL_ACTIVE_LEVEL);
   delay(20);
   uint64_t total = 0;
   for (int i = 0; i < samples; ++i) {
     total += analogReadMilliVolts(BAT_ADC_PIN);
     delay(2);
   }
+  digitalWrite(BAT_ADC_CTRL_PIN, BAT_ADC_CTRL_IDLE_LEVEL);
   return static_cast<uint32_t>(total / samples);
 }
 
@@ -1275,12 +1353,108 @@ String buildBatteryJson() {
   String payload = "{";
   payload += "\"adc_pin\":" + String(BAT_ADC_PIN);
   payload += ",\"adc_ctrl_pin\":" + String(BAT_ADC_CTRL_PIN);
+  payload += ",\"adc_ctrl_active_level\":" + String(BAT_ADC_CTRL_ACTIVE_LEVEL);
+  payload += ",\"adc_ctrl_idle_level\":" + String(BAT_ADC_CTRL_IDLE_LEVEL);
+  payload += ",\"adc_ctrl_idle_after_read\":" + String(digitalRead(BAT_ADC_CTRL_PIN));
   payload += ",\"adc_mv\":" + String(adcMv);
   payload += ",\"battery_est_v\":" + String(batteryV, 3);
   payload += ",\"charging_gpio15\":" + String(digitalRead(BAT_CHRG_PIN));
   payload += ",\"done_gpio16\":" + String(digitalRead(BAT_DONE_PIN));
   payload += "}";
   return payload;
+}
+
+uint32_t readBatteryMilliVolts(int samples = 16) {
+  return readBatteryAdcMilliVolts(samples) * 2;
+}
+
+bool previousBootSuggestsLowVoltageWedge() {
+  return !previousBootOperational &&
+         previousBootUptimeMs > 0 &&
+         previousBootUptimeMs < 60000UL &&
+         previousBootBatteryMv > 0 &&
+         previousBootBatteryMv < BATTERY_BOOT_MIN_MV;
+}
+
+bool batteryVoltageStableForBoot(uint32_t batteryMv) {
+  if (batteryMv >= BATTERY_BOOT_RECOVER_MV) {
+    ++lowBatteryStableSampleCount;
+  } else {
+    lowBatteryStableSampleCount = 0;
+  }
+  return lowBatteryStableSampleCount >= BATTERY_BOOT_STABLE_SAMPLES;
+}
+
+String buildLowBatteryBootHoldJson() {
+  String payload = "{";
+  payload += "\"active\":" + String(lowBatteryBootHold ? "true" : "false");
+  payload += ",\"entry_battery_mv\":" + String(lowBatteryBootHoldEntryMv);
+  payload += ",\"last_battery_mv\":" + String(lowBatteryLastMv);
+  payload += ",\"boot_min_mv\":" + String(BATTERY_BOOT_MIN_MV);
+  payload += ",\"boot_recover_mv\":" + String(BATTERY_BOOT_RECOVER_MV);
+  payload += ",\"stable_samples\":" + String(lowBatteryStableSampleCount);
+  payload += ",\"required_stable_samples\":" + String(BATTERY_BOOT_STABLE_SAMPLES);
+  payload += ",\"hold_age_ms\":" + String(msSince(lowBatteryBootHoldStartedMs));
+  payload += ",\"previous_boot_low_voltage_wedge\":" + String(previousBootSuggestsLowVoltageWedge() ? "true" : "false");
+  payload += "}";
+  return payload;
+}
+
+bool batteryBootHoldRequired(uint32_t batteryMv) {
+  if (batteryMv < BATTERY_BOOT_MIN_MV) {
+    return true;
+  }
+  if (previousBootSuggestsLowVoltageWedge() && batteryMv < BATTERY_BOOT_RECOVER_MV) {
+    return true;
+  }
+  return false;
+}
+
+void enterLowBatteryBootHold(uint32_t entryBatteryMv) {
+  lowBatteryBootHold = true;
+  lowBatteryBootHoldEntryMv = entryBatteryMv;
+  lowBatteryLastMv = entryBatteryMv;
+  lowBatteryStableSampleCount = 0;
+  lowBatteryBootHoldStartedMs = millis();
+  lowBatteryLastCheckMs = 0;
+  Serial.printf("[power] low battery boot hold entry_mv=%u min_mv=%u recover_mv=%u previous_low_voltage_wedge=%s\n",
+                entryBatteryMv,
+                BATTERY_BOOT_MIN_MV,
+                BATTERY_BOOT_RECOVER_MV,
+                previousBootSuggestsLowVoltageWedge() ? "yes" : "no");
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  closeBleWakeSession();
+}
+
+void serviceLowBatteryBootHold() {
+  if (!lowBatteryBootHold) {
+    return;
+  }
+  if (lowBatteryLastCheckMs != 0 &&
+      millis() - lowBatteryLastCheckMs < BATTERY_LOW_POWER_RECHECK_MS) {
+    delay(250);
+    return;
+  }
+  lowBatteryLastCheckMs = millis();
+  lowBatteryLastMv = readBatteryMilliVolts(16);
+  const bool stable = batteryVoltageStableForBoot(lowBatteryLastMv);
+  Serial.printf("[power] low battery hold mv=%u stable=%u/%u age_ms=%lu\n",
+                lowBatteryLastMv,
+                lowBatteryStableSampleCount,
+                BATTERY_BOOT_STABLE_SAMPLES,
+                msSince(lowBatteryBootHoldStartedMs));
+  if (stable) {
+    Serial.println("[power] battery recovered; restarting for clean boot");
+    delay(100);
+    ESP.restart();
+  }
+  if (BATTERY_LOW_POWER_RESTART_MS > 0 &&
+      msSince(lowBatteryBootHoldStartedMs) >= BATTERY_LOW_POWER_RESTART_MS) {
+    Serial.println("[power] low battery hold timed restart");
+    delay(100);
+    ESP.restart();
+  }
 }
 
 String buildHaLowStatusJson() {
@@ -1383,7 +1557,7 @@ bool onboardClockValid() {
   return time(nullptr) >= 1700000000;
 }
 
-int onboardLocalMinuteOfDay() {
+int onboardActualLocalMinuteOfDay() {
   if (!onboardClockValid()) {
     return -1;
   }
@@ -1397,6 +1571,14 @@ int onboardLocalMinuteOfDay() {
     localtime_r(&adjusted, &tmValue);
   }
   return tmValue.tm_hour * 60 + tmValue.tm_min;
+}
+
+int onboardLocalMinuteOfDay() {
+  const int actualMinute = onboardActualLocalMinuteOfDay();
+  if (actualMinute >= 0) {
+    return actualMinute;
+  }
+  return static_cast<int>((millis() / 60000UL) % 1440UL);
 }
 
 bool onboardCaptureWindowActive() {
@@ -1553,6 +1735,47 @@ OnboardCameraSettings snapshotOnboardCameraSettings() {
   return settings;
 }
 
+bool parseOnboardCameraSettingsFromServer(OnboardCameraSettings &settings, String &error) {
+  if (server.hasArg("framesize")) {
+    framesize_t requested;
+    if (!parseFrameSize(server.arg("framesize"), requested)) {
+      error = "invalid_framesize";
+      return false;
+    }
+    if (!psramFound() && requested > FRAMESIZE_SVGA) {
+      error = "framesize_requires_psram";
+      return false;
+    }
+    settings.frameSize = requested;
+  }
+  if (server.hasArg("jpeg_quality") || server.hasArg("quality")) {
+    const int requested = server.hasArg("jpeg_quality") ? server.arg("jpeg_quality").toInt() : server.arg("quality").toInt();
+    if (requested < 4 || requested > 63) {
+      error = "invalid_jpeg_quality";
+      return false;
+    }
+    settings.jpegQuality = requested;
+  }
+  if (server.hasArg("brightness")) settings.brightness = server.arg("brightness").toInt();
+  if (server.hasArg("contrast")) settings.contrast = server.arg("contrast").toInt();
+  if (server.hasArg("saturation")) settings.saturation = server.arg("saturation").toInt();
+  if (server.hasArg("sharpness")) settings.sharpness = server.arg("sharpness").toInt();
+  if (server.hasArg("vflip")) settings.vflip = boolLikeValue(server.arg("vflip"));
+  if (server.hasArg("hmirror")) settings.hmirror = boolLikeValue(server.arg("hmirror"));
+  if (server.hasArg("awb")) settings.awb = boolLikeValue(server.arg("awb"));
+  if (server.hasArg("awb_gain")) settings.awbGain = boolLikeValue(server.arg("awb_gain"));
+  if (server.hasArg("wb_mode")) settings.wbMode = server.arg("wb_mode").toInt();
+  if (server.hasArg("aec")) settings.aec = boolLikeValue(server.arg("aec"));
+  if (server.hasArg("aec2")) settings.aec2 = boolLikeValue(server.arg("aec2"));
+  if (server.hasArg("ae_level")) settings.aeLevel = server.arg("ae_level").toInt();
+  if (server.hasArg("aec_value")) settings.aecValue = server.arg("aec_value").toInt();
+  if (server.hasArg("agc")) settings.agc = boolLikeValue(server.arg("agc"));
+  if (server.hasArg("agc_gain")) settings.agcGain = server.arg("agc_gain").toInt();
+  if (server.hasArg("special_effect")) settings.specialEffect = server.arg("special_effect").toInt();
+  error = "";
+  return true;
+}
+
 bool applyOnboardCameraSettings(const OnboardCameraSettings &settings, String &error) {
   sensor_t *s = esp_camera_sensor_get();
   if (s == nullptr) {
@@ -1637,7 +1860,7 @@ void loadOnboardConfig() {
   if (!runtimePrefs.begin("onboard", true)) {
     Serial.println("[onboard-config] failed to open preferences for read");
     onboardFrameSize = psramFound() ? FRAMESIZE_UXGA : FRAMESIZE_SVGA;
-    onboardJpegQuality = psramFound() ? 8 : 10;
+    onboardJpegQuality = psramFound() ? 5 : 10;
     clampOnboardConfig();
     return;
   }
@@ -1647,7 +1870,7 @@ void loadOnboardConfig() {
   onboardCaptureEndMinute = runtimePrefs.getUShort("end", onboardCaptureEndMinute);
   onboardCaptureTzOffsetMin = runtimePrefs.getShort("tz", onboardCaptureTzOffsetMin);
   onboardFrameSize = static_cast<framesize_t>(runtimePrefs.getUChar("framesize", psramFound() ? FRAMESIZE_UXGA : FRAMESIZE_SVGA));
-  onboardJpegQuality = runtimePrefs.getUChar("quality", psramFound() ? 8 : 10);
+  onboardJpegQuality = runtimePrefs.getUChar("quality", psramFound() ? 5 : 10);
   onboardBrightness = runtimePrefs.getChar("bright", onboardBrightness);
   onboardContrast = runtimePrefs.getChar("contrast", onboardContrast);
   onboardSaturation = runtimePrefs.getChar("saturate", onboardSaturation);
@@ -1734,6 +1957,17 @@ void saveScannerConfig() {
 }
 
 bool initOnboardCamera() {
+  if (onboardCameraReady) {
+    sensor_t *existing = esp_camera_sensor_get();
+    if (existing != nullptr) {
+      onboardCameraPowerState = "ready";
+      return true;
+    }
+    Serial.println("[onboard-camera] ready flag set but sensor unavailable; forcing reinit");
+    onboardCameraReady = false;
+    onboardCameraPowerState = "sensor_unavailable";
+  }
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -1774,6 +2008,7 @@ bool initOnboardCamera() {
   const esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("[onboard-camera] init failed err=0x%x\n", err);
+    onboardCameraPowerState = "init_failed";
     return false;
   }
 
@@ -1808,10 +2043,67 @@ bool initOnboardCamera() {
   }
 
   onboardCameraReady = true;
+  onboardCameraPoweredDownBySchedule = false;
+  onboardCameraPowerState = "ready";
+  onboardCameraLastPowerUpMs = millis();
+  ++onboardCameraPowerUpCount;
   Serial.printf("[onboard-camera] ready psram=%s interval_ms=%lu enabled=%s\n",
                 psramFound() ? "yes" : "no",
                 onboardCaptureIntervalMs,
                 onboardCaptureEnabled ? "yes" : "no");
+  return true;
+}
+
+void shutdownOnboardCamera(const char *reason) {
+  if (!onboardCameraReady) {
+    onboardCameraPowerState = reason != nullptr ? reason : "off";
+    return;
+  }
+  esp_camera_deinit();
+  onboardCameraReady = false;
+  onboardCameraPowerState = reason != nullptr ? reason : "off";
+  onboardCameraLastPowerDownMs = millis();
+  ++onboardCameraPowerDownCount;
+  Serial.printf("[onboard-camera] powered down reason=%s\n", onboardCameraPowerState.c_str());
+}
+
+bool reinitOnboardCamera(const char *reason) {
+  if (onboardCameraMutex != nullptr &&
+      xSemaphoreTake(onboardCameraMutex, pdMS_TO_TICKS(2500)) != pdTRUE) {
+    onboardLastCaptureError = "onboard_camera_busy";
+    onboardLastRecoveryReason = reason != nullptr ? reason : "reinit_busy";
+    return false;
+  }
+  onboardLastRecoveryReason = reason != nullptr ? reason : "reinit";
+  Serial.printf("[onboard-camera] reinit reason=%s\n", onboardLastRecoveryReason.c_str());
+  esp_camera_deinit();
+  onboardCameraReady = false;
+  onboardCameraPowerState = "reinitializing";
+  cooperativeDelay(1000);
+  const bool ok = initOnboardCamera();
+  ++onboardCameraReinitCount;
+  if (!ok) {
+    onboardLastCaptureError = "onboard_camera_not_ready";
+  }
+  if (onboardCameraMutex != nullptr) xSemaphoreGive(onboardCameraMutex);
+  return ok;
+}
+
+bool ensureOnboardCameraReady(String *error = nullptr) {
+  if (onboardCameraReady) {
+    if (esp_camera_sensor_get() != nullptr) {
+      return true;
+    }
+    if (!reinitOnboardCamera("sensor_unavailable")) {
+      if (error != nullptr) *error = "onboard_camera_not_ready";
+      return false;
+    }
+    return true;
+  }
+  if (!initOnboardCamera()) {
+    if (error != nullptr) *error = "onboard_camera_not_ready";
+    return false;
+  }
   return true;
 }
 
@@ -2080,6 +2372,7 @@ String buildDiagnosticStatusJson() {
   payload += ",\"chip_temperature_c\":" + String(temperatureDeciC / 10.0f, 1);
   payload += ",\"free_heap\":" + String(ESP.getFreeHeap());
   payload += ",\"minimum_free_heap\":" + String(ESP.getMinFreeHeap());
+  payload += ",\"low_battery_boot_hold\":" + buildLowBatteryBootHoldJson();
   payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   payload += ",\"sd_ready\":" + String(sdReady ? "true" : "false");
@@ -2217,53 +2510,92 @@ String buildOnboardMediaJson(const OnboardMediaInfo &info, bool includeCaptureFi
 }
 
 bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *savedMedia = nullptr, String *captureError = nullptr) {
-  if (!onboardCameraReady) {
+  if (!ensureOnboardCameraReady(captureError)) {
     ++onboardCaptureFailures;
-    if (captureError != nullptr) *captureError = "onboard_camera_not_ready";
     return false;
   }
   if (!onboardStorageReady) {
     ++onboardCaptureFailures;
+    onboardLastCaptureError = "storage_unavailable";
     if (captureError != nullptr) *captureError = "storage_unavailable";
     return false;
   }
 
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
-  fs::FS &fs = onboardMediaFs();
-
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (fb == nullptr || fb->len == 0) {
-    ++onboardCaptureFailures;
-    if (fb != nullptr) {
-      esp_camera_fb_return(fb);
+  camera_fb_t *fb = nullptr;
+  bool cameraLocked = false;
+  if (onboardCameraMutex != nullptr) {
+    if (xSemaphoreTake(onboardCameraMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+      ++onboardCaptureFailures;
+      onboardLastCaptureError = "onboard_camera_busy";
+      if (captureError != nullptr) *captureError = onboardLastCaptureError;
+      return false;
     }
-    if (captureError != nullptr) *captureError = "capture_failed";
-    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    cameraLocked = true;
+  }
+
+  fb = esp_camera_fb_get();
+  if (fb == nullptr || fb->len == 0) {
+    if (fb != nullptr) esp_camera_fb_return(fb);
+    if (cameraLocked) {
+      xSemaphoreGive(onboardCameraMutex);
+      cameraLocked = false;
+    }
+    ++onboardCaptureRecoveryCount;
+    onboardLastCaptureError = "capture_failed";
+    if (reinitOnboardCamera("capture_fb_failed")) {
+      cooperativeDelay(250);
+      if (onboardCameraMutex != nullptr) {
+        if (xSemaphoreTake(onboardCameraMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+          ++onboardCaptureFailures;
+          onboardLastCaptureError = "onboard_camera_busy_after_reinit";
+          if (captureError != nullptr) *captureError = onboardLastCaptureError;
+          return false;
+        }
+        cameraLocked = true;
+      }
+      fb = esp_camera_fb_get();
+    }
+  }
+
+  if (fb == nullptr || fb->len == 0) {
+    if (fb != nullptr) esp_camera_fb_return(fb);
+    if (cameraLocked) xSemaphoreGive(onboardCameraMutex);
+    ++onboardCaptureFailures;
+    onboardLastCaptureError = "capture_failed_after_reinit";
+    if (captureError != nullptr) *captureError = onboardLastCaptureError;
     return false;
   }
 
-  const uint64_t freeBytes = persistentStorageFreeBytes();
-  if (freeBytes < fb->len + sizeof(OnboardMediaMetaDisk) + 4096) {
-    ++onboardCaptureFailures;
+  const size_t copyLen = fb->len;
+  uint8_t *copy = static_cast<uint8_t *>(psramFound() ? ps_malloc(copyLen) : malloc(copyLen));
+  if (copy == nullptr) {
     esp_camera_fb_return(fb);
+    if (cameraLocked) xSemaphoreGive(onboardCameraMutex);
+    ++onboardCaptureFailures;
+    onboardLastCaptureError = "capture_alloc_failed";
+    if (captureError != nullptr) *captureError = "capture_failed";
+    return false;
+  }
+  memcpy(copy, fb->buf, copyLen);
+  const uint16_t width = fb->width;
+  const uint16_t height = fb->height;
+  esp_camera_fb_return(fb);
+  if (cameraLocked) xSemaphoreGive(onboardCameraMutex);
+
+  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  fs::FS &fs = onboardMediaFs();
+
+  const uint64_t freeBytes = persistentStorageFreeBytes();
+  if (freeBytes < copyLen + sizeof(OnboardMediaMetaDisk) + 4096) {
+    free(copy);
+    ++onboardCaptureFailures;
     onboardStorageError = "storage_full";
+    onboardLastCaptureError = "storage_full";
     if (captureError != nullptr) *captureError = "storage_full";
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     return false;
   }
 
-  uint8_t *copy = static_cast<uint8_t *>(psramFound() ? ps_malloc(fb->len) : malloc(fb->len));
-  if (copy == nullptr) {
-    ++onboardCaptureFailures;
-    esp_camera_fb_return(fb);
-    if (captureError != nullptr) *captureError = "capture_failed";
-    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
-    return false;
-  }
-  memcpy(copy, fb->buf, fb->len);
-  const size_t copyLen = fb->len;
-  const uint16_t width = fb->width;
-  const uint16_t height = fb->height;
   const uint32_t id = onboardNextMediaId;
   const uint32_t recordedAt = onboardClockValid() ? static_cast<uint32_t>(time(nullptr)) : 0;
   const String imagePath = onboardMediaImagePath(id);
@@ -2273,9 +2605,8 @@ bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *s
   fs.remove(tempImagePath);
   fs.remove(tempMetaPath);
   File imageFile = fs.open(tempImagePath, FILE_WRITE);
-  const size_t imageWritten = imageFile ? imageFile.write(fb->buf, fb->len) : 0;
+  const size_t imageWritten = imageFile ? imageFile.write(copy, copyLen) : 0;
   if (imageFile) imageFile.close();
-  esp_camera_fb_return(fb);
 
   OnboardMediaMetaDisk disk{};
   disk.magic = ONBOARD_MEDIA_META_MAGIC;
@@ -2300,6 +2631,7 @@ bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *s
     free(copy);
     ++onboardCaptureFailures;
     onboardStorageError = "storage_unavailable";
+    onboardLastCaptureError = "storage_unavailable";
     if (captureError != nullptr) *captureError = "storage_unavailable";
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     return false;
@@ -2314,6 +2646,7 @@ bool captureOnboardFrame(const char *captureKind = "manual", OnboardMediaInfo *s
   ++onboardStoredPhotoCount;
   onboardLatestMediaId = id;
   onboardStorageError = "";
+  onboardLastCaptureError = "";
 
   if (onboardFrameMutex != nullptr) {
     xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
@@ -2377,6 +2710,12 @@ String buildOnboardCameraStatusJson() {
   const int localMinute = onboardLocalMinuteOfDay();
   String payload = "{";
   payload += "\"ready\":" + String(onboardCameraReady ? "true" : "false");
+  payload += ",\"power_state\":\"" + jsonEscape(onboardCameraPowerState) + "\"";
+  payload += ",\"powered_down_by_schedule\":" + String(onboardCameraPoweredDownBySchedule ? "true" : "false");
+  payload += ",\"power_up_count\":" + String(onboardCameraPowerUpCount);
+  payload += ",\"power_down_count\":" + String(onboardCameraPowerDownCount);
+  payload += ",\"last_power_up_age_ms\":" + String(msSince(onboardCameraLastPowerUpMs));
+  payload += ",\"last_power_down_age_ms\":" + String(msSince(onboardCameraLastPowerDownMs));
   payload += ",\"enabled\":" + String(onboardCaptureEnabled ? "true" : "false");
   payload += ",\"interval_ms\":" + String(onboardCaptureIntervalMs);
   payload += ",\"window_start\":\"" + minuteOfDayToString(onboardCaptureStartMinute) + "\"";
@@ -2385,8 +2724,9 @@ String buildOnboardCameraStatusJson() {
   payload += ",\"window_end_minute\":" + String(onboardCaptureEndMinute);
   payload += ",\"tz_offset_min\":" + String(onboardCaptureTzOffsetMin);
   payload += ",\"clock_valid\":" + String(onboardClockValid() ? "true" : "false");
-  payload += ",\"schedule_mode\":\"" + String(onboardClockValid() ? "clock_window" : "uptime_fallback") + "\"";
+  payload += ",\"schedule_mode\":\"" + String(onboardClockValid() ? "clock_window" : "uptime_window_fallback") + "\"";
   payload += ",\"local_minute\":" + String(localMinute);
+  payload += ",\"actual_local_minute\":" + String(onboardActualLocalMinuteOfDay());
   payload += ",\"window_active\":" + String(onboardCaptureWindowActive() ? "true" : "false");
   payload += ",\"framesize\":\"" + String(frameSizeName(onboardFrameSize)) + "\"";
   payload += ",\"jpeg_quality\":" + String(onboardJpegQuality);
@@ -2421,6 +2761,10 @@ String buildOnboardCameraStatusJson() {
   payload += ",\"captures\":" + String(count);
   payload += ",\"failures\":" + String(failures);
   payload += ",\"schedule_skips\":" + String(scheduleSkips);
+  payload += ",\"camera_reinit_count\":" + String(onboardCameraReinitCount);
+  payload += ",\"capture_recovery_count\":" + String(onboardCaptureRecoveryCount);
+  payload += ",\"last_capture_error\":\"" + jsonEscape(onboardLastCaptureError) + "\"";
+  payload += ",\"last_recovery_reason\":\"" + jsonEscape(onboardLastRecoveryReason) + "\"";
   payload += ",\"last_capture_age_ms\":" + String(msSince(lastMs));
   payload += ",\"timelapse\":{";
   payload += "\"active\":" + String(onboardTimelapseActive ? "true" : "false");
@@ -2780,13 +3124,114 @@ void dumpOnboardJpegBase64(bool freshCapture) {
   }
 }
 
+bool queueOnboardJob(OnboardJobType type,
+                     const char *captureKind,
+                     bool oneShotSettings,
+                     const OnboardCameraSettings *settings,
+                     String &error) {
+  if (onboardJobMutex != nullptr) xSemaphoreTake(onboardJobMutex, portMAX_DELAY);
+  if (onboardJob.pending || onboardJob.running) {
+    if (onboardJobMutex != nullptr) xSemaphoreGive(onboardJobMutex);
+    error = "onboard_camera_busy";
+    return false;
+  }
+  onboardJob = {};
+  onboardJob.type = type;
+  onboardJob.pending = true;
+  onboardJob.oneShotSettings = oneShotSettings;
+  onboardJob.settingsRestored = !oneShotSettings;
+  snprintf(onboardJob.captureKind, sizeof(onboardJob.captureKind), "%s", captureKind != nullptr ? captureKind : "manual");
+  if (settings != nullptr) {
+    onboardJob.settings = *settings;
+  }
+  if (onboardJobMutex != nullptr) xSemaphoreGive(onboardJobMutex);
+  error = "";
+  return true;
+}
+
+bool waitOnboardJob(unsigned long timeoutMs, OnboardJobState &result, String &error) {
+  const unsigned long startedMs = millis();
+  while (millis() - startedMs < timeoutMs) {
+    if (onboardJobMutex != nullptr) xSemaphoreTake(onboardJobMutex, portMAX_DELAY);
+    const bool done = onboardJob.done;
+    if (done) {
+      result = onboardJob;
+      onboardJob = {};
+      if (onboardJobMutex != nullptr) xSemaphoreGive(onboardJobMutex);
+      error = result.error;
+      return true;
+    }
+    if (onboardJobMutex != nullptr) xSemaphoreGive(onboardJobMutex);
+    cooperativeDelay(25);
+  }
+  error = "onboard_job_timeout";
+  return false;
+}
+
+bool runQueuedOnboardJob() {
+  OnboardJobState job{};
+  if (onboardJobMutex != nullptr) xSemaphoreTake(onboardJobMutex, portMAX_DELAY);
+  if (!onboardJob.pending || onboardJob.running) {
+    if (onboardJobMutex != nullptr) xSemaphoreGive(onboardJobMutex);
+    return false;
+  }
+  onboardJob.pending = false;
+  onboardJob.running = true;
+  job = onboardJob;
+  if (onboardJobMutex != nullptr) xSemaphoreGive(onboardJobMutex);
+
+  String jobError;
+  if (job.type == ONBOARD_JOB_REINIT) {
+    job.ok = reinitOnboardCamera("worker_api_request");
+    if (!job.ok) jobError = "onboard_camera_not_ready";
+  } else if (job.type == ONBOARD_JOB_CAPTURE) {
+    OnboardCameraSettings restoreSettings = snapshotOnboardCameraSettings();
+    if (job.oneShotSettings) {
+      job.ok = applyOnboardCameraSettings(job.settings, jobError);
+      if (job.ok) cooperativeDelay(150);
+    } else {
+      job.ok = true;
+    }
+    if (job.ok) {
+      job.ok = captureOnboardFrame(job.captureKind, &job.media, &jobError);
+    }
+    if (job.oneShotSettings) {
+      String restoreError;
+      job.settingsRestored = applyOnboardCameraSettings(restoreSettings, restoreError);
+      if (!job.settingsRestored) {
+        Serial.printf("[onboard-camera] worker failed to restore settings: %s\n", restoreError.c_str());
+      }
+    }
+  } else {
+    job.ok = false;
+    jobError = "invalid_onboard_job";
+  }
+
+  snprintf(job.error, sizeof(job.error), "%s", jobError.c_str());
+  job.pending = false;
+  job.running = false;
+  job.done = true;
+  if (onboardJobMutex != nullptr) xSemaphoreTake(onboardJobMutex, portMAX_DELAY);
+  onboardJob = job;
+  if (onboardJobMutex != nullptr) xSemaphoreGive(onboardJobMutex);
+  return true;
+}
+
 void onboardCaptureTask(void *pvParameters) {
   (void)pvParameters;
   while (true) {
+    if (runQueuedOnboardJob()) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
     refreshOnboardTimelapseState();
-    if (onboardCameraReady) {
-      const unsigned long nowMs = millis();
-      if (onboardTimelapseActive) {
+    const unsigned long nowMs = millis();
+    if (onboardTimelapseActive) {
+      String cameraError;
+      if (!ensureOnboardCameraReady(&cameraError)) {
+        ++onboardCaptureFailures;
+        Serial.printf("[onboard-timelapse] camera unavailable error=%s\n", cameraError.c_str());
+      } else {
         if (onboardTimelapseLastCaptureMs == 0 ||
             nowMs - onboardTimelapseLastCaptureMs >= onboardTimelapseIntervalMs) {
           if (captureOnboardFrame("timelapse")) {
@@ -2794,28 +3239,41 @@ void onboardCaptureTask(void *pvParameters) {
             ++onboardTimelapseCaptureCount;
           }
         }
-      } else if (onboardCaptureEnabled) {
-        const unsigned long normalIntervalMs = onboardCaptureIntervalMs < 5000UL ? 5000UL : onboardCaptureIntervalMs;
+      }
+    } else if (onboardCaptureEnabled) {
+      const bool windowActive = onboardCaptureWindowActive();
+      if (!windowActive) {
+        if (onboardCameraReady) {
+          shutdownOnboardCamera("scheduled_window_inactive");
+          onboardCameraPoweredDownBySchedule = true;
+        }
         if (onboardLastScheduleAttemptMs == 0 ||
-            nowMs - onboardLastScheduleAttemptMs >= normalIntervalMs) {
-          if (!onboardClockValid()) {
+            nowMs - onboardLastScheduleAttemptMs >= onboardCaptureIntervalMs) {
+          onboardLastScheduleAttemptMs = nowMs;
+          ++onboardCaptureScheduleSkips;
+          Serial.printf("[onboard-camera] scheduled capture skipped/powered_down clock_valid=%s local_minute=%d window=%s-%s\n",
+                        onboardClockValid() ? "yes" : "no",
+                        onboardLocalMinuteOfDay(),
+                        minuteOfDayToString(onboardCaptureStartMinute).c_str(),
+                        minuteOfDayToString(onboardCaptureEndMinute).c_str());
+        }
+      } else {
+        String cameraError;
+        if (!ensureOnboardCameraReady(&cameraError)) {
+          ++onboardCaptureFailures;
+          Serial.printf("[onboard-camera] scheduled capture camera unavailable error=%s\n", cameraError.c_str());
+        } else {
+          onboardCameraPoweredDownBySchedule = false;
+          const unsigned long normalIntervalMs = onboardCaptureIntervalMs < 5000UL ? 5000UL : onboardCaptureIntervalMs;
+          if (onboardLastScheduleAttemptMs == 0 ||
+              nowMs - onboardLastScheduleAttemptMs >= normalIntervalMs) {
             onboardLastScheduleAttemptMs = nowMs;
-            Serial.println("[onboard-camera] scheduled capture using uptime fallback clock_valid=no");
             captureOnboardFrame("scheduled");
-          } else if (onboardCaptureWindowActive()) {
-            onboardLastScheduleAttemptMs = nowMs;
-            captureOnboardFrame("scheduled");
-          } else {
-            onboardLastScheduleAttemptMs = nowMs;
-            ++onboardCaptureScheduleSkips;
-            Serial.printf("[onboard-camera] scheduled capture skipped clock_valid=%s local_minute=%d window=%s-%s\n",
-                          onboardClockValid() ? "yes" : "no",
-                          onboardLocalMinuteOfDay(),
-                          minuteOfDayToString(onboardCaptureStartMinute).c_str(),
-                          minuteOfDayToString(onboardCaptureEndMinute).c_str());
           }
         }
       }
+    } else if (onboardCameraPoweredDownBySchedule && !onboardCaptureEnabled) {
+      onboardCameraPoweredDownBySchedule = false;
     }
     vTaskDelay(pdMS_TO_TICKS(ONBOARD_SCHEDULER_TICK_MS));
   }
@@ -3719,6 +4177,25 @@ void refreshWifiState() {
   wifiConnected = (WiFi.status() == WL_CONNECTED) && (WiFi.localIP() != IPAddress((uint32_t)0));
 }
 
+void powerDownTrailCameraWifiRadio(const char *reason) {
+  if (streamSessionActive) {
+    Serial.printf("[power] keeping trail camera WiFi active during stream reason=%s\n", reason);
+    return;
+  }
+  closeBleWakeSession();
+  if (wifiConnected || WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[power] disconnecting trail camera WiFi reason=%s ip=%s\n",
+                  reason,
+                  WiFi.localIP().toString().c_str());
+    WiFi.disconnect(true, true);
+    cooperativeDelay(150);
+  }
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(true);
+  WiFi.mode(WIFI_OFF);
+  wifiConnected = false;
+}
+
 static void bleNotifyCallback(NimBLERemoteCharacteristic *characteristic,
                               uint8_t *data,
                               size_t length,
@@ -4531,6 +5008,8 @@ bool recoverIdleWifi(const char *reason) {
 
 void scanCameraWifiPresence() {
   Serial.println("Rescanning for camera hotspot");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   const int count = WiFi.scanNetworks();
   bool foundTarget = false;
   for (int i = 0; i < count; ++i) {
@@ -4550,6 +5029,8 @@ void scanCameraWifiPresence() {
 
 bool waitForCameraWifiPresence(unsigned long timeoutMs, unsigned long intervalMs) {
   const unsigned long start = millis();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   while (millis() - start < timeoutMs) {
     const unsigned long elapsedMs = millis() - start;
     const int count = WiFi.scanNetworks();
@@ -5232,6 +5713,7 @@ bool proxyCameraRequest(const String &method,
     if (path == "/cmd/standby/now") {
       standbyRequested = true;
       releaseCameraSessionLease();
+      powerDownTrailCameraWifiRadio("camera_standby_request");
     } else if (path == "/cmd/standby/reset") {
       standbyRequested = false;
       markCameraActivity();
@@ -5251,6 +5733,27 @@ bool proxyCameraRequest(const String &method,
   return proxyCameraRequest(method, path, emptyBody, emptyContentType, responseBody, statusCode);
 }
 
+bool requestCameraStandbyAndPowerDownWifi(const char *reason) {
+  if (streamSessionActive) {
+    Serial.printf("[power] not requesting standby during active stream reason=%s\n", reason);
+    return false;
+  }
+  refreshWifiState();
+  bool standbyOk = false;
+  if (wifiConnected) {
+    String body;
+    int statusCode = 500;
+    const bool requestOk = proxyCameraRequest("GET", "/cmd/standby/now", body, statusCode);
+    standbyOk = requestOk && statusCode >= 200 && statusCode < 300;
+    Serial.printf("[power] standby request reason=%s ok=%s status=%d\n",
+                  reason,
+                  standbyOk ? "yes" : "no",
+                  statusCode);
+  }
+  powerDownTrailCameraWifiRadio(reason);
+  return standbyOk;
+}
+
 void processCameraSessionLeaseExpiry() {
   if (!cameraSessionLeaseActive || !cameraSessionLeaseExpired()) {
     return;
@@ -5265,11 +5768,11 @@ void processCameraSessionLeaseExpiry() {
   cameraSessionLeaseDurationMs = 0;
 
   if (sendStandby) {
-    String body;
-    int statusCode = 500;
     cameraSessionLeaseExpiredStandbySent = true;
     Serial.println("[session] lease expired, requesting standby");
-    proxyCameraRequest("GET", "/cmd/standby/now", body, statusCode);
+    requestCameraStandbyAndPowerDownWifi("session_lease_expired");
+  } else if (!streamSessionActive) {
+    powerDownTrailCameraWifiRadio("session_lease_expired_no_standby");
   }
 }
 
@@ -5706,10 +6209,14 @@ bool startStreamSession() {
 }
 
 bool runTriggerPhotoJob() {
+  const bool keepCameraSession = cameraSessionLeaseActive;
   if (!wifiConnected) {
     Serial.println("[job] trigger_photo requires camera bringup");
     if (!runBringupSequence()) {
       lastStreamStartMessage = "trigger_photo_bringup_failed";
+      if (!keepCameraSession) {
+        powerDownTrailCameraWifiRadio("trigger_photo_bringup_failed");
+      }
       return false;
     }
   }
@@ -5720,6 +6227,9 @@ bool runTriggerPhotoJob() {
       statusCode < 200 || statusCode >= 300) {
     Serial.printf("[job] trigger_photo take failed status=%d body=%s\n", statusCode, body.c_str());
     lastStreamStartMessage = "trigger_photo_take_failed";
+    if (!keepCameraSession) {
+      requestCameraStandbyAndPowerDownWifi("trigger_photo_take_failed");
+    }
     return false;
   }
 
@@ -5733,12 +6243,18 @@ bool runTriggerPhotoJob() {
                     resultStatus,
                     resultBody.c_str());
       lastStreamStartMessage = "trigger_photo_complete";
+      if (!keepCameraSession) {
+        requestCameraStandbyAndPowerDownWifi("trigger_photo_complete");
+      }
       return true;
     }
     cooperativeDelay(2000);
   }
 
   lastStreamStartMessage = "trigger_photo_result_timeout";
+  if (!keepCameraSession) {
+    requestCameraStandbyAndPowerDownWifi("trigger_photo_result_timeout");
+  }
   return false;
 }
 
@@ -5783,6 +6299,8 @@ bool runBringupSequence() {
   }
 
   WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   cooperativeDelay(250);
   refreshWifiState();
   bleWakeAttempted = true;
@@ -5830,7 +6348,8 @@ bool runBringupSequence() {
   }
   connectCameraWifi();
   if (RUN_LOCAL_SERIAL_TEST) {
-    Serial.println("[BLE] keeping wake session open in local serial mode");
+    Serial.println("[BLE] closing wake session after camera WiFi connect");
+    closeBleWakeSession();
   } else {
     closeBleWakeSession();
   }
@@ -6222,6 +6741,24 @@ void handleDiagnosticStatus() {
   server.send(200, "application/json", buildDiagnosticStatusJson());
 }
 
+void handleDiagnosticLog() {
+  if (!sdReady) {
+    server.send(503, "application/json", "{\"error\":\"sd_unavailable\"}");
+    return;
+  }
+  const char *path = (server.hasArg("previous") && server.arg("previous") == "1")
+                       ? "/diagnostics/health.previous.jsonl"
+                       : DIAGNOSTIC_LOG_PATH;
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    server.send(404, "application/json", "{\"error\":\"diagnostic_log_not_found\"}");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(file, "application/x-ndjson");
+  file.close();
+}
+
 void handleHaLowStatusHttp() {
   server.send(200, "application/json", buildHaLowStatusJson());
 }
@@ -6278,7 +6815,9 @@ void handleTrailMediaList() {
     File file = dir.openNextFile(FILE_READ);
     while (file) {
       const String name = file.name();
-      if (!file.isDirectory() && !name.endsWith(".part")) {
+      if (!file.isDirectory() &&
+          (name.endsWith(".JPG") || name.endsWith(".mp4")) &&
+          !name.endsWith(".part")) {
         const int slash = name.lastIndexOf('/');
         const String filename = slash >= 0 ? name.substring(slash + 1) : name;
         if (!first) payload += ',';
@@ -6316,6 +6855,30 @@ void handleTrailMediaFile() {
   file.close();
   if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
 }
+
+void handleSystemRestart() {
+  server.send(202, "application/json", "{\"ok\":true,\"action\":\"system_restart\",\"restart_pending\":true}");
+  delay(100);
+  ESP.restart();
+}
+
+void handleOnboardCameraReinit() {
+  String error;
+  if (!queueOnboardJob(ONBOARD_JOB_REINIT, "manual", false, nullptr, error)) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(error) + "\"}");
+    return;
+  }
+  OnboardJobState result{};
+  const bool completed = waitOnboardJob(20000UL, result, error);
+  const bool ok = completed && result.ok;
+  String payload = "{";
+  payload += "\"ok\":" + String(ok ? "true" : "false");
+  if (!ok) payload += ",\"error\":\"" + jsonEscape(error.isEmpty() ? String("onboard_camera_not_ready") : error) + "\"";
+  payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
+  payload += "}";
+  server.send(ok ? 200 : 503, "application/json", payload);
+}
+
 void handleOnboardCameraStatus() {
   server.send(200, "application/json", buildOnboardCameraStatusJson());
 }
@@ -6352,41 +6915,34 @@ void handleOnboardCameraLatest() {
 }
 
 void handleOnboardCameraCapture() {
-  if (!onboardCameraReady) {
-    server.send(503, "application/json", "{\"error\":\"onboard_camera_not_ready\"}");
-    return;
-  }
-
   const bool hasOneShotSettings = serverHasOnboardSensorArgs();
-  const OnboardCameraSettings scheduledSettings = snapshotOnboardCameraSettings();
+  OnboardCameraSettings oneShotSettings = snapshotOnboardCameraSettings();
   if (hasOneShotSettings) {
     String sensorError;
-    if (!applyOnboardCameraSensorArgs(sensorError, false)) {
+    if (!parseOnboardCameraSettingsFromServer(oneShotSettings, sensorError)) {
       server.send(400, "application/json", "{\"error\":\"" + jsonEscape(sensorError) + "\"}");
       return;
     }
-    cooperativeDelay(150);
   }
 
-  OnboardMediaInfo savedMedia{};
-  String captureError;
-  const bool ok = captureOnboardFrame("manual", &savedMedia, &captureError);
-  bool settingsRestored = !hasOneShotSettings;
-  if (hasOneShotSettings) {
-    String restoreError;
-    settingsRestored = applyOnboardCameraSettings(scheduledSettings, restoreError);
-    if (!settingsRestored) {
-      Serial.printf("[onboard-camera] failed to restore scheduled settings: %s\n", restoreError.c_str());
-    }
+  String queueError;
+  if (!queueOnboardJob(ONBOARD_JOB_CAPTURE, "manual", hasOneShotSettings, &oneShotSettings, queueError)) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(queueError) + "\"}");
+    return;
   }
+  OnboardJobState result{};
+  String waitError;
+  const bool completed = waitOnboardJob(45000UL, result, waitError);
+  const bool ok = completed && result.ok;
+  const String captureError = completed ? String(result.error) : waitError;
 
   String payload = "{";
   payload += "\"ok\":" + String(ok ? "true" : "false");
   if (!ok) payload += ",\"error\":\"" + jsonEscape(captureError.isEmpty() ? String("capture_failed") : captureError) + "\"";
-  if (ok) payload += ",\"media\":" + buildOnboardMediaJson(savedMedia, false);
+  if (ok) payload += ",\"media\":" + buildOnboardMediaJson(result.media, false);
   payload += ",\"latest_updated\":" + String(ok ? "true" : "false");
   payload += ",\"one_shot_settings\":" + String(hasOneShotSettings ? "true" : "false");
-  payload += ",\"settings_restored\":" + String(settingsRestored ? "true" : "false");
+  payload += ",\"settings_restored\":" + String(result.settingsRestored ? "true" : "false");
   payload += ",\"onboard_camera\":" + buildOnboardCameraStatusJson();
   payload += "}";
   const int status = ok ? 200 : (captureError == "storage_full" ? 507 : (captureError == "storage_unavailable" ? 503 : 500));
@@ -6630,8 +7186,9 @@ bool parseOnboardTimelapseArgs(unsigned long &durationMs, unsigned long &interva
 }
 
 void handleOnboardTimelapseStart() {
-  if (!onboardCameraReady) {
-    server.send(503, "application/json", "{\"error\":\"onboard_camera_not_ready\"}");
+  String cameraError;
+  if (!ensureOnboardCameraReady(&cameraError)) {
+    server.send(503, "application/json", "{\"error\":\"" + jsonEscape(cameraError) + "\"}");
     return;
   }
 
@@ -6709,6 +7266,13 @@ void handleOnboardCameraConfig() {
     backfillOnboardMediaTimestamps();
     configChanged = true;
   }
+  if (serverHasOnboardSensorArgs()) {
+    String cameraError;
+    if (!ensureOnboardCameraReady(&cameraError)) {
+      server.send(503, "application/json", "{\"error\":\"" + jsonEscape(cameraError) + "\"}");
+      return;
+    }
+  }
   String sensorError;
   if (!applyOnboardCameraSensorArgs(sensorError, true)) {
     server.send(400, "application/json", "{\"error\":\"" + jsonEscape(sensorError) + "\"}");
@@ -6717,6 +7281,17 @@ void handleOnboardCameraConfig() {
   if (configChanged) {
     clampOnboardConfig();
     saveOnboardConfig();
+  }
+  if (!onboardTimelapseActive) {
+    if (onboardCaptureEnabled && onboardCaptureWindowActive()) {
+      String cameraError;
+      if (ensureOnboardCameraReady(&cameraError)) {
+        onboardCameraPoweredDownBySchedule = false;
+      }
+    } else {
+      shutdownOnboardCamera(onboardCaptureEnabled ? "scheduled_window_inactive" : "scheduled_disabled");
+      onboardCameraPoweredDownBySchedule = onboardCaptureEnabled;
+    }
   }
   server.send(200, "application/json", buildOnboardCameraStatusJson());
 }
@@ -7656,6 +8231,91 @@ String durableMediaFilePath(const DurableMediaRecord &record, bool partial = fal
   return path;
 }
 
+String durableMediaSizeSidecarPath(const String &mediaPath) {
+  return mediaPath + ".size";
+}
+
+uint32_t readDurableMediaStoredSize(const String &mediaPath) {
+  File file = SD.open(durableMediaSizeSidecarPath(mediaPath), FILE_READ);
+  if (!file) return 0;
+  String value = file.readString();
+  file.close();
+  value.trim();
+  const long parsed = strtol(value.c_str(), nullptr, 10);
+  return parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+}
+
+void writeDurableMediaStoredSize(const String &mediaPath, uint32_t bytes) {
+  if (bytes == 0) return;
+  File file = SD.open(durableMediaSizeSidecarPath(mediaPath), FILE_WRITE);
+  if (!file) return;
+  file.print(String(bytes));
+  file.flush();
+  file.close();
+}
+
+uint64_t readBigEndian32(const uint8_t *bytes) {
+  return (static_cast<uint64_t>(bytes[0]) << 24) |
+         (static_cast<uint64_t>(bytes[1]) << 16) |
+         (static_cast<uint64_t>(bytes[2]) << 8) |
+         static_cast<uint64_t>(bytes[3]);
+}
+
+bool isPrintableMp4AtomType(const uint8_t *type) {
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (type[i] < 0x20 || type[i] > 0x7e) return false;
+  }
+  return true;
+}
+
+bool validateMp4FileBasic(const String &path) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  const uint64_t fileSize = file.size();
+  uint64_t offset = 0;
+  bool sawFtyp = false;
+  bool sawMdat = false;
+  bool sawMoov = false;
+  uint16_t atomCount = 0;
+  while (offset + 8 <= fileSize && atomCount < 256) {
+    if (!file.seek(offset)) { file.close(); return false; }
+    uint8_t header[8];
+    if (file.read(header, sizeof(header)) != sizeof(header)) { file.close(); return false; }
+    uint64_t atomSize = readBigEndian32(header);
+    const uint8_t *atomType = header + 4;
+    if (!isPrintableMp4AtomType(atomType)) { file.close(); return false; }
+    uint64_t headerSize = 8;
+    if (atomSize == 1) {
+      uint8_t extended[8];
+      if (file.read(extended, sizeof(extended)) != sizeof(extended)) { file.close(); return false; }
+      atomSize = (readBigEndian32(extended) << 32) | readBigEndian32(extended + 4);
+      headerSize = 16;
+    } else if (atomSize == 0) {
+      atomSize = fileSize - offset;
+    }
+    if (atomSize < headerSize || offset + atomSize > fileSize) {
+      file.close();
+      return false;
+    }
+    if (memcmp(atomType, "ftyp", 4) == 0) sawFtyp = true;
+    if (memcmp(atomType, "mdat", 4) == 0) sawMdat = true;
+    if (memcmp(atomType, "moov", 4) == 0) sawMoov = true;
+    offset += atomSize;
+    ++atomCount;
+  }
+  file.close();
+  return fileSize > 0 && offset == fileSize && sawFtyp && sawMdat && sawMoov;
+}
+
+uint32_t parseContentRangeTotal(const String &line) {
+  const int slash = line.lastIndexOf('/');
+  if (slash < 0 || slash + 1 >= static_cast<int>(line.length())) return 0;
+  const String totalText = line.substring(slash + 1);
+  if (totalText == "*") return 0;
+  const long parsed = strtol(totalText.c_str(), nullptr, 10);
+  return parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+}
+
 bool flushCameraSdBuffer(File &output, uint8_t *sdBuffer, size_t &buffered) {
   if (buffered == 0) return true;
   const bool ok = output.write(sdBuffer, buffered) == buffered;
@@ -7690,33 +8350,45 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
   bytesWritten = 0;
   const String finalPath = durableMediaFilePath(record, false);
   const String partialPath = durableMediaFilePath(record, true);
+  const bool isVideo = record.type == 2;
+  const uint32_t storedExpectedBytes = readDurableMediaStoredSize(finalPath);
+  const uint32_t knownExpectedBytes = record.expectedBytes > 0 ? record.expectedBytes : storedExpectedBytes;
   File existing = SD.open(finalPath, FILE_READ);
   if (existing) {
     const size_t size = existing.size();
     existing.close();
-    if (size > 0 && (record.expectedBytes == 0 || size == record.expectedBytes)) {
+    if (size > 0 && ((knownExpectedBytes > 0 && size == knownExpectedBytes) ||
+                     (!isVideo && knownExpectedBytes == 0))) {
       bytesWritten = size;
       error = "already_staged";
       return true;
     }
     SD.remove(finalPath);
+    SD.remove(durableMediaSizeSidecarPath(finalPath));
   }
   size_t resumeOffset = 0;
   File partial = SD.open(partialPath, FILE_READ);
   if (partial) {
     resumeOffset = partial.size();
     partial.close();
-    if (record.expectedBytes > 0 && resumeOffset == record.expectedBytes) {
-      SD.remove(finalPath);
-      if (SD.rename(partialPath, finalPath)) {
-        bytesWritten = resumeOffset;
-        error = "already_staged";
-        return true;
+    if (knownExpectedBytes > 0 && resumeOffset == knownExpectedBytes) {
+      if (isVideo && !validateMp4FileBasic(partialPath)) {
+        SD.remove(partialPath);
+        SD.remove(durableMediaSizeSidecarPath(finalPath));
+        resumeOffset = 0;
+      } else {
+        SD.remove(finalPath);
+        if (SD.rename(partialPath, finalPath)) {
+          bytesWritten = resumeOffset;
+          writeDurableMediaStoredSize(finalPath, static_cast<uint32_t>(resumeOffset));
+          error = "already_staged";
+          return true;
+        }
+        error = "stage_rename_failed";
+        return false;
       }
-      error = "stage_rename_failed";
-      return false;
     }
-    if (record.expectedBytes > 0 && resumeOffset > record.expectedBytes) {
+    if (knownExpectedBytes > 0 && resumeOffset > knownExpectedBytes) {
       SD.remove(partialPath);
       resumeOffset = 0;
     }
@@ -7729,7 +8401,8 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
   const String cameraPath = "/file/" + String(record.id) + (record.type == 1 ? "/JPG" : "/mp4");
   String request = "GET " + cameraPath + " HTTP/1.1\r\nHost: " + CAMERA_IP.toString() + ":" + String(CAMERA_HTTP_PORT) +
                    "\r\nUser-Agent: esp32-gardepro-durable/1\r\n";
-  if (resumeOffset > 0) request += "Range: bytes=" + String(resumeOffset) + "-\r\n";
+  const bool requestRange = isVideo || resumeOffset > 0;
+  if (requestRange) request += "Range: bytes=" + String(resumeOffset) + "-\r\n";
   request += "Connection: close\r\n\r\n";
   client.print(request);
   unsigned long waitStart = millis();
@@ -7744,6 +8417,7 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
   const int firstSpace = statusLine.indexOf(' ');
   const int statusCode = firstSpace >= 0 ? statusLine.substring(firstSpace + 1).toInt() : 0;
   int contentLength = -1;
+  uint32_t contentRangeTotal = 0;
   bool chunked = false;
   while (client.connected()) {
     String line = client.readStringUntil('\n');
@@ -7752,6 +8426,7 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     String lower = line;
     lower.toLowerCase();
     if (lower.startsWith("content-length:")) contentLength = line.substring(15).toInt();
+    if (lower.startsWith("content-range:")) contentRangeTotal = parseContentRangeTotal(line);
     if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0) chunked = true;
   }
   if (statusCode < 200 || statusCode >= 300) {
@@ -7759,10 +8434,17 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     error = "camera_http_" + String(statusCode);
     return false;
   }
-  const bool rangeAccepted = resumeOffset > 0 && statusCode == 206;
+  const bool rangeAccepted = requestRange && statusCode == 206;
   if (resumeOffset > 0 && !rangeAccepted) {
     SD.remove(partialPath);
     resumeOffset = 0;
+  }
+  uint32_t expectedTotalBytes = record.expectedBytes;
+  if (expectedTotalBytes == 0 && contentRangeTotal > 0) {
+    expectedTotalBytes = contentRangeTotal;
+  }
+  if (expectedTotalBytes == 0 && contentLength >= 0 && !chunked) {
+    expectedTotalBytes = static_cast<uint32_t>((rangeAccepted ? resumeOffset : 0) + static_cast<size_t>(contentLength));
   }
   if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
   File output = SD.open(partialPath, rangeAccepted ? FILE_APPEND : FILE_WRITE);
@@ -7834,14 +8516,24 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
   if (output) { output.flush(); output.close(); }
   if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
   client.stop();
-  if (ok && written > 0 && record.expectedBytes > 0 && written != record.expectedBytes) {
+  if (ok && written > 0 && expectedTotalBytes > 0 && written != expectedTotalBytes) {
     ok = false;
-    error = "size_mismatch_expected_" + String(record.expectedBytes) + "_got_" + String(written);
+    error = "size_mismatch_expected_" + String(expectedTotalBytes) + "_got_" + String(written);
+  }
+  if (ok && isVideo && expectedTotalBytes == 0) {
+    ok = false;
+    error = "video_size_unknown";
+  }
+  if (ok && isVideo && !validateMp4FileBasic(partialPath)) {
+    ok = false;
+    error = "mp4_validation_failed";
+    SD.remove(partialPath);
   }
   if (ok && written > 0) {
     SD.remove(finalPath);
     ok = SD.rename(partialPath, finalPath);
     if (!ok) error = "stage_rename_failed";
+    else if (expectedTotalBytes > 0) writeDurableMediaStoredSize(finalPath, expectedTotalBytes);
   }
   bytesWritten = static_cast<uint32_t>(written);
   return ok;
@@ -7929,6 +8621,7 @@ void durableMediaJobRetry(const String &error) {
   saveDurableMediaJob();
   Serial.printf("[durable-job] id=%u retry=%u error=%s\n",
                 durableMediaJob.jobId, durableMediaJob.retryCount, error.c_str());
+  requestCameraStandbyAndPowerDownWifi("durable_media_retry_wait");
 }
 
 void serviceDurableMediaJob() {
@@ -7981,6 +8674,7 @@ void serviceDurableMediaJob() {
     if (totalCount == 0) {
       durableMediaJob.status = DURABLE_MEDIA_SUCCEEDED;
       saveDurableMediaJob();
+      requestCameraStandbyAndPowerDownWifi("durable_media_complete_empty");
       return;
     }
   }
@@ -7993,6 +8687,7 @@ void serviceDurableMediaJob() {
                   durableMediaJob.jobId, durableMediaJob.downloadedCount,
                   durableMediaJob.skippedCount, durableMediaJob.deletedCount,
                   durableMediaJob.bytesDownloaded);
+    requestCameraStandbyAndPowerDownWifi("durable_media_complete");
     return;
   }
   DurableMediaRecord record{};
@@ -8254,13 +8949,16 @@ void controlWorkerTask(void *pvParameters) {
 void startHttpServer() {
   if (httpServerStarted) {
     server.begin();
+    startHttpServiceTask();
     return;
   }
   server.on("/healthz", HTTP_GET, handleHealthz);
   server.on("/system/http_restart", HTTP_POST, handleHttpRestart);
+  server.on("/system/restart", HTTP_POST, handleSystemRestart);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/system/status", HTTP_GET, handleSystemStatus);
   server.on("/diagnostics/status", HTTP_GET, handleDiagnosticStatus);
+  server.on("/diagnostics/log", HTTP_GET, handleDiagnosticLog);
   server.on("/halow/status", HTTP_GET, handleHaLowStatusHttp);
   server.on("/wifi/status", HTTP_GET, handleWifiStatus);
   server.on("/camera/status", HTTP_GET, handleCameraBridgeStatus);
@@ -8287,6 +8985,7 @@ void startHttpServer() {
   server.on("/session/status", HTTP_GET, handleSessionStatus);
   server.on("/battery/status", HTTP_GET, handleBatteryStatus);
   server.on("/onboard/status", HTTP_GET, handleOnboardCameraStatus);
+  server.on("/onboard/reinit", HTTP_POST, handleOnboardCameraReinit);
   server.on("/onboard/latest.jpg", HTTP_GET, handleOnboardCameraLatest);
   server.on("/onboard/capture", HTTP_POST, handleOnboardCameraCapture);
   server.on("/onboard/media", HTTP_GET, handleOnboardMediaList);
@@ -8324,6 +9023,7 @@ void startHttpServer() {
   server.on("/camera/standby/reset", HTTP_GET, handleStandbyReset);
   server.begin();
   httpServerStarted = true;
+  startHttpServiceTask();
   Serial.printf("Bridge HTTP server on port %u\n", BRIDGE_HTTP_PORT);
 }
 
@@ -8840,16 +9540,23 @@ void setup() {
   enqueueUploadEvent("boot", "startup", "{\"firmware\":\"" + jsonEscape(FIRMWARE_VERSION) + "\"}", true);
 
   pinMode(BAT_ADC_CTRL_PIN, OUTPUT);
-  digitalWrite(BAT_ADC_CTRL_PIN, LOW);
+  digitalWrite(BAT_ADC_CTRL_PIN, BAT_ADC_CTRL_IDLE_LEVEL);
   pinMode(BAT_CHRG_PIN, INPUT_PULLUP);
   pinMode(BAT_DONE_PIN, INPUT_PULLUP);
   analogReadResolution(12);
   analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+  const uint32_t bootBatteryMv = readBatteryMilliVolts(16);
+  if (batteryBootHoldRequired(bootBatteryMv)) {
+    enterLowBatteryBootHold(bootBatteryMv);
+    return;
+  }
   Serial.printf("[battery] %s\n", buildBatteryJson().c_str());
 
   onboardFrameMutex = xSemaphoreCreateMutex();
   onboardStorageMutex = xSemaphoreCreateMutex();
+  onboardCameraMutex = xSemaphoreCreateMutex();
   observationUploadMutex = xSemaphoreCreateMutex();
+  httpServiceMutex = xSemaphoreCreateMutex();
   durableMediaJobMutex = xSemaphoreCreateMutex();
   initOnboardStorage();
   mountSdCard();
@@ -8857,7 +9564,19 @@ void setup() {
   appendDiagnosticJournal("boot");
   loadOnboardConfig();
   loadScannerConfig();
-  initOnboardCamera();
+  if (onboardCaptureEnabled && onboardCaptureWindowActive()) {
+    initOnboardCamera();
+  } else {
+    onboardCameraReady = false;
+    onboardCameraPoweredDownBySchedule = onboardCaptureEnabled;
+    onboardCameraPowerState = onboardCaptureEnabled ? "scheduled_window_inactive" : "scheduled_disabled";
+    Serial.printf("[onboard-camera] boot init skipped power_state=%s clock_valid=%s local_minute=%d window=%s-%s\n",
+                  onboardCameraPowerState.c_str(),
+                  onboardClockValid() ? "yes" : "no",
+                  onboardLocalMinuteOfDay(),
+                  minuteOfDayToString(onboardCaptureStartMinute).c_str(),
+                  minuteOfDayToString(onboardCaptureEndMinute).c_str());
+  }
   if (onboardCaptureTaskHandle == nullptr) {
     xTaskCreatePinnedToCore(onboardCaptureTask,
                             "onboard-capture",
@@ -8941,6 +9660,12 @@ void setup() {
 }
 
 void loop() {
+  if (lowBatteryBootHold) {
+    pollSerialConsole();
+    serviceLowBatteryBootHold();
+    return;
+  }
+
   pollSerialConsole();
   servicePersistentDiagnostics();
   if (otaRestartPending && millis() >= otaRestartAtMs) {
@@ -8954,7 +9679,9 @@ void loop() {
     if (!httpServerStarted) {
       startHttpServer();
     }
-    serviceBoardHttp();
+    if (httpServiceTaskHandle == nullptr) {
+      serviceBoardHttp();
+    }
     maybeRestartHttpServerIdle();
     if (halowConnected && !onboardClockValid() &&
         (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
@@ -9017,8 +9744,12 @@ void loop() {
     return;
   }
 
-  serviceBoardHttp();
+  if (httpServiceTaskHandle == nullptr) {
+    serviceBoardHttp();
+  }
   maybeRestartHttpServerIdle();
+  refreshWifiState();
+  processCameraSessionLeaseExpiry();
 
   if (halowConnected && !onboardClockValid() &&
       (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
