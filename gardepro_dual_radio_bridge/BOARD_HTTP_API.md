@@ -188,6 +188,21 @@ Important fields:
 - `stream_status`
 - `stream_active`
 - `tunnel_connected`
+- `stream_status.rtp_flowing`
+- `stream_status.rtp_stalled`
+- `stream_status.stall_fail_ms`
+- `stream_status.stall_count`
+- `stream_status.rtp_packets_received`
+- `stream_status.rtp_packets_forwarded`
+- `stream_status.rtp_sequence_gaps`
+- `stream_status.rtp_packets_missing`
+- `stream_status.rtp_out_of_order`
+- `stream_status.rtp_forward_failures`
+- `stream_status.udp_receive_overruns`
+- `stream_status.last_rtp_sequence`
+- `stream_status.rtp_loss_pct`
+- `stream_status.rtp_keyframe_seen`
+- `stream_status.rtp_keyframes_observed`
 - `recoveries`
 - `idle_recoveries`
 - `http_keepalive_failures`
@@ -196,7 +211,7 @@ Important fields:
 - `media_secondary_packets`
 - `media_secondary_bytes`
 
-During active live view the stream can still be functional even if occasional ESP32 control/status HTTP polls reset or time out. Treat packet counters as the functional signal.
+During active live view, treat RTP packet movement as the functional signal. The webserver should compare `media_primary_packets`, `stream_status.tunnel_packets_sent`, and `stream_status.udp_primary.last_packet_age_ms` across polls. If `stream_active=true` but `rtp_stalled=true`, the camera-side RTP stream has stopped and the UI should fail or restart live view instead of continuing to show "waiting for relay".
 
 ### `GET /control/summary`
 
@@ -410,6 +425,8 @@ Live view is split into two independent states:
 - optional HaLow tunnel forwarding to the upstream receiver
 
 If the trail-camera RTSP session starts but HaLow or the tunnel is unavailable, the job still succeeds as a local camera stream. `/stream/status` then reports camera packet counters while `tunnel_connected` remains `false`.
+
+If the camera stops sending RTP after live view starts, the firmware now marks the stream stalled, stops the stale local/tunnel session, and exposes `control_error: "stream_rtp_stalled"` through `/control/status` so callers can fail fast.
 
 ### `POST /control/stream_stop`
 

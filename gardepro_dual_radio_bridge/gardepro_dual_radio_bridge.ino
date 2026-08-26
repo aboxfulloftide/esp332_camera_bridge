@@ -255,6 +255,20 @@ static const CameraProfile CAMERA_PROFILES[] = {
 };
 String serialCommandBuffer;
 bool udpInspectorsStarted = false;
+volatile bool udpPrimaryReady = false;
+volatile bool udpSecondaryReady = false;
+uint32_t rtpPacketsReceived = 0;
+uint32_t rtpPacketsForwarded = 0;
+uint32_t rtpSequenceGaps = 0;
+uint32_t rtpPacketsMissing = 0;
+uint32_t rtpOutOfOrder = 0;
+uint32_t rtpForwardFailures = 0;
+uint32_t udpReceiveOverruns = 0;
+uint16_t lastRtpSequence = 0;
+bool haveLastRtpSequence = false;
+bool rtpKeyframeSeen = false;
+uint32_t rtpKeyframesObserved = 0;
+static const uint32_t RTP_MAX_HEALTH_LOSS_PCT = 20;
 bool streamSessionActive = false;
 uint32_t halowEventCount = 0;
 int halowLastEventId = -1;
@@ -280,12 +294,19 @@ unsigned long lastStreamRecoveryMs = 0;
 unsigned long lastIdleRecoveryMs = 0;
 unsigned long streamSessionStartedMs = 0;
 unsigned long lastStreamStopMs = 0;
+unsigned long lastStreamStallMs = 0;
+uint32_t streamStallCount = 0;
+uint32_t rtspKeepaliveCount = 0;
+uint32_t rtspKeepaliveFailures = 0;
+int lastRtspKeepaliveStatus = 0;
+String lastRtspKeepaliveMethod = "";
 static const unsigned long RTSP_KEEPALIVE_INTERVAL_MS = 5000;
 static const unsigned long TUNNEL_CONNECT_TIMEOUT_MS = 3000;
 static const unsigned long BLE_KEEPALIVE_INTERVAL_MS = 20000;
 static const unsigned long HTTP_KEEPALIVE_INTERVAL_MS = 15000;
 static const unsigned long TUNNEL_RECONNECT_INTERVAL_MS = 2000;
 static const unsigned long STREAM_STALL_TIMEOUT_MS = 4000;
+static const unsigned long STREAM_STALL_FAIL_MS = 15000;
 static const unsigned long STREAM_RECOVERY_COOLDOWN_MS = 10000;
 static const unsigned long IDLE_WIFI_RECOVERY_COOLDOWN_MS = 30000;
 static const unsigned long CAMERA_SESSION_DEFAULT_LEASE_MS = 120000;
@@ -296,7 +317,7 @@ static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
 #define CAMERA_HTTP_KEEPALIVE_ENABLED 0
 #endif
 #ifndef CAMERA_AUTO_RECOVERY_ENABLED
-#define CAMERA_AUTO_RECOVERY_ENABLED 0
+#define CAMERA_AUTO_RECOVERY_ENABLED 1
 #endif
 #ifndef HTTP_SERVER_IDLE_RESTART_MS
 #define HTTP_SERVER_IDLE_RESTART_MS 0UL
@@ -1128,6 +1149,25 @@ bool connectTunnelSocket() {
 }
 
 void closeRtspSession() {
+  // Explicitly tear down an active RTSP session before closing the TCP
+  // connection.  Some trail-camera firmware keeps the previous RTP session
+  // alive when the client simply drops TCP, causing subsequent PLAY requests
+  // to return 200 but emit no UDP media.
+  if (cameraRtspClient.connected() &&
+      rtspSessionOpen &&
+      !rtspSessionHeader.isEmpty() &&
+      !rtspPlayUrl.isEmpty()) {
+    String teardownResponse;
+    int teardownStatus = 0;
+    String teardownHeaders = "Session: " + rtspSessionHeader + "\r\n";
+    exchangeCameraRtspRequest(cameraRtspClient,
+                              "TEARDOWN",
+                              rtspPlayUrl,
+                              teardownHeaders,
+                              teardownResponse,
+                              teardownStatus);
+    Serial.printf("[rtsp-live] TEARDOWN status=%d\n", teardownStatus);
+  }
   if (cameraRtspClient.connected()) {
     cameraRtspClient.stop();
   }
@@ -1146,6 +1186,7 @@ void stopTunnelSession(const char *reason) {
                 activeMs,
                 msSince(lastPrimaryPacketMs),
                 msSince(lastSecondaryPacketMs));
+  streamSessionActive = false;
   const int sock = getTunnelSocketSnapshot();
   if (sock >= 0) {
     String metadata = "{\"type\":\"stop\",\"reason\":\"";
@@ -1155,9 +1196,29 @@ void stopTunnelSession(const char *reason) {
   }
   closeTunnelSocket();
   closeRtspSession();
-  streamSessionActive = false;
   lastStreamStopMs = millis();
   streamSessionStartedMs = 0;
+}
+
+void serviceStreamHealth() {
+  if (!streamSessionActive || lastPrimaryPacketMs == 0) return;
+  const unsigned long gapMs = millis() - lastPrimaryPacketMs;
+  if (gapMs <= STREAM_STALL_FAIL_MS) return;
+#if CAMERA_AUTO_RECOVERY_ENABLED
+  // The main loop's recovery path owns stalled-session restart when enabled.
+  // Leave the session state intact long enough for recoverActiveStream() to
+  // tear down and establish a fresh RTSP/tunnel session.
+  return;
+#endif
+  ++streamStallCount;
+  lastStreamStallMs = millis();
+  lastStreamStartStage = "rtp_stalled";
+  lastStreamStartMessage = "stream_rtp_stalled";
+  Serial.printf("[stream] RTP stalled gap_ms=%lu count=%u; stopping stale session\n",
+                gapMs,
+                static_cast<unsigned>(streamStallCount));
+  stopTunnelSession("rtp_stalled");
+  finishControlAction(CONTROL_ACTION_STREAM_START, false, "stream_rtp_stalled");
 }
 
 bool sendTunnelMediaPacket(uint8_t streamId, uint8_t flags, const uint8_t *payload, size_t payloadLen) {
@@ -1297,30 +1358,60 @@ String buildTimingJson() {
 }
 
 String buildStreamStatusJson() {
+  const unsigned long primaryAgeMs = msSince(lastPrimaryPacketMs);
+  const uint32_t lossDenominator = rtpPacketsReceived + rtpPacketsMissing;
+  const uint32_t lossPct = lossDenominator == 0 ? 100 :
+                           static_cast<uint32_t>((static_cast<uint64_t>(rtpPacketsMissing) * 100ULL) / lossDenominator);
+  const bool primaryFlowing = streamSessionActive && lastPrimaryPacketMs > 0 &&
+                              primaryAgeMs < 5000UL && rtpPacketsReceived > 0 &&
+                              rtpPacketsForwarded > 0 && lossPct <= RTP_MAX_HEALTH_LOSS_PCT;
+  const bool primaryStalled = streamSessionActive && lastPrimaryPacketMs > 0 && primaryAgeMs > STREAM_STALL_FAIL_MS;
   String payload = "{";
   payload += "\"last_stage\":\"" + jsonEscape(lastStreamStartStage) + "\"";
   payload += ",\"last_message\":\"" + jsonEscape(lastStreamStartMessage) + "\"";
+  payload += ",\"rtp_flowing\":" + String(primaryFlowing ? "true" : "false");
+  payload += ",\"rtp_stalled\":" + String(primaryStalled ? "true" : "false");
+  payload += ",\"stall_fail_ms\":" + String(STREAM_STALL_FAIL_MS);
+  payload += ",\"stall_count\":" + String(streamStallCount);
+  payload += ",\"last_stall_age_ms\":" + String(msSince(lastStreamStallMs));
   payload += ",\"last_elapsed_ms\":" + String(lastStreamStartElapsedMs);
   payload += ",\"last_started_age_ms\":" + String(msSince(lastStreamStartMs));
   payload += ",\"describe_status\":" + String(lastStreamDescribeStatus);
   payload += ",\"setup_status\":" + String(lastStreamSetupStatus);
   payload += ",\"play_status\":" + String(lastStreamPlayStatus);
   payload += ",\"play_url\":\"" + jsonEscape(lastStreamPlayUrl) + "\"";
+  payload += ",\"rtsp_keepalive_count\":" + String(rtspKeepaliveCount);
+  payload += ",\"rtsp_keepalive_failures\":" + String(rtspKeepaliveFailures);
+  payload += ",\"last_rtsp_keepalive_status\":" + String(lastRtspKeepaliveStatus);
+  payload += ",\"last_rtsp_keepalive_method\":\"" + jsonEscape(lastRtspKeepaliveMethod) + "\"";
+  payload += ",\"rtp_packets_received\":" + String(rtpPacketsReceived);
+  payload += ",\"rtp_packets_forwarded\":" + String(rtpPacketsForwarded);
+  payload += ",\"rtp_sequence_gaps\":" + String(rtpSequenceGaps);
+  payload += ",\"rtp_packets_missing\":" + String(rtpPacketsMissing);
+  payload += ",\"rtp_out_of_order\":" + String(rtpOutOfOrder);
+  payload += ",\"rtp_forward_failures\":" + String(rtpForwardFailures);
+  payload += ",\"udp_receive_overruns\":" + String(udpReceiveOverruns);
+  payload += ",\"last_rtp_sequence\":" + String(lastRtpSequence);
+  payload += ",\"rtp_loss_pct\":" + String(lossPct);
+  payload += ",\"rtp_keyframe_seen\":" + String(rtpKeyframeSeen ? "true" : "false");
+  payload += ",\"rtp_keyframes_observed\":" + String(rtpKeyframesObserved);
   payload += ",\"tunnel_target\":\"" + jsonEscape(String(UPSTREAM_TUNNEL_HOST) + ":" + String(UPSTREAM_TUNNEL_PORT)) + "\"";
   payload += ",\"tunnel_connect_error\":" + String(lastTunnelConnectError);
   payload += ",\"tunnel_packets_sent\":" + String(tunnelPacketsSent);
   payload += ",\"tunnel_bytes_sent\":" + String(tunnelBytesSent);
   payload += ",\"tunnel_send_failures\":" + String(tunnelSendFailures);
   payload += ",\"udp_primary\":{";
-  payload += "\"port\":" + String(udpPrimaryStats.localPort);
+  payload += "\"ready\":" + String(udpPrimaryReady ? "true" : "false");
+  payload += ",\"port\":" + String(udpPrimaryStats.localPort);
   payload += ",\"packets\":" + String(udpPrimaryStats.packets);
   payload += ",\"bytes\":" + String(udpPrimaryStats.bytes);
   payload += ",\"last_source\":\"" + udpPrimaryStats.lastSourceIp.toString() + ":" + String(udpPrimaryStats.lastSourcePort) + "\"";
   payload += ",\"last_packet_len\":" + String(static_cast<unsigned>(udpPrimaryStats.lastPacketLen));
-  payload += ",\"last_packet_age_ms\":" + String(msSince(lastPrimaryPacketMs));
+  payload += ",\"last_packet_age_ms\":" + String(primaryAgeMs);
   payload += "}";
   payload += ",\"udp_secondary\":{";
-  payload += "\"port\":" + String(udpSecondaryStats.localPort);
+  payload += "\"ready\":" + String(udpSecondaryReady ? "true" : "false");
+  payload += ",\"port\":" + String(udpSecondaryStats.localPort);
   payload += ",\"packets\":" + String(udpSecondaryStats.packets);
   payload += ",\"bytes\":" + String(udpSecondaryStats.bytes);
   payload += ",\"last_source\":\"" + udpSecondaryStats.lastSourceIp.toString() + ":" + String(udpSecondaryStats.lastSourcePort) + "\"";
@@ -3658,6 +3749,7 @@ String controlErrorFromMessage(ControlAction action, const String &message) {
   if (message.indexOf("rtsp_describe") >= 0) return "rtsp_describe_failed";
   if (message.indexOf("rtsp_setup") >= 0) return "rtsp_setup_failed";
   if (message.indexOf("rtsp_play") >= 0) return "rtsp_play_failed";
+  if (message.indexOf("rtp_stalled") >= 0) return "stream_rtp_stalled";
   if (message.indexOf("tunnel") >= 0) return "tunnel_connect_failed";
   if (message.indexOf("trigger_photo_take") >= 0) return "trigger_photo_take_failed";
   if (message.indexOf("trigger_photo_result") >= 0) return "trigger_photo_result_timeout";
@@ -3763,7 +3855,10 @@ String controlProgressText(const String &progress) {
   if (progress == "waiting_for_camera_hotspot") return "Waiting for camera Wi-Fi hotspot";
   if (progress == "bringing_up") return "Bringing camera up";
   if (progress == "camera_wifi_connected") return "Camera Wi-Fi connected";
+  if (progress == "camera_bringup") return "Bringing camera up for live view";
+  if (progress == "camera_wifi_down") return "Camera Wi-Fi unavailable";
   if (progress == "starting_rtsp") return "Starting live view";
+  if (progress == "rtp_stalled") return "Camera RTP stalled";
   if (progress == "streaming") return "Streaming";
   if (progress == "going_standby") return "Going standby";
   if (progress == "triggering_photo") return "Triggering photo";
@@ -3872,28 +3967,45 @@ bool sendRtspKeepalive() {
     return false;
   }
 
+  String extraHeaders = "Session: " + rtspSessionHeader + "\r\n";
   String responseText;
   int statusCode = 0;
-  String extraHeaders = "Session: " + rtspSessionHeader + "\r\n";
-  if (!exchangeCameraRtspRequest(cameraRtspClient,
-                                 "OPTIONS",
-                                 rtspPlayUrl,
-                                 extraHeaders,
-                                 responseText,
-                                 statusCode)) {
-    Serial.println("[rtsp] keepalive failed");
-    closeRtspSession();
-    return false;
+
+  // GardePro-compatible RTSP servers commonly expect GET_PARAMETER during
+  // playback.  Keep OPTIONS as a fallback for cameras that only implement
+  // the older keepalive behavior.
+  const char *methods[] = {"OPTIONS", "GET_PARAMETER"};
+  for (size_t i = 0; i < 2; ++i) {
+    responseText = "";
+    statusCode = 0;
+    lastRtspKeepaliveMethod = methods[i];
+    const bool exchanged = exchangeCameraRtspRequest(cameraRtspClient,
+                                                     methods[i],
+                                                     rtspPlayUrl,
+                                                     extraHeaders,
+                                                     responseText,
+                                                     statusCode);
+    lastRtspKeepaliveStatus = statusCode;
+    if (exchanged && statusCode == 200) {
+      ++rtspKeepaliveCount;
+      lastRtspKeepaliveMs = millis();
+      Serial.printf("[rtsp] keepalive ok method=%s\n", methods[i]);
+      return true;
+    }
+    // A method rejection is safe to fall through to the alternate method;
+    // transport failure is not, but leave the session open for the stall
+    // guard to make the final decision if RTP also stops.
+    Serial.printf("[rtsp] keepalive method=%s status=%d exchanged=%s\n",
+                  methods[i],
+                  statusCode,
+                  exchanged ? "yes" : "no");
+    if (!cameraRtspClient.connected()) {
+      break;
+    }
   }
 
-  if (statusCode != 200) {
-    Serial.printf("[rtsp] keepalive status=%d\n", statusCode);
-    return false;
-  }
-
-  Serial.println("[rtsp] keepalive ok");
-  lastRtspKeepaliveMs = millis();
-  return true;
+  ++rtspKeepaliveFailures;
+  return false;
 }
 
 bool sendBleWakePulse() {
@@ -4883,27 +4995,15 @@ void connectCameraWifi() {
   const unsigned long connectStartedMs = millis();
   Serial.printf("Connecting camera WiFi SSID %s\n", cameraTargetWifiSsid.c_str());
   WiFi.persistent(false);
+  WiFi.scanDelete();
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  cooperativeDelay(200);
   WiFi.mode(WIFI_MODE_STA);
   WiFi.setHostname(BOARD_HOSTNAME);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.disconnect(true, true);
   cooperativeDelay(250);
-
-  Serial.println("Scanning for camera hotspot before connect");
-  const int count = WiFi.scanNetworks();
-  bool foundTarget = false;
-  for (int i = 0; i < count; ++i) {
-    const String ssid = WiFi.SSID(i);
-    const int rssi = WiFi.RSSI(i);
-    if (ssid == cameraTargetWifiSsid) {
-      foundTarget = true;
-      Serial.printf("Found target SSID %s RSSI=%d\n", ssid.c_str(), rssi);
-    }
-  }
-  if (!foundTarget) {
-    Serial.printf("Target SSID %s not seen in scan\n", cameraTargetWifiSsid.c_str());
-  }
 
   WiFi.begin(cameraTargetWifiSsid.c_str(), CAMERA_WIFI_PASS);
 
@@ -6130,8 +6230,10 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
     lastRtspKeepaliveMs = millis();
     lastBleKeepaliveMs = millis();
     lastHttpKeepaliveMs = millis();
-    lastPrimaryPacketMs = millis();
-    lastSecondaryPacketMs = millis();
+    // Packet timestamps are updated only by the UDP forwarders.  Do not mark
+    // RTP as flowing merely because PLAY returned 200.
+    lastPrimaryPacketMs = 0;
+    lastSecondaryPacketMs = 0;
     lastStreamStartStage = "rtsp_play_ok";
     lastStreamStartMessage = "rtsp_play_ok";
   } else {
@@ -6154,6 +6256,7 @@ bool startStreamSession() {
   lastStreamPlayStatus = 0;
   lastTunnelConnectError = 0;
   lastStreamPlayUrl = "";
+  resetRtpTelemetry();
   if (streamSessionActive) {
     Serial.println("[stream] session already active");
     lastStreamStartStage = "already_active";
@@ -6162,11 +6265,15 @@ bool startStreamSession() {
     return true;
   }
   if (!wifiConnected) {
-    Serial.println("[stream] camera WiFi is down");
-    lastStreamStartStage = "camera_wifi_down";
-    lastStreamStartMessage = "stream_camera_wifi_down";
-    lastStreamStartElapsedMs = millis() - startedMs;
-    return false;
+    Serial.println("[stream] camera WiFi is down, running bringup");
+    lastStreamStartStage = "camera_bringup";
+    lastStreamStartMessage = "stream_camera_bringup";
+    if (!runBringupSequence()) {
+      lastStreamStartStage = "camera_wifi_down";
+      lastStreamStartMessage = "stream_camera_wifi_down";
+      lastStreamStartElapsedMs = millis() - startedMs;
+      return false;
+    }
   }
 
   RtspSessionInfo info{};
@@ -6197,6 +6304,7 @@ bool startStreamSession() {
   startHttpServer();
   streamSessionActive = true;
   streamSessionStartedMs = millis();
+  lastStreamStallMs = 0;
   if (tunnelOk) {
     lastStreamStartStage = "stream_active";
     lastStreamStartMessage = "stream_active";
@@ -6528,10 +6636,11 @@ String buildCameraBridgeStatusJson() {
 }
 
 String buildStreamRuntimeStatusJson() {
+  const bool tunnelActive = streamSessionActive && getTunnelSocketSnapshot() >= 0;
   String payload = "{";
   payload += "\"stream_status\":" + buildStreamStatusJson();
   payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
-  payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
+  payload += ",\"tunnel_connected\":" + String(tunnelActive ? "true" : "false");
   payload += ",\"recoveries\":" + String(streamRecoveryAttempts);
   payload += ",\"idle_recoveries\":" + String(idleRecoveryAttempts);
   payload += ",\"http_keepalive_failures\":" + String(httpKeepaliveFailures);
@@ -6614,6 +6723,7 @@ String buildControlSummaryJson() {
   snapshotControlState(controlSnapshot);
   const String state = controlStateFromSnapshot(controlSnapshot);
   const String progress = controlProgressFromSnapshot(controlSnapshot);
+  const bool tunnelActive = streamSessionActive && getTunnelSocketSnapshot() >= 0;
   String payload = "{";
   payload += "\"ok\":true";
   payload += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
@@ -6635,7 +6745,7 @@ String buildControlSummaryJson() {
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
   payload += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
   payload += ",\"live_view_active\":" + String(streamSessionActive ? "true" : "false");
-  payload += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
+  payload += ",\"tunnel_connected\":" + String(tunnelActive ? "true" : "false");
   payload += ",\"ble_stage\":\"" + jsonEscape(bleStage) + "\"";
   payload += ",\"durable_media_job\":" + buildDurableMediaJobJson();
   payload += "}";
@@ -6647,6 +6757,7 @@ void handleStatus() {
   snapshotControlState(controlSnapshot);
   const String controlStateValue = controlStateFromSnapshot(controlSnapshot);
   const String controlProgress = controlProgressFromSnapshot(controlSnapshot);
+  const bool tunnelActive = streamSessionActive && getTunnelSocketSnapshot() >= 0;
   String basic = "{";
   basic += "\"uptime_ms\":" + String(millis());
   basic += ",\"hostname\":\"" + jsonEscape(BOARD_HOSTNAME) + "\"";
@@ -6657,7 +6768,7 @@ void handleStatus() {
   basic += ",\"halow_rssi\":" + String(halowConnected ? HaLow.RSSI() : 0);
   basic += ",\"wifi_connected\":" + String(wifiConnected ? "true" : "false");
   basic += ",\"stream_active\":" + String(streamSessionActive ? "true" : "false");
-  basic += ",\"tunnel_connected\":" + String(getTunnelSocketSnapshot() >= 0 ? "true" : "false");
+  basic += ",\"tunnel_connected\":" + String(tunnelActive ? "true" : "false");
   basic += ",\"camera_target_wifi_ssid\":\"" + jsonEscape(cameraTargetWifiSsid) + "\"";
   basic += ",\"camera_target_ble_mac\":\"" + jsonEscape(cameraTargetBleMac) + "\"";
   basic += ",\"control_busy\":" + String(controlSnapshot.busy ? "true" : "false");
@@ -9115,6 +9226,47 @@ void startLocalUdpInspectors() {
   xTaskCreatePinnedToCore(udpInspectTask, "udp-inspect-secondary", 4096, &udpSecondaryStats, 1, nullptr, 0);
 }
 
+void resetRtpTelemetry() {
+  rtpPacketsReceived = 0;
+  rtpPacketsForwarded = 0;
+  rtpSequenceGaps = 0;
+  rtpPacketsMissing = 0;
+  rtpOutOfOrder = 0;
+  rtpForwardFailures = 0;
+  udpReceiveOverruns = 0;
+  lastRtpSequence = 0;
+  haveLastRtpSequence = false;
+  rtpKeyframeSeen = false;
+  rtpKeyframesObserved = 0;
+}
+
+void recordRtpTelemetry(const uint8_t *payload, size_t length) {
+  if (length < 12 || (payload[0] >> 6) != 2) return;
+  ++rtpPacketsReceived;
+  const uint16_t sequence = (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
+  if (haveLastRtpSequence) {
+    const uint16_t expected = static_cast<uint16_t>(lastRtpSequence + 1);
+    if (sequence != expected) {
+      const uint16_t forward = static_cast<uint16_t>(sequence - expected);
+      if (forward < 0x8000u) {
+        ++rtpSequenceGaps;
+        rtpPacketsMissing += forward;
+      } else {
+        ++rtpOutOfOrder;
+      }
+    }
+  }
+  lastRtpSequence = sequence;
+  haveLastRtpSequence = true;
+  const uint8_t nalType = payload[12] & 0x1F;
+  bool keyframe = nalType == 5;
+  if (nalType == 28 && length >= 14) keyframe = (payload[13] & 0x1F) == 5;
+  if (keyframe) {
+    rtpKeyframeSeen = true;
+    ++rtpKeyframesObserved;
+  }
+}
+
 void udpForwardTask(void *pvParameters) {
   const bool primary = reinterpret_cast<uintptr_t>(pvParameters) == 0;
   const uint16_t localPort = primary ? LOCAL_MEDIA_PORT_PRIMARY : LOCAL_MEDIA_PORT_SECONDARY;
@@ -9137,6 +9289,16 @@ void udpForwardTask(void *pvParameters) {
     return;
   }
 
+  int receiveBufferBytes = 65536;
+  setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+             &receiveBufferBytes, sizeof(receiveBufferBytes));
+
+  if (primary) {
+    udpPrimaryReady = true;
+  } else {
+    udpSecondaryReady = true;
+  }
+
   Serial.printf("UDP forwarder listening on %u for tunnel stream_id=%u\n",
                 localPort,
                 primary ? STREAM_ID_VIDEO_RTP : STREAM_ID_VIDEO_RTCP);
@@ -9155,23 +9317,33 @@ void udpForwardTask(void *pvParameters) {
     if (primary) {
       mediaPrimaryPackets++;
       mediaPrimaryBytes += len;
+      udpPrimaryStats.packets++;
+      udpPrimaryStats.bytes += len;
+      udpPrimaryStats.lastSourceIp = IPAddress(srcAddr.sin_addr.s_addr);
+      udpPrimaryStats.lastSourcePort = ntohs(srcAddr.sin_port);
+      udpPrimaryStats.lastPacketLen = static_cast<size_t>(len);
+      lastPrimaryPacketMs = millis();
     } else {
       mediaSecondaryPackets++;
       mediaSecondaryBytes += len;
+      udpSecondaryStats.packets++;
+      udpSecondaryStats.bytes += len;
+      udpSecondaryStats.lastSourceIp = IPAddress(srcAddr.sin_addr.s_addr);
+      udpSecondaryStats.lastSourcePort = ntohs(srcAddr.sin_port);
+      udpSecondaryStats.lastPacketLen = static_cast<size_t>(len);
+      lastSecondaryPacketMs = millis();
     }
 
-    if (!streamSessionActive) {
-      continue;
-    }
-
+    if (primary) recordRtpTelemetry(buf, static_cast<size_t>(len));
+    if (!streamSessionActive) continue;
     uint8_t flags = primary ? 0x01 : 0x02;
-    if (primary && len >= 2 && (buf[1] & 0x80) != 0) {
-      flags |= 0x04;
+    if (primary && len >= 2 && (buf[1] & 0x80) != 0) flags |= 0x04;
+    if (sendTunnelMediaPacket(primary ? STREAM_ID_VIDEO_RTP : STREAM_ID_VIDEO_RTCP,
+                              flags, buf, static_cast<size_t>(len))) {
+      if (primary) ++rtpPacketsForwarded;
+    } else if (primary) {
+      ++rtpForwardFailures;
     }
-    sendTunnelMediaPacket(primary ? STREAM_ID_VIDEO_RTP : STREAM_ID_VIDEO_RTCP,
-                          flags,
-                          buf,
-                          static_cast<size_t>(len));
   }
 }
 
@@ -9601,7 +9773,6 @@ void setup() {
     if (!halowConnected) {
       Serial.println("[HaLow] local serial mode boot did not reach control plane");
     }
-    startLocalUdpInspectors();
     printSerialHelp();
     printRuntimeStatus();
     if (controlWorkerTaskHandle == nullptr) {
@@ -9614,6 +9785,8 @@ void setup() {
                               CONTROL_WORKER_CORE);
     }
     startWifiScannerTask();
+    xTaskCreatePinnedToCore(udpForwardTask, "udp-primary", 4096, reinterpret_cast<void *>(0), 1, nullptr, 0);
+    xTaskCreatePinnedToCore(udpForwardTask, "udp-secondary", 4096, reinterpret_cast<void *>(1), 1, nullptr, 0);
     return;
   }
 
@@ -9635,7 +9808,6 @@ void setup() {
   }
   if (wifiConnected) {
     runCameraHttpSelfTest();
-    startLocalUdpInspectors();
     printSerialHelp();
     printRuntimeStatus();
   } else {
@@ -9690,6 +9862,7 @@ void loop() {
     }
     refreshWifiState();
     processCameraSessionLeaseExpiry();
+    serviceStreamHealth();
     if (streamSessionActive && rtspSessionOpen && millis() - lastRtspKeepaliveMs > RTSP_KEEPALIVE_INTERVAL_MS) {
       sendRtspKeepalive();
     }
@@ -9750,6 +9923,7 @@ void loop() {
   maybeRestartHttpServerIdle();
   refreshWifiState();
   processCameraSessionLeaseExpiry();
+  serviceStreamHealth();
 
   if (halowConnected && !onboardClockValid() &&
       (lastClockSyncAttemptMs == 0 || millis() - lastClockSyncAttemptMs > 60000UL)) {
