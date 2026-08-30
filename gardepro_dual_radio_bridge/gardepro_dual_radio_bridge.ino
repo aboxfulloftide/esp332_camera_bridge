@@ -3340,7 +3340,6 @@ void onboardCaptureTask(void *pvParameters) {
         }
         if (onboardLastScheduleAttemptMs == 0 ||
             nowMs - onboardLastScheduleAttemptMs >= onboardCaptureIntervalMs) {
-          onboardLastScheduleAttemptMs = nowMs;
           ++onboardCaptureScheduleSkips;
           Serial.printf("[onboard-camera] scheduled capture skipped/powered_down clock_valid=%s local_minute=%d window=%s-%s\n",
                         onboardClockValid() ? "yes" : "no",
