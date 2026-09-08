@@ -211,6 +211,20 @@ Important fields:
 - `media_secondary_packets`
 - `media_secondary_bytes`
 
+Firmware 0.2.7 adds these fields inside `stream_status`:
+
+- `stream_session_id`
+- `rtp_receiving` (recent RTP arrival, independent of loss quality)
+- `rtp_quality_ok` and `rtp_quality_limit_pct`
+- boot-lifetime `*_total` RTP/overrun counters that survive stream recovery
+- `forward_queue` capacity, depth, high-water, drop, and tunnel-write metrics
+- `recovery` reason, result, age, and duration
+- actual `receive_buffer_bytes` under `udp_primary` and `udp_secondary`
+
+See [STREAM_SERVER_UPDATE.md](../STREAM_SERVER_UPDATE.md) for the server state
+model and compatibility rules. `rtp_flowing` remains for compatibility and is
+true only when RTP is arriving, being forwarded, and within the loss limit.
+
 During active live view, treat RTP packet movement as the functional signal. The webserver should compare `media_primary_packets`, `stream_status.tunnel_packets_sent`, and `stream_status.udp_primary.last_packet_age_ms` across polls. If `stream_active=true` but `rtp_stalled=true`, the camera-side RTP stream has stopped and the UI should fail or restart live view instead of continuing to show "waiting for relay".
 
 ### `GET /control/summary`

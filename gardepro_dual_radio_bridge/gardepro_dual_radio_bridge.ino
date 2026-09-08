@@ -22,6 +22,8 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 extern "C" {
 #include <lwip/sockets.h>
@@ -125,7 +127,7 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 // API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
-static const char *FIRMWARE_VERSION = "0.2.6";
+static const char *FIRMWARE_VERSION = "0.2.7";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
 static const char *DIAGNOSTIC_DIR = "/diagnostics";
 static const char *DIAGNOSTIC_LOG_PATH = "/diagnostics/health.jsonl";
@@ -264,12 +266,24 @@ uint32_t rtpPacketsMissing = 0;
 uint32_t rtpOutOfOrder = 0;
 uint32_t rtpForwardFailures = 0;
 uint32_t udpReceiveOverruns = 0;
+uint32_t rtpPacketsReceivedTotal = 0;
+uint32_t rtpPacketsForwardedTotal = 0;
+uint32_t rtpPacketsMissingTotal = 0;
+uint32_t rtpForwardFailuresTotal = 0;
+uint32_t udpReceiveOverrunsTotal = 0;
 uint16_t lastRtpSequence = 0;
 bool haveLastRtpSequence = false;
 bool rtpKeyframeSeen = false;
 uint32_t rtpKeyframesObserved = 0;
 static const uint32_t RTP_MAX_HEALTH_LOSS_PCT = 20;
 bool streamSessionActive = false;
+volatile bool streamForwardingEnabled = false;
+uint32_t streamSessionId = 0;
+String lastStreamRecoveryReason;
+bool lastStreamRecoverySucceeded = false;
+unsigned long lastStreamRecoveryStartedMs = 0;
+unsigned long lastStreamRecoveryFinishedMs = 0;
+unsigned long lastStreamRecoveryDurationMs = 0;
 uint32_t halowEventCount = 0;
 int halowLastEventId = -1;
 unsigned long halowLastEventMs = 0;
@@ -694,6 +708,29 @@ enum TunnelControlType : uint8_t {
   CONTROL_TYPE_REGISTER = 3,
 };
 
+static const size_t STREAM_PACKET_MAX_BYTES = 1600;
+static const UBaseType_t STREAM_PACKET_QUEUE_DEPTH = 16;
+
+struct StreamPacket {
+  uint32_t sessionId;
+  uint16_t length;
+  uint8_t streamId;
+  uint8_t flags;
+  uint8_t payload[STREAM_PACKET_MAX_BYTES];
+};
+
+QueueHandle_t streamPacketQueue = nullptr;
+TaskHandle_t streamForwardTaskHandle = nullptr;
+volatile uint32_t streamQueueHighWater = 0;
+volatile uint32_t streamQueueEnqueued = 0;
+volatile uint32_t streamQueueDequeued = 0;
+volatile uint32_t streamQueueDropped = 0;
+volatile uint32_t tunnelWriteLastMs = 0;
+volatile uint32_t tunnelWriteMaxMs = 0;
+volatile uint32_t tunnelWriteBlockedCount = 0;
+int udpPrimaryReceiveBufferBytes = 0;
+int udpSecondaryReceiveBufferBytes = 0;
+
 enum ControlAction : uint8_t {
   CONTROL_ACTION_NONE = 0,
   CONTROL_ACTION_BRINGUP = 1,
@@ -872,6 +909,7 @@ void setTunnelSocketState(int fd, bool connected) {
 }
 
 void closeTunnelSocket() {
+  streamForwardingEnabled = false;
   int fd = -1;
   portENTER_CRITICAL(&tunnelState.lock);
   fd = tunnelState.socketFd;
@@ -1108,6 +1146,7 @@ bool sendBoardRegistration() {
 
 bool connectTunnelSocket() {
   closeTunnelSocket();
+  if (streamPacketQueue != nullptr) xQueueReset(streamPacketQueue);
   lastTunnelConnectError = 0;
 
   int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1133,6 +1172,11 @@ bool connectTunnelSocket() {
     return false;
   }
 
+  timeval sendTimeout{};
+  sendTimeout.tv_sec = 1;
+  sendTimeout.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
+
   setTunnelSocketState(sock, true);
   tunnelEverConnected = true;
   tunnelLastConnectMs = millis();
@@ -1145,6 +1189,7 @@ bool connectTunnelSocket() {
 
   Serial.printf("[tunnel] connected, start metadata bytes=%u\n",
                 static_cast<unsigned>(metadata.length()));
+  streamForwardingEnabled = true;
   return true;
 }
 
@@ -1186,6 +1231,7 @@ void stopTunnelSession(const char *reason) {
                 activeMs,
                 msSince(lastPrimaryPacketMs),
                 msSince(lastSecondaryPacketMs));
+  streamForwardingEnabled = false;
   streamSessionActive = false;
   const int sock = getTunnelSocketSnapshot();
   if (sock >= 0) {
@@ -1195,14 +1241,17 @@ void stopTunnelSession(const char *reason) {
     sendTunnelControlFrame(sock, CONTROL_TYPE_STOP, metadata);
   }
   closeTunnelSocket();
+  if (streamPacketQueue != nullptr) xQueueReset(streamPacketQueue);
   closeRtspSession();
   lastStreamStopMs = millis();
   streamSessionStartedMs = 0;
 }
 
 void serviceStreamHealth() {
-  if (!streamSessionActive || lastPrimaryPacketMs == 0) return;
-  const unsigned long gapMs = millis() - lastPrimaryPacketMs;
+  if (!streamSessionActive) return;
+  const unsigned long gapMs = lastPrimaryPacketMs == 0
+                                ? msSince(streamSessionStartedMs)
+                                : millis() - lastPrimaryPacketMs;
   if (gapMs <= STREAM_STALL_FAIL_MS) return;
 #if CAMERA_AUTO_RECOVERY_ENABLED
   // The main loop's recovery path owns stalled-session restart when enabled.
@@ -1246,8 +1295,13 @@ bool sendTunnelMediaPacket(uint8_t streamId, uint8_t flags, const uint8_t *paylo
     ++tunnelSendFailures;
     return false;
   }
+  const unsigned long writeStartedMs = millis();
   if (!sendAll(sock, reinterpret_cast<const uint8_t *>(&header), sizeof(header)) ||
       !sendAll(sock, payload, payloadLen)) {
+    const uint32_t writeMs = millis() - writeStartedMs;
+    tunnelWriteLastMs = writeMs;
+    if (writeMs > tunnelWriteMaxMs) tunnelWriteMaxMs = writeMs;
+    if (writeMs >= 20) ++tunnelWriteBlockedCount;
     unlockTunnelWrite();
     ++tunnelSendFailures;
     Serial.println("[tunnel] media send failed, closing socket");
@@ -1255,6 +1309,11 @@ bool sendTunnelMediaPacket(uint8_t streamId, uint8_t flags, const uint8_t *paylo
     return false;
   }
   unlockTunnelWrite();
+
+  const uint32_t writeMs = millis() - writeStartedMs;
+  tunnelWriteLastMs = writeMs;
+  if (writeMs > tunnelWriteMaxMs) tunnelWriteMaxMs = writeMs;
+  if (writeMs >= 20) ++tunnelWriteBlockedCount;
 
   ++tunnelPacketsSent;
   tunnelBytesSent += payloadLen;
@@ -1362,15 +1421,23 @@ String buildStreamStatusJson() {
   const uint32_t lossDenominator = rtpPacketsReceived + rtpPacketsMissing;
   const uint32_t lossPct = lossDenominator == 0 ? 100 :
                            static_cast<uint32_t>((static_cast<uint64_t>(rtpPacketsMissing) * 100ULL) / lossDenominator);
-  const bool primaryFlowing = streamSessionActive && lastPrimaryPacketMs > 0 &&
-                              primaryAgeMs < 5000UL && rtpPacketsReceived > 0 &&
-                              rtpPacketsForwarded > 0 && lossPct <= RTP_MAX_HEALTH_LOSS_PCT;
-  const bool primaryStalled = streamSessionActive && lastPrimaryPacketMs > 0 && primaryAgeMs > STREAM_STALL_FAIL_MS;
+  const bool primaryReceiving = streamSessionActive && lastPrimaryPacketMs > 0 &&
+                                primaryAgeMs < 5000UL && rtpPacketsReceived > 0;
+  const bool primaryQualityOk = primaryReceiving && lossPct <= RTP_MAX_HEALTH_LOSS_PCT;
+  const bool primaryFlowing = primaryQualityOk && rtpPacketsForwarded > 0;
+  const bool primaryStalled = streamSessionActive &&
+                              ((lastPrimaryPacketMs > 0 && primaryAgeMs > STREAM_STALL_FAIL_MS) ||
+                               (lastPrimaryPacketMs == 0 && msSince(streamSessionStartedMs) > STREAM_STALL_FAIL_MS));
+  const UBaseType_t queueDepth = streamPacketQueue == nullptr ? 0 : uxQueueMessagesWaiting(streamPacketQueue);
   String payload = "{";
   payload += "\"last_stage\":\"" + jsonEscape(lastStreamStartStage) + "\"";
   payload += ",\"last_message\":\"" + jsonEscape(lastStreamStartMessage) + "\"";
   payload += ",\"rtp_flowing\":" + String(primaryFlowing ? "true" : "false");
+  payload += ",\"rtp_receiving\":" + String(primaryReceiving ? "true" : "false");
+  payload += ",\"rtp_quality_ok\":" + String(primaryQualityOk ? "true" : "false");
+  payload += ",\"rtp_quality_limit_pct\":" + String(RTP_MAX_HEALTH_LOSS_PCT);
   payload += ",\"rtp_stalled\":" + String(primaryStalled ? "true" : "false");
+  payload += ",\"stream_session_id\":" + String(streamSessionId);
   payload += ",\"stall_fail_ms\":" + String(STREAM_STALL_FAIL_MS);
   payload += ",\"stall_count\":" + String(streamStallCount);
   payload += ",\"last_stall_age_ms\":" + String(msSince(lastStreamStallMs));
@@ -1391,6 +1458,11 @@ String buildStreamStatusJson() {
   payload += ",\"rtp_out_of_order\":" + String(rtpOutOfOrder);
   payload += ",\"rtp_forward_failures\":" + String(rtpForwardFailures);
   payload += ",\"udp_receive_overruns\":" + String(udpReceiveOverruns);
+  payload += ",\"rtp_packets_received_total\":" + String(rtpPacketsReceivedTotal);
+  payload += ",\"rtp_packets_forwarded_total\":" + String(rtpPacketsForwardedTotal);
+  payload += ",\"rtp_packets_missing_total\":" + String(rtpPacketsMissingTotal);
+  payload += ",\"rtp_forward_failures_total\":" + String(rtpForwardFailuresTotal);
+  payload += ",\"udp_receive_overruns_total\":" + String(udpReceiveOverrunsTotal);
   payload += ",\"last_rtp_sequence\":" + String(lastRtpSequence);
   payload += ",\"rtp_loss_pct\":" + String(lossPct);
   payload += ",\"rtp_keyframe_seen\":" + String(rtpKeyframeSeen ? "true" : "false");
@@ -1400,6 +1472,24 @@ String buildStreamStatusJson() {
   payload += ",\"tunnel_packets_sent\":" + String(tunnelPacketsSent);
   payload += ",\"tunnel_bytes_sent\":" + String(tunnelBytesSent);
   payload += ",\"tunnel_send_failures\":" + String(tunnelSendFailures);
+  payload += ",\"forward_queue\":{";
+  payload += "\"capacity\":" + String(STREAM_PACKET_QUEUE_DEPTH);
+  payload += ",\"depth\":" + String(queueDepth);
+  payload += ",\"high_water\":" + String(streamQueueHighWater);
+  payload += ",\"enqueued\":" + String(streamQueueEnqueued);
+  payload += ",\"dequeued\":" + String(streamQueueDequeued);
+  payload += ",\"dropped\":" + String(streamQueueDropped);
+  payload += ",\"tunnel_write_last_ms\":" + String(tunnelWriteLastMs);
+  payload += ",\"tunnel_write_max_ms\":" + String(tunnelWriteMaxMs);
+  payload += ",\"tunnel_write_blocked_count\":" + String(tunnelWriteBlockedCount);
+  payload += "}";
+  payload += ",\"recovery\":{";
+  payload += "\"reason\":\"" + jsonEscape(lastStreamRecoveryReason) + "\"";
+  payload += ",\"succeeded\":" + String(lastStreamRecoverySucceeded ? "true" : "false");
+  payload += ",\"started_age_ms\":" + String(msSince(lastStreamRecoveryStartedMs));
+  payload += ",\"finished_age_ms\":" + String(msSince(lastStreamRecoveryFinishedMs));
+  payload += ",\"duration_ms\":" + String(lastStreamRecoveryDurationMs);
+  payload += "}";
   payload += ",\"udp_primary\":{";
   payload += "\"ready\":" + String(udpPrimaryReady ? "true" : "false");
   payload += ",\"port\":" + String(udpPrimaryStats.localPort);
@@ -1408,6 +1498,7 @@ String buildStreamStatusJson() {
   payload += ",\"last_source\":\"" + udpPrimaryStats.lastSourceIp.toString() + ":" + String(udpPrimaryStats.lastSourcePort) + "\"";
   payload += ",\"last_packet_len\":" + String(static_cast<unsigned>(udpPrimaryStats.lastPacketLen));
   payload += ",\"last_packet_age_ms\":" + String(primaryAgeMs);
+  payload += ",\"receive_buffer_bytes\":" + String(udpPrimaryReceiveBufferBytes);
   payload += "}";
   payload += ",\"udp_secondary\":{";
   payload += "\"ready\":" + String(udpSecondaryReady ? "true" : "false");
@@ -1417,6 +1508,7 @@ String buildStreamStatusJson() {
   payload += ",\"last_source\":\"" + udpSecondaryStats.lastSourceIp.toString() + ":" + String(udpSecondaryStats.lastSourcePort) + "\"";
   payload += ",\"last_packet_len\":" + String(static_cast<unsigned>(udpSecondaryStats.lastPacketLen));
   payload += ",\"last_packet_age_ms\":" + String(msSince(lastSecondaryPacketMs));
+  payload += ",\"receive_buffer_bytes\":" + String(udpSecondaryReceiveBufferBytes);
   payload += "}";
   payload += "}";
   return payload;
@@ -5032,6 +5124,11 @@ bool recoverActiveStream(const char *reason) {
     return false;
   }
   lastStreamRecoveryMs = millis();
+  lastStreamRecoveryStartedMs = lastStreamRecoveryMs;
+  lastStreamRecoveryFinishedMs = 0;
+  lastStreamRecoveryDurationMs = 0;
+  lastStreamRecoveryReason = reason;
+  lastStreamRecoverySucceeded = false;
   ++streamRecoveryAttempts;
   Serial.printf("[stream] recovery start reason=%s attempt=%u\n",
                 reason,
@@ -5061,10 +5158,15 @@ bool recoverActiveStream(const char *reason) {
 
   if (!wifiConnected) {
     Serial.println("[stream] recovery aborted, camera WiFi still down");
+    lastStreamRecoveryFinishedMs = millis();
+    lastStreamRecoveryDurationMs = lastStreamRecoveryFinishedMs - lastStreamRecoveryStartedMs;
     return false;
   }
 
   const bool restarted = startStreamSession();
+  lastStreamRecoverySucceeded = restarted;
+  lastStreamRecoveryFinishedMs = millis();
+  lastStreamRecoveryDurationMs = lastStreamRecoveryFinishedMs - lastStreamRecoveryStartedMs;
   Serial.printf("[stream] recovery restart=%s\n", restarted ? "ok" : "failed");
   return restarted;
 }
@@ -6179,6 +6281,16 @@ bool runRtspLiveSequence(RtspSessionInfo &info) {
   lastRtspSessionId = info.sessionHeader;
   Serial.printf("[rtsp-live] session=%s\n", info.sessionHeader.c_str());
 
+  // Establish the HaLow tunnel before PLAY so the first SPS/PPS/IDR packets
+  // can be queued immediately instead of being lost during TCP connection.
+  lastStreamStartStage = "tunnel_connect_before_play";
+  if (halowConnected && !connectTunnelSocket()) {
+    Serial.println("[stream] pre-PLAY tunnel connect failed; continuing local-only");
+    lastStreamStartMessage = "camera_stream_active_tunnel_connect_failed";
+  } else if (!halowConnected) {
+    lastStreamStartMessage = "camera_stream_active_tunnel_halow_down";
+  }
+
   String playHeaders = "Session: " + info.sessionHeader + "\r\n";
   playHeaders += "Range: npt=0.000-\r\n";
   String playUrl = info.aggregateControlUrl;
@@ -6255,7 +6367,6 @@ bool startStreamSession() {
   lastStreamPlayStatus = 0;
   lastTunnelConnectError = 0;
   lastStreamPlayUrl = "";
-  resetRtpTelemetry();
   if (streamSessionActive) {
     Serial.println("[stream] session already active");
     lastStreamStartStage = "already_active";
@@ -6263,6 +6374,12 @@ bool startStreamSession() {
     lastStreamStartElapsedMs = millis() - startedMs;
     return true;
   }
+  ++streamSessionId;
+  if (streamSessionId == 0) ++streamSessionId;
+  resetRtpTelemetry();
+  streamForwardingEnabled = false;
+  closeTunnelSocket();
+  if (streamPacketQueue != nullptr) xQueueReset(streamPacketQueue);
   if (!wifiConnected) {
     Serial.println("[stream] camera WiFi is down, running bringup");
     lastStreamStartStage = "camera_bringup";
@@ -6282,23 +6399,13 @@ bool startStreamSession() {
       lastStreamStartMessage = "stream_rtsp_failed";
     }
     lastStreamStartElapsedMs = millis() - startedMs;
+    streamForwardingEnabled = false;
+    closeTunnelSocket();
     return false;
   }
 
-  lastStreamStartStage = "tunnel_connect";
-  bool tunnelOk = false;
-  if (!halowConnected) {
-    Serial.println("[stream] HaLow is down; keeping camera RTSP local and retrying tunnel later");
-    lastStreamStartStage = "camera_stream_local";
-    lastStreamStartMessage = "camera_stream_active_tunnel_halow_down";
-  } else {
-    tunnelOk = connectTunnelSocket();
-    if (!tunnelOk) {
-      Serial.println("[stream] tunnel connect failed; keeping camera RTSP local");
-      lastStreamStartStage = "camera_stream_local";
-      lastStreamStartMessage = "camera_stream_active_tunnel_connect_failed";
-    }
-  }
+  const bool tunnelOk = getTunnelSocketSnapshot() >= 0;
+  if (!tunnelOk) lastStreamStartStage = "camera_stream_local";
 
   startHttpServer();
   streamSessionActive = true;
@@ -9237,11 +9344,19 @@ void resetRtpTelemetry() {
   haveLastRtpSequence = false;
   rtpKeyframeSeen = false;
   rtpKeyframesObserved = 0;
+  streamQueueHighWater = 0;
+  streamQueueEnqueued = 0;
+  streamQueueDequeued = 0;
+  streamQueueDropped = 0;
+  tunnelWriteLastMs = 0;
+  tunnelWriteMaxMs = 0;
+  tunnelWriteBlockedCount = 0;
 }
 
 void recordRtpTelemetry(const uint8_t *payload, size_t length) {
   if (length < 12 || (payload[0] >> 6) != 2) return;
   ++rtpPacketsReceived;
+  ++rtpPacketsReceivedTotal;
   const uint16_t sequence = (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
   if (haveLastRtpSequence) {
     const uint16_t expected = static_cast<uint16_t>(lastRtpSequence + 1);
@@ -9250,6 +9365,7 @@ void recordRtpTelemetry(const uint8_t *payload, size_t length) {
       if (forward < 0x8000u) {
         ++rtpSequenceGaps;
         rtpPacketsMissing += forward;
+        rtpPacketsMissingTotal += forward;
       } else {
         ++rtpOutOfOrder;
       }
@@ -9291,22 +9407,30 @@ void udpForwardTask(void *pvParameters) {
   int receiveBufferBytes = 65536;
   setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
              &receiveBufferBytes, sizeof(receiveBufferBytes));
+  socklen_t receiveBufferLength = sizeof(receiveBufferBytes);
+  if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+                 &receiveBufferBytes, &receiveBufferLength) != 0) {
+    receiveBufferBytes = 0;
+  }
 
   if (primary) {
     udpPrimaryReady = true;
+    udpPrimaryReceiveBufferBytes = receiveBufferBytes;
   } else {
     udpSecondaryReady = true;
+    udpSecondaryReceiveBufferBytes = receiveBufferBytes;
   }
 
-  Serial.printf("UDP forwarder listening on %u for tunnel stream_id=%u\n",
+  Serial.printf("UDP receiver listening on %u for tunnel stream_id=%u rcvbuf=%d\n",
                 localPort,
-                primary ? STREAM_ID_VIDEO_RTP : STREAM_ID_VIDEO_RTCP);
+                primary ? STREAM_ID_VIDEO_RTP : STREAM_ID_VIDEO_RTCP,
+                receiveBufferBytes);
 
-  uint8_t buf[1600];
   while (true) {
+    StreamPacket packet{};
     sockaddr_in srcAddr{};
     socklen_t srcLen = sizeof(srcAddr);
-    int len = recvfrom(sock, buf, sizeof(buf), 0,
+    int len = recvfrom(sock, packet.payload, sizeof(packet.payload), 0,
                        reinterpret_cast<sockaddr *>(&srcAddr), &srcLen);
     if (len <= 0) {
       delay(10);
@@ -9333,17 +9457,80 @@ void udpForwardTask(void *pvParameters) {
       lastSecondaryPacketMs = millis();
     }
 
-    if (primary) recordRtpTelemetry(buf, static_cast<size_t>(len));
-    if (!streamSessionActive) continue;
-    uint8_t flags = primary ? 0x01 : 0x02;
-    if (primary && len >= 2 && (buf[1] & 0x80) != 0) flags |= 0x04;
-    if (sendTunnelMediaPacket(primary ? STREAM_ID_VIDEO_RTP : STREAM_ID_VIDEO_RTCP,
-                              flags, buf, static_cast<size_t>(len))) {
-      if (primary) ++rtpPacketsForwarded;
-    } else if (primary) {
-      ++rtpForwardFailures;
+    if (primary) recordRtpTelemetry(packet.payload, static_cast<size_t>(len));
+    if (!streamForwardingEnabled || streamPacketQueue == nullptr) continue;
+
+    packet.sessionId = streamSessionId;
+    packet.length = static_cast<uint16_t>(len);
+    packet.streamId = primary ? STREAM_ID_VIDEO_RTP : STREAM_ID_VIDEO_RTCP;
+    packet.flags = primary ? 0x01 : 0x02;
+    if (primary && len >= 2 && (packet.payload[1] & 0x80) != 0) packet.flags |= 0x04;
+    if (xQueueSend(streamPacketQueue, &packet, 0) == pdTRUE) {
+      ++streamQueueEnqueued;
+      const UBaseType_t depth = uxQueueMessagesWaiting(streamPacketQueue);
+      if (depth > streamQueueHighWater) streamQueueHighWater = depth;
+    } else {
+      ++streamQueueDropped;
+      ++udpReceiveOverruns;
+      ++udpReceiveOverrunsTotal;
     }
   }
+}
+
+void streamForwardTask(void *pvParameters) {
+  (void)pvParameters;
+  StreamPacket packet{};
+  while (true) {
+    if (streamPacketQueue == nullptr ||
+        xQueueReceive(streamPacketQueue, &packet, portMAX_DELAY) != pdTRUE) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    ++streamQueueDequeued;
+    if (!streamForwardingEnabled || packet.sessionId != streamSessionId) continue;
+    if (sendTunnelMediaPacket(packet.streamId, packet.flags,
+                              packet.payload, packet.length)) {
+      if (packet.streamId == STREAM_ID_VIDEO_RTP) {
+        ++rtpPacketsForwarded;
+        ++rtpPacketsForwardedTotal;
+      }
+    } else if (packet.streamId == STREAM_ID_VIDEO_RTP) {
+      ++rtpForwardFailures;
+      ++rtpForwardFailuresTotal;
+    }
+  }
+}
+
+bool startStreamPacketPipeline() {
+  if (streamPacketQueue == nullptr) {
+    streamPacketQueue = xQueueCreate(STREAM_PACKET_QUEUE_DEPTH, sizeof(StreamPacket));
+    if (streamPacketQueue == nullptr) {
+      Serial.printf("[stream-queue] allocation failed depth=%u item_bytes=%u\n",
+                    static_cast<unsigned>(STREAM_PACKET_QUEUE_DEPTH),
+                    static_cast<unsigned>(sizeof(StreamPacket)));
+      return false;
+    }
+  }
+  if (streamForwardTaskHandle == nullptr) {
+    if (xTaskCreatePinnedToCore(streamForwardTask,
+                                "stream-forward",
+                                6144,
+                                nullptr,
+                                3,
+                                &streamForwardTaskHandle,
+                                1) != pdPASS) {
+      Serial.println("[stream-queue] forwarding task creation failed");
+      return false;
+    }
+  }
+  xTaskCreatePinnedToCore(udpForwardTask, "udp-primary", 4096,
+                          reinterpret_cast<void *>(0), 4, nullptr, 0);
+  xTaskCreatePinnedToCore(udpForwardTask, "udp-secondary", 4096,
+                          reinterpret_cast<void *>(1), 4, nullptr, 0);
+  Serial.printf("[stream-queue] ready depth=%u packet_bytes=%u\n",
+                static_cast<unsigned>(STREAM_PACKET_QUEUE_DEPTH),
+                static_cast<unsigned>(sizeof(StreamPacket)));
+  return true;
 }
 
 void handleSerialCommand(const String &line) {
@@ -9784,8 +9971,7 @@ void setup() {
                               CONTROL_WORKER_CORE);
     }
     startWifiScannerTask();
-    xTaskCreatePinnedToCore(udpForwardTask, "udp-primary", 4096, reinterpret_cast<void *>(0), 1, nullptr, 0);
-    xTaskCreatePinnedToCore(udpForwardTask, "udp-secondary", 4096, reinterpret_cast<void *>(1), 1, nullptr, 0);
+    startStreamPacketPipeline();
     return;
   }
 
@@ -9826,8 +10012,7 @@ void setup() {
   }
   startWifiScannerTask();
 
-  xTaskCreatePinnedToCore(udpForwardTask, "udp-primary", 4096, reinterpret_cast<void *>(0), 1, nullptr, 0);
-  xTaskCreatePinnedToCore(udpForwardTask, "udp-secondary", 4096, reinterpret_cast<void *>(1), 1, nullptr, 0);
+  startStreamPacketPipeline();
 }
 
 void loop() {
@@ -9890,9 +10075,12 @@ void loop() {
     }
     if ((CAMERA_AUTO_RECOVERY_ENABLED != 0) &&
         streamSessionActive && wifiConnected &&
-        lastPrimaryPacketMs > 0 &&
-        millis() - lastPrimaryPacketMs > STREAM_STALL_TIMEOUT_MS) {
-      Serial.printf("[stream] primary RTP stalled for %lu ms\n", msSince(lastPrimaryPacketMs));
+        ((lastPrimaryPacketMs > 0 && millis() - lastPrimaryPacketMs > STREAM_STALL_TIMEOUT_MS) ||
+         (lastPrimaryPacketMs == 0 && msSince(streamSessionStartedMs) > STREAM_STALL_FAIL_MS))) {
+      const unsigned long rtpGapMs = lastPrimaryPacketMs == 0
+                                       ? msSince(streamSessionStartedMs)
+                                       : msSince(lastPrimaryPacketMs);
+      Serial.printf("[stream] primary RTP stalled for %lu ms\n", rtpGapMs);
       recoverActiveStream("rtp_stall");
     }
     if ((CAMERA_AUTO_RECOVERY_ENABLED != 0) &&
