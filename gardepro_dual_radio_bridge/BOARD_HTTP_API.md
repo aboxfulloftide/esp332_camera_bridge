@@ -528,6 +528,9 @@ Current supported actions:
 Queues camera work and returns immediately. Media download jobs persist their state and
 camera manifest on SD, resume after resets, and retry camera bring-up without requiring
 HaLow. Download-and-delete verifies the staged SD file before deleting each camera item.
+Firmware 0.2.8 paginates until the trail camera returns an empty gallery page; it does
+not assume the camera honors the requested page size. Therefore both durable download
+actions cover the complete camera gallery rather than only its newest 40-item page.
 
 Power behavior:
 

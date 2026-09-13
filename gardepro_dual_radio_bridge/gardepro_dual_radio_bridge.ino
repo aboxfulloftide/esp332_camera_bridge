@@ -127,7 +127,7 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 // API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
-static const char *FIRMWARE_VERSION = "0.2.7";
+static const char *FIRMWARE_VERSION = "0.2.8";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
 static const char *DIAGNOSTIC_DIR = "/diagnostics";
 static const char *DIAGNOSTIC_LOG_PATH = "/diagnostics/health.jsonl";
@@ -8429,7 +8429,10 @@ bool appendDurableManifestPage(const String &galleryJson, bool truncate,
   }
   manifest.flush();
   manifest.close();
-  return recordCount > 0 || galleryJson.indexOf("[]", arrayStart) >= 0;
+  // A valid data array with zero media records is the pagination terminator.
+  // Do not require the camera to serialize the empty array as the exact text
+  // "[]"; some revisions include whitespace and line breaks.
+  return true;
 }
 
 bool readDurableManifestRecord(uint32_t index, DurableMediaRecord &record) {
@@ -8861,6 +8864,7 @@ void serviceDurableMediaJob() {
     uint32_t totalCount = 0;
     uint32_t cursor = 900000;
     bool manifestOk = true;
+    bool manifestComplete = false;
     for (uint16_t page = 0; page < 256; ++page) {
       String gallery;
       int statusCode = 0;
@@ -8877,12 +8881,19 @@ void serviceDurableMediaJob() {
         break;
       }
       totalCount += pageCount;
-      if (pageCount < 60 || minimumId <= 1 || minimumId == UINT32_MAX) break;
+      if (pageCount == 0 || minimumId <= 1) {
+        manifestComplete = true;
+        break;
+      }
+      if (minimumId == UINT32_MAX || minimumId >= cursor) {
+        manifestOk = false;
+        break;
+      }
       cursor = minimumId - 1;
       cooperativeDelay(25);
     }
-    if (!manifestOk) {
-      durableMediaJobRetry("manifest_write_failed");
+    if (!manifestOk || !manifestComplete) {
+      durableMediaJobRetry(manifestOk ? "manifest_page_limit_reached" : "manifest_pagination_failed");
       return;
     }
     durableMediaJob.manifestCount = totalCount;
