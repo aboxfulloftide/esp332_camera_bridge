@@ -403,7 +403,7 @@ Trail-camera session lease state. Use this when coordinating short-lived camera 
 
 ### `GET /sd/status`
 
-SD card mount/storage details: ready state, mount counters, pins, card type/size, and storage totals.
+SD card mount/storage details: ready state, durable media-job load state, mount counters, pins, card type/size, and storage totals. `durable_media_job_loaded` must be `true` before a durable trail-media job can be accepted.
 
 ### `GET /scanner/config`
 
@@ -632,7 +632,7 @@ Uploads telemetry, events, and queued observation batches.
 
 ### `POST /sd/mount`
 
-Attempts to mount/remount the SD card.
+Attempts to mount/remount the SD card and then loads the durable trail-media job state from it. A successful response means both the card mount and durable-state initialization succeeded. Failure to load or initialize the durable state returns HTTP 503 with `last_message` set to `durable_job_load_failed`.
 
 ### `POST /firmware/update`
 

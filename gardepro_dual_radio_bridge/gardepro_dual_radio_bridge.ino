@@ -127,7 +127,7 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 // API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
-static const char *FIRMWARE_VERSION = "0.2.8";
+static const char *FIRMWARE_VERSION = "0.2.9";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
 static const char *DIAGNOSTIC_DIR = "/diagnostics";
 static const char *DIAGNOSTIC_LOG_PATH = "/diagnostics/health.jsonl";
@@ -794,6 +794,7 @@ unsigned long durableMediaNextRetryMs = 0;
 SemaphoreHandle_t durableMediaJobMutex = nullptr;
 
 String buildDurableMediaJobJson();
+bool loadDurableMediaJob();
 
 struct ControlState {
   portMUX_TYPE lock;
@@ -2652,6 +2653,7 @@ void servicePersistentDiagnostics() {
 String buildSdStatusJson() {
   String payload = "{";
   payload += "\"ready\":" + String(sdReady ? "true" : "false");
+  payload += ",\"durable_media_job_loaded\":" + String(durableMediaJobLoaded ? "true" : "false");
   payload += ",\"last_message\":\"" + jsonEscape(sdLastMessage) + "\"";
   payload += ",\"mount_attempts\":" + String(sdMountAttempts);
   payload += ",\"mount_successes\":" + String(sdMountSuccesses);
@@ -7560,7 +7562,11 @@ void handleSdStatus() {
 }
 
 void handleSdMount() {
-  const bool ok = mountSdCard();
+  bool ok = mountSdCard();
+  if (ok && !loadDurableMediaJob()) {
+    sdLastMessage = "durable_job_load_failed";
+    ok = false;
+  }
   server.send(ok ? 200 : 503, "application/json", buildSdStatusJson());
 }
 
@@ -8075,6 +8081,7 @@ bool saveDurableMediaJob() {
 }
 
 bool loadDurableMediaJob() {
+  durableMediaJobLoaded = false;
   durableMediaJob = {};
   durableMediaJob.magic = DURABLE_MEDIA_JOB_MAGIC;
   durableMediaJob.version = DURABLE_MEDIA_JOB_VERSION;
@@ -8084,7 +8091,9 @@ bool loadDurableMediaJob() {
   File file = SD.open(DURABLE_JOB_STATE_PATH, FILE_READ);
   if (!file) {
     durableMediaJobLoaded = true;
-    return saveDurableMediaJob();
+    const bool saved = saveDurableMediaJob();
+    if (!saved) durableMediaJobLoaded = false;
+    return saved;
   }
   DurableMediaJobState loaded{};
   const bool readOk = file.read(reinterpret_cast<uint8_t *>(&loaded), sizeof(loaded)) == sizeof(loaded);
@@ -8095,7 +8104,9 @@ bool loadDurableMediaJob() {
     SD.remove("/jobs/media_job.bad");
     SD.rename(DURABLE_JOB_STATE_PATH, "/jobs/media_job.bad");
     durableMediaJobLoaded = true;
-    return saveDurableMediaJob();
+    const bool saved = saveDurableMediaJob();
+    if (!saved) durableMediaJobLoaded = false;
+    return saved;
   }
   durableMediaJob = loaded;
   durableMediaJobLoaded = true;
@@ -9617,7 +9628,9 @@ void handleSerialCommand(const String &line) {
     return;
   }
   if (cmd == "sd_mount") {
-    mountSdCard();
+    if (mountSdCard() && !loadDurableMediaJob()) {
+      sdLastMessage = "durable_job_load_failed";
+    }
     Serial.println(buildSdStatusJson());
     return;
   }
