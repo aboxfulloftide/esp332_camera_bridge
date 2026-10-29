@@ -80,7 +80,7 @@ The firmware also periodically re-begins the HTTP listener while idle. It skips 
 
 ### `GET /halow/status`
 
-HaLow uplink state: connected/status, SSID/BSSID/MAC/IP/gateway, RSSI, and event counters.
+HaLow uplink state: connected/status, SSID/BSSID/MAC/IP/gateway, RSSI, event counters, and automatic recovery diagnostics. Firmware emits a gratuitous ARP every five seconds so the HaLow AP and LAN clients retain a usable mapping for the board even when inbound ARP replies become unreliable; counters are exposed as `gratuitous_arp_count` and `gratuitous_arp_failures`. It also probes the configured upstream HTTP host every 15 seconds. Two consecutive outbound data-plane failures force a clean Morse station disable/reconnect. Relevant fields include `liveness_probe_successes`, `liveness_probe_failures`, `consecutive_liveness_failures`, `last_liveness_error`, `last_liveness_probe_age_ms`, and `forced_reconnects`. Idle camera-Wi-Fi recovery is suppressed while a durable media job is active so two cores cannot concurrently reconfigure the camera radio.
 
 Current Heltec HaLow wrapper does not expose SNR, noise, or rate-control details; those fields may be `null` with explanatory note fields.
 
@@ -403,7 +403,7 @@ Trail-camera session lease state. Use this when coordinating short-lived camera 
 
 ### `GET /sd/status`
 
-SD card mount/storage details: ready state, durable media-job load state, mount counters, pins, card type/size, and storage totals. `durable_media_job_loaded` must be `true` before a durable trail-media job can be accepted.
+SD card mount/storage details: ready state, durable media-job load state, mount counters, `last_mount_frequency_hz`, background recovery counters, pins, card type/size, and cached storage totals. Capacity values are cached so status polling cannot contend with an active media transfer. `durable_media_job_loaded` must be `true` before a durable trail-media job can be accepted. Boot and remote recovery use multiple settle-and-retry attempts, falling back from 4 MHz to 400 kHz when necessary. If every boot attempt fails, firmware continues trying one frequency every 15 seconds after networking starts; a successful background mount automatically loads and resumes the durable job.
 
 ### `GET /scanner/config`
 
@@ -552,11 +552,43 @@ curl -sS -X POST "http://192.168.1.160:18080/jobs?action=download_and_delete_med
 
 ## Staged trail-camera media
 
-- `GET /trail-media/status` — durable job progress and SD free space
+- `GET /trail-media/status` — durable job progress and cached SD free space. The job object also reports `item_bytes_received`, `item_expected_bytes`, `item_elapsed_ms`, and `item_progress_age_ms` while an individual file is transferring, allowing the server to distinguish a slow large file from a stalled transfer.
 - `GET /trail-media/files` — files safely staged on the ESP32 SD card
 - `GET /trail-media/file/<filename>` — download a staged file over HaLow when available
 
 Staged files remain on the ESP32 until a separate retention/upload policy removes them.
+
+The firmware also uploads staged trail-camera files outbound so operation does not depend on inbound HaLow TCP. When no durable camera job is active, it selects an unmarked staged file, calculates SHA-256, posts metadata to `POST <UPSTREAM_API_PREFIX>/api/board/media`, then streams the file with `PUT` to the returned `upload_url`. A successful PUT creates a `<media-file>.uploaded` marker on SD; the original remains staged. Failures retain the file and retry after 30 seconds. The server must return an `upload_url`; metadata acceptance alone is not treated as a completed transfer. Progress and retry state are exposed under `trail_media` in `GET /upload/status`.
+
+Durable camera jobs have priority over staged uploads. Accepting a durable job preempts any active upload during transfer-Wi-Fi association, hashing, or blob transmission, and the uploader remains blocked with `blocked_reason: "camera_job_active"` until the camera job is terminal. This prevents the background uploader from starving camera-to-SD writes or holding stale active state across a job submission.
+
+Durable media jobs enter `waiting_retry` with stage `low_battery_wait` below 3.8 V. Camera Wi-Fi/BLE activity is shut down, the manifest and current position remain durable, and the low-voltage hold does not increment retry counters. Firmware rechecks every five minutes and resumes only after battery voltage reaches 3.9 V. The job JSON exposes `battery_mv`, `minimum_battery_mv`, and `recovery_battery_mv`.
+
+Firmware 0.2.25 separates camera-job safe mode from storage/upload recovery. Repeated HTTP failures may suspend new camera work, but SD remount attempts continue with exponential backoff from 15 seconds to 10 minutes. After the SD and durable job state recover, already-staged media resumes uploading automatically. SD recovery waits below 3.5 V and media uploads wait below 3.6 V to avoid high-current storage/network work on a collapsing battery.
+
+The durable job summary is mirrored periodically to NVS (on state changes, every ten completed entries, or every five minutes). If SD is temporarily unavailable, job JSON reports `state_source: "nvs_mirror"` instead of incorrectly appearing as a new idle job.
+
+When transfer Wi-Fi is configured, staged uploads prefer that 2.4 GHz connection and bind their sockets specifically to it. If association fails, the same upload falls back to HaLow. `GET /upload/status` reports `preferred_transport`, `fallback_transport`, battery threshold, and a machine-readable `blocked_reason` such as `sd_unavailable`, `battery_below_upload_threshold`, or `camera_job_active`.
+
+### `POST /wifi/transfer_test`
+
+Performs a bounded, non-media transfer-network test. It refuses to run while the camera radio, live view, a control action, or an upload is active. The board associates with the configured 2.4 GHz SSID, binds a test socket to that Wi-Fi interface, connects to the configured API host/port, reports IP/gateway/RSSI/channel and the data-plane result, then disconnects from 2.4 GHz. No media or camera state is changed.
+
+If `TRANSFER_WIFI_SSID` and `TRANSFER_WIFI_PASS` are configured, staged-media uploads first try that normal 2.4 GHz network for higher throughput and fall back to HaLow if association fails. The camera and transfer networks share the ESP32 Wi-Fi radio, so transfer Wi-Fi is only used when no camera job, control action, or live stream is active. Transfer-network state is exposed under `transfer_wifi` in `GET /upload/status`.
+
+Directory scanning, SHA-256 hashing, and blob streaming yield to the CPU idle task between SD chunks. This prevents the task watchdog from resetting the board when a large staged directory is processed.
+
+Because the HaLow and normal Wi-Fi networks may use the same IPv4 subnet, HaLow remains the management/default interface while staged-upload sockets are explicitly bound to the normal Wi-Fi interface. This keeps both radios up without sending HaLow replies through the wrong interface.
+
+Outbound connect and send operations have bounded socket timeouts. Transfer Wi-Fi remains connected for an efficient batch of up to 25 successful files or 10 minutes. It then rotates back to HaLow before the next batch; failures close the transfer session immediately so retries begin with clean routing. An independent supervisor restarts the board if HTTP servicing stops for 60 seconds or an active staged upload makes no progress for three minutes. The restart reason and cumulative count persist in NVS and are reported under `failsafe` by `GET /diagnostics/status`.
+
+The supervisor starts before storage, camera, and network initialization complete. It additionally checks the HTTP listener over loopback once per minute, restarts a dead listener after two failures, reboots after four failures, detects stalled startup/main-loop/long HTTP operations, and reboots after HaLow has remained down for ten minutes. OTA and file streaming callbacks update explicit long-operation progress heartbeats.
+
+HaLow liveness probes are bound to the HaLow interface and target the configured gateway rather than the application server. Association gets up to 75 seconds to finish, and failed recovery attempts back off from 30 seconds to a maximum of ten minutes.
+
+SD-backed HTTP handlers wait at most two seconds for storage and otherwise return `503 storage_busy`. Trail-media streaming, staged-upload hashing/blob reads, and camera-to-SD writes hold the storage mutex only for individual chunks rather than for the entire network transfer.
+
+Each manifest item has a persistent failure counter. After three failed download or delete attempts, the durable job records `skipped_after_3:<error>`, advances to the next manifest item, and continues instead of retrying one camera file forever.
 
 Video staging is intentionally strict. MP4 downloads are not promoted from `.part` to
 final `.mp4` unless the firmware can determine the complete byte count from the camera
@@ -633,6 +665,8 @@ Uploads telemetry, events, and queued observation batches.
 ### `POST /sd/mount`
 
 Attempts to mount/remount the SD card and then loads the durable trail-media job state from it. A successful response means both the card mount and durable-state initialization succeeded. Failure to load or initialize the durable state returns HTTP 503 with `last_message` set to `durable_job_load_failed`.
+
+Returns HTTP 409 with `error: "durable_job_active"` if the SD card is already mounted and a durable media job is active. This prevents a remote remount from invalidating an in-progress transfer.
 
 ### `POST /firmware/update`
 

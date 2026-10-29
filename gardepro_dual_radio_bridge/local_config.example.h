@@ -14,6 +14,10 @@
 #define UPSTREAM_API_PREFIX "/trail_cam"
 // Optional bearer token. Leave empty when the local API does not require auth.
 #define UPSTREAM_API_TOKEN ""
+// Optional faster 2.4 GHz path for uploading files already staged on SD.
+// Keep real credentials in the ignored local_config.h file.
+#define TRANSFER_WIFI_SSID ""
+#define TRANSFER_WIFI_PASS ""
 // Optional live media tunnel override. Defaults to UPSTREAM_API_HOST.
 #define UPSTREAM_TUNNEL_HOST UPSTREAM_API_HOST
 #define UPSTREAM_TUNNEL_PORT 6000

@@ -13,6 +13,8 @@
 #include <SPI.h>
 #include <Update.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
+#include <mbedtls/sha256.h>
 #include <uri/UriRegex.h>
 #include <algorithm>
 #include <vector>
@@ -27,6 +29,8 @@
 
 extern "C" {
 #include <lwip/sockets.h>
+#include <lwip/etharp.h>
+#include <lwip/netif.h>
 }
 
 #if __has_include("local_config.h")
@@ -59,10 +63,16 @@ extern "C" {
 
 // 2.4 GHz camera hotspot
 #ifndef CAMERA_WIFI_SSID
-#define CAMERA_WIFI_SSID "CAM8Z8_A46DD49E4732"
+#define CAMERA_WIFI_SSID "CAM8Z8_A4C138982635"
 #endif
 #ifndef CAMERA_WIFI_PASS
 #define CAMERA_WIFI_PASS "1234567890"
+#endif
+#ifndef TRANSFER_WIFI_SSID
+#define TRANSFER_WIFI_SSID ""
+#endif
+#ifndef TRANSFER_WIFI_PASS
+#define TRANSFER_WIFI_PASS ""
 #endif
 static const IPAddress CAMERA_IP(192, 168, 8, 1);
 static const uint16_t CAMERA_HTTP_PORT = 8080;
@@ -127,19 +137,34 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 // API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
-static const char *FIRMWARE_VERSION = "0.2.9";
+static const char *FIRMWARE_VERSION = "0.2.68";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
 static const char *DIAGNOSTIC_DIR = "/diagnostics";
 static const char *DIAGNOSTIC_LOG_PATH = "/diagnostics/health.jsonl";
 static const char *DURABLE_JOB_DIR = "/jobs";
 static const char *DURABLE_JOB_STATE_PATH = "/jobs/media_job.bin";
 static const char *DURABLE_JOB_STATE_TEMP_PATH = "/jobs/media_job.tmp";
+static const char *DURABLE_JOB_STATE_BACKUP_PATH = "/jobs/media_job.bak";
 static const char *DURABLE_JOB_MANIFEST_PATH = "/jobs/media_manifest.bin";
+static const char *TRAIL_MEDIA_UPLOAD_CURSOR_PATH = "/jobs/media_upload_cursor.bin";
 static const char *TRAIL_MEDIA_DIR = "/trail_media";
+static const unsigned long TRAIL_MEDIA_UPLOAD_RETRY_MS = 30000UL;
+static const uint8_t TRAIL_MEDIA_MAX_UPLOAD_ATTEMPTS = 3;
+static const unsigned long FAILSAFE_CHECK_INTERVAL_MS = 10000UL;
+static const unsigned long FAILSAFE_HTTP_STALL_MS = 60000UL;
+static const unsigned long FAILSAFE_UPLOAD_STALL_MS = 180000UL;
+static const unsigned long FAILSAFE_LONG_HTTP_STALL_MS = 300000UL;
+static const unsigned long HTTP_SELF_TEST_INTERVAL_MS = 60000UL;
+static const uint16_t TRANSFER_WIFI_BATCH_FILES = 25;
+static const unsigned long TRANSFER_WIFI_SESSION_MAX_MS = 600000UL;
+// Automatic transfer Wi-Fi currently panics this dual-radio build during
+// route handoff. Keep the explicit diagnostic endpoint available, but use
+// HaLow for unattended uploads until interface routing is repaired.
+static const bool TRANSFER_WIFI_UPLOAD_ENABLED = true;
 static const unsigned long DIAGNOSTIC_SD_INTERVAL_MS = 300000UL;
 static const unsigned long DIAGNOSTIC_NVS_INTERVAL_MS = 21600000UL;
 #ifndef CAMERA_BLE_MAC
-#define CAMERA_BLE_MAC "a4:6d:d4:9e:47:32"
+#define CAMERA_BLE_MAC "a4:c1:38:98:26:35"
 #endif
 #ifndef CAMERA_BLE_WAKE
 #define CAMERA_BLE_WAKE "AT+WAKEPULSE=10\r\n"
@@ -207,6 +232,22 @@ bool httpServerStarted = false;
 
 volatile bool halowConnected = false;
 volatile bool wifiConnected = false;
+portMUX_TYPE halowConnectMux = portMUX_INITIALIZER_UNLOCKED;
+bool halowConnectInProgress = false;
+unsigned long halowLastRecoveryAttemptMs = 0;
+unsigned long halowRecoveryIntervalMs = 30000UL;
+unsigned long halowDownSinceMs = 0;
+uint32_t halowRecoveryAttempts = 0;
+uint32_t halowRecoverySuccesses = 0;
+unsigned long halowLastLivenessProbeMs = 0;
+uint32_t halowLivenessProbeSuccesses = 0;
+uint32_t halowLivenessProbeFailures = 0;
+uint8_t halowConsecutiveLivenessFailures = 0;
+uint32_t halowForcedReconnects = 0;
+int halowLastLivenessError = 0;
+unsigned long halowLastGratuitousArpMs = 0;
+uint32_t halowGratuitousArpCount = 0;
+uint32_t halowGratuitousArpFailures = 0;
 volatile unsigned bleNotifyCount = 0;
 bool bleWakeSawOk = false;
 String bleLastNotifyText;
@@ -252,7 +293,7 @@ struct CameraProfile {
   const char *wifiSsid;
 };
 static const CameraProfile CAMERA_PROFILES[] = {
-  {"e6_original", "GardePro E6 original", "a4:6d:d4:9e:47:32", "CAM8Z8_NoName_G_E6", "CAM8Z8_A46DD49E4732"},
+  {"e6_original", "GardePro E6 replacement", "a4:c1:38:98:26:35", "CAM8Z8_NoName_G_E6", "CAM8Z8_A4C138982635"},
   {"e6_plus", "GardePro E6+", "a4:c1:38:98:81:48", "CAM8Z8_NoName_G_E6+", "CAM8Z8_A4C138988148"},
 };
 String serialCommandBuffer;
@@ -323,6 +364,21 @@ static const unsigned long STREAM_STALL_TIMEOUT_MS = 4000;
 static const unsigned long STREAM_STALL_FAIL_MS = 15000;
 static const unsigned long STREAM_RECOVERY_COOLDOWN_MS = 10000;
 static const unsigned long IDLE_WIFI_RECOVERY_COOLDOWN_MS = 30000;
+static const unsigned long HALOW_RECOVERY_INTERVAL_MS = 30000;
+static const unsigned long HALOW_RECOVERY_MAX_INTERVAL_MS = 600000;
+static const unsigned long HALOW_CONNECT_WAIT_MS = 75000;
+static const unsigned long HALOW_LIVENESS_INTERVAL_MS = 30000;
+static const uint8_t HALOW_LIVENESS_FAILURE_THRESHOLD = 2;
+static const unsigned long HALOW_GRATUITOUS_ARP_INTERVAL_MS = 5000;
+static const unsigned long SD_BACKGROUND_RECOVERY_INTERVAL_MS = 15000;
+static const unsigned long SD_BACKGROUND_RECOVERY_MAX_INTERVAL_MS = 600000;
+static const uint32_t SD_RECOVERY_MIN_BATTERY_MV = 3500;
+static const uint32_t MEDIA_UPLOAD_MIN_BATTERY_MV = 3600;
+static const uint32_t CAMERA_BRINGUP_MIN_BATTERY_MV = 3600;
+static const uint32_t DURABLE_MEDIA_MIN_BATTERY_MV = 3800;
+static const uint32_t DURABLE_MEDIA_RECOVER_BATTERY_MV = 3900;
+static const unsigned long DURABLE_MEDIA_LOW_BATTERY_RECHECK_MS = 300000UL;
+static const unsigned long STORAGE_BATTERY_CHECK_INTERVAL_MS = 30000;
 static const unsigned long CAMERA_SESSION_DEFAULT_LEASE_MS = 120000;
 static const unsigned long CAMERA_SESSION_MAX_LEASE_MS = 600000;
 static const unsigned long CAMERA_IDLE_HOLD_MS = 120000;
@@ -331,32 +387,46 @@ static const uint8_t HTTP_KEEPALIVE_FAILURE_THRESHOLD = 2;
 #define CAMERA_HTTP_KEEPALIVE_ENABLED 0
 #endif
 #ifndef CAMERA_AUTO_RECOVERY_ENABLED
-#define CAMERA_AUTO_RECOVERY_ENABLED 1
+#define CAMERA_AUTO_RECOVERY_ENABLED 0
 #endif
 #ifndef HTTP_SERVER_IDLE_RESTART_MS
 #define HTTP_SERVER_IDLE_RESTART_MS 0UL
 #endif
-static const BaseType_t CONTROL_WORKER_CORE = 0;
+// Camera BLE/Wi-Fi bring-up previously ran beside the HaLow driver on core 0.
+// Under repeated camera reconnects that combination starved IDLE0 and caused
+// ESP_RST_TASK_WDT resets. Keep outbound staged uploads on core 0, but run the
+// serialized camera control/durable-job worker on the application core.
+// Camera BLE/Wi-Fi work must not share core 0 with the HaLow driver. BLE scan
+// activity on core 0 starves the radio task and trips the task watchdog.
+static const BaseType_t CONTROL_WORKER_CORE = 1;
+static const BaseType_t TRAIL_UPLOAD_WORKER_CORE = 0;
 static const BaseType_t HTTP_SERVICE_CORE = 1;
-static const uint8_t BLE_SCAN_ATTEMPTS = 3;
+static const uint8_t BLE_SCAN_ATTEMPTS = 2;
 static const uint16_t BLE_SCAN_WINDOW_SEC = 5;
 static const unsigned long BLE_SCAN_RETRY_DELAY_MS = 1000;
 static const uint8_t BLE_PASSIVE_SCAN_ATTEMPTS = 2;
 static const uint16_t BLE_PASSIVE_SCAN_WINDOW_SEC = 8;
-static const uint16_t BLE_SCAN_INTERVAL_MS = 160;
-static const uint16_t BLE_SCAN_WINDOW_MS = 80;
+// The trail cameras can advertise only briefly after a cold boot.  A 50%
+// scan duty cycle routinely missed the E6+ even though a nearby Linux BLE
+// adapter saw one packet during a 30 second scan.  Use continuous scanning
+// for camera bring-up so a sparse advertisement cannot land in a scan gap.
+static const uint16_t BLE_SCAN_INTERVAL_MS = 100;
+static const uint16_t BLE_SCAN_WINDOW_MS = 100;
 static const unsigned long BLE_INIT_WARMUP_MS = 5000;
 static const unsigned long BLE_REUSE_WARMUP_MS = 750;
 static const unsigned long BLE_SCAN_CONNECT_SETTLE_MS = 500;
 static const unsigned long BLE_CONNECT_RETRY_DELAY_MS = 1000;
 static const uint8_t BLE_CONNECT_ATTEMPTS = 3;
 static const uint16_t BLE_CONNECT_TIMEOUT_MS = 15000;
+static const uint8_t BLE_DIRECT_CONNECT_ATTEMPTS = 1;
+static const uint16_t BLE_DIRECT_CONNECT_TIMEOUT_MS = 5000;
 static const uint8_t BLE_WAKE_PULSE_ATTEMPTS = 3;
 static const unsigned long BLE_WAKE_PULSE_DELAY_MS = 350;
 static const size_t BLE_OBSERVATION_DEVICE_LIMIT = 96;
 static const size_t BLE_OBSERVATION_FIELD_LIMIT = 512;
 static const uint32_t BLE_OBSERVATION_SCAN_WINDOW_MS = 10000UL;
 static const unsigned long BRINGUP_HOTSPOT_WAIT_MS = 20000;
+static const unsigned long BRINGUP_FAILED_WAKE_HOTSPOT_WAIT_MS = 5000;
 static const unsigned long BRINGUP_HOTSPOT_POLL_MS = 3000;
 static const unsigned long BRINGUP_HOTSPOT_FAST_WINDOW_MS = 10000;
 static const unsigned long BRINGUP_HOTSPOT_FAST_POLL_MS = 1000;
@@ -403,11 +473,17 @@ SemaphoreHandle_t tunnelWriteMutex = nullptr;
 TaskHandle_t controlWorkerTaskHandle = nullptr;
 TaskHandle_t wifiScannerTaskHandle = nullptr;
 TaskHandle_t httpServiceTaskHandle = nullptr;
+TaskHandle_t trailMediaUploadTaskHandle = nullptr;
+TaskHandle_t failsafeTaskHandle = nullptr;
+volatile unsigned long loopHeartbeatMs = 0;
+volatile bool cameraBringupInProgress = false;
+unsigned long setupStartedMs = 0;
 SemaphoreHandle_t observationUploadMutex = nullptr;
 
 SemaphoreHandle_t onboardFrameMutex = nullptr;
 SemaphoreHandle_t onboardStorageMutex = nullptr;
 SemaphoreHandle_t onboardCameraMutex = nullptr;
+SemaphoreHandle_t wifiRadioMutex = nullptr;
 TaskHandle_t onboardCaptureTaskHandle = nullptr;
 SemaphoreHandle_t onboardJobMutex = nullptr;
 bool onboardCameraReady = false;
@@ -426,6 +502,18 @@ bool sdReady = false;
 String sdLastMessage = "not_started";
 uint32_t sdMountAttempts = 0;
 uint32_t sdMountSuccesses = 0;
+uint32_t sdLastMountFrequencyHz = 0;
+unsigned long sdLastBackgroundRecoveryMs = 0;
+uint32_t sdBackgroundRecoveryAttempts = 0;
+uint32_t sdBackgroundRecoverySuccesses = 0;
+unsigned long sdBackgroundRecoveryIntervalMs = SD_BACKGROUND_RECOVERY_INTERVAL_MS;
+uint32_t storageBatteryMv = 0;
+unsigned long storageBatteryLastCheckMs = 0;
+portMUX_TYPE sdCapacityCacheMux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t sdCachedCardType = CARD_NONE;
+uint64_t sdCachedCardSizeBytes = 0;
+uint64_t sdCachedTotalBytes = 0;
+uint64_t sdCachedUsedBytes = 0;
 bool onboardCaptureEnabled = ONBOARD_CAPTURE_ENABLED != 0;
 unsigned long onboardCaptureIntervalMs = ONBOARD_CAPTURE_INTERVAL_MS;
 uint16_t onboardCaptureStartMinute = ONBOARD_CAPTURE_START_MINUTE;
@@ -623,6 +711,55 @@ int uploadLastStatusCode = 0;
 String uploadLastMessage = "idle";
 unsigned long uploadLastAttemptMs = 0;
 unsigned long uploadLastSuccessMs = 0;
+bool trailMediaUploadActive = false;
+volatile bool trailMediaUploadAbortRequested = false;
+volatile bool core1TransferWdtGuardActive = false;
+TaskHandle_t core1TransferWdtGuardHandle = nullptr;
+volatile bool trailMediaRequeueActive = false;
+bool transferWifiConnected = false;
+uint32_t transferWifiConnectAttempts = 0;
+String transferWifiLastError = "";
+uint16_t transferWifiSessionFiles = 0;
+unsigned long transferWifiSessionStartedMs = 0;
+String trailMediaUploadFilename = "";
+uint32_t trailMediaUploadBytesSent = 0;
+uint32_t trailMediaUploadFileBytes = 0;
+uint32_t trailMediaUploadBytesHashed = 0;
+uint32_t trailMediaUploadSuccessCount = 0;
+uint32_t trailMediaUploadFailureCount = 0;
+uint32_t trailMediaUploadSkippedCount = 0;
+String trailMediaUploadLastSkipped = "";
+unsigned long trailMediaUploadLastAttemptMs = 0;
+unsigned long trailMediaUploadLastSuccessMs = 0;
+String trailMediaUploadLastError = "";
+String trailMediaUploadBlockedReason = "";
+String trailMediaUploadPreferredTransport = "halow";
+volatile unsigned long trailMediaUploadPauseUntilMs = 0;
+bool trailMediaUploadCursorLoaded = false;
+uint32_t trailMediaUploadCursorJobId = 0;
+uint32_t trailMediaUploadCursorPosition = 0;
+uint8_t trailMediaUploadCursorAttempts = 0;
+
+struct TrailMediaUploadCursorDisk {
+  uint32_t magic;
+  uint32_t jobId;
+  uint32_t position;
+  uint32_t check;
+};
+
+static const uint32_t TRAIL_MEDIA_UPLOAD_CURSOR_MAGIC = 0x55434D31UL;
+enum UpstreamTransport : uint8_t {
+  UPSTREAM_TRANSPORT_AUTO = 0,
+  UPSTREAM_TRANSPORT_HALOW,
+  UPSTREAM_TRANSPORT_TRANSFER_WIFI,
+};
+String failsafeLastReason = "";
+uint32_t failsafeRestartCount = 0;
+uint32_t failsafeConsecutiveSameReason = 0;
+bool automaticRecoverySuspended = false;
+uint32_t httpSelfTestSuccessCount = 0;
+uint32_t httpSelfTestFailureCount = 0;
+uint8_t httpSelfTestConsecutiveFailures = 0;
 unsigned long lastClockSyncAttemptMs = 0;
 uint32_t observationQueueNextId = 1;
 uint32_t observationQueueEnqueueCount = 0;
@@ -633,6 +770,8 @@ String observationQueueLastError = "";
 size_t observationQueueCachedCount = 0;
 size_t observationQueueCachedBytes = 0;
 bool otaInProgress = false;
+volatile bool httpLongOperationActive = false;
+volatile unsigned long httpLongOperationLastProgressMs = 0;
 bool otaSucceeded = false;
 bool otaRestartPending = false;
 unsigned long otaStartedMs = 0;
@@ -788,10 +927,21 @@ struct DurableMediaRecord {
 static const uint32_t DURABLE_MEDIA_JOB_MAGIC = 0x47504A42UL;
 static const uint16_t DURABLE_MEDIA_JOB_VERSION = 1;
 static const unsigned long DURABLE_MEDIA_RETRY_MS = 10000UL;
+static const uint8_t DURABLE_MEDIA_ITEM_MAX_ATTEMPTS = 3;
+static const uint8_t DURABLE_MEDIA_CAMERA_BRINGUP_MAX_ATTEMPTS = 3;
 DurableMediaJobState durableMediaJob{};
 bool durableMediaJobLoaded = false;
+bool durableMediaJobFromMirror = false;
+uint32_t durableMirrorLastJobId = 0;
+uint32_t durableMirrorLastIndex = 0;
+uint8_t durableMirrorLastStatus = DURABLE_MEDIA_IDLE;
+unsigned long durableMirrorLastWriteMs = 0;
 unsigned long durableMediaNextRetryMs = 0;
 SemaphoreHandle_t durableMediaJobMutex = nullptr;
+volatile uint32_t durableTransferBytes = 0;
+volatile uint32_t durableTransferExpectedBytes = 0;
+volatile unsigned long durableTransferStartedMs = 0;
+volatile unsigned long durableTransferLastProgressMs = 0;
 
 String buildDurableMediaJobJson();
 bool loadDurableMediaJob();
@@ -864,13 +1014,21 @@ bool connectSocketWithTimeout(int sock, const sockaddr_in &addr, unsigned long t
     return false;
   }
 
-  fd_set writeSet;
-  FD_ZERO(&writeSet);
-  FD_SET(sock, &writeSet);
-  timeval timeout{};
-  timeout.tv_sec = timeoutMs / 1000UL;
-  timeout.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000UL) * 1000UL);
-  const int selected = select(sock + 1, nullptr, &writeSet, nullptr, &timeout);
+  int selected = 0;
+  const unsigned long connectStartedMs = millis();
+  while (millis() - connectStartedMs < timeoutMs) {
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(sock, &writeSet);
+    timeval slice{};
+    slice.tv_sec = 0;
+    slice.tv_usec = 250000;
+    selected = select(sock + 1, nullptr, &writeSet, nullptr, &slice);
+    if (selected > 0) break;
+    if (selected < 0 && errno != EINTR) break;
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
   if (selected <= 0) {
     errorCode = selected == 0 ? ETIMEDOUT : errno;
     if (flags >= 0) {
@@ -924,14 +1082,108 @@ void closeTunnelSocket() {
 
 bool sendAll(int sock, const uint8_t *data, size_t len) {
   size_t sent = 0;
+  unsigned long lastProgressMs = millis();
   while (sent < len) {
-    const int written = send(sock, data + sent, len - sent, 0);
-    if (written <= 0) {
-      return false;
+    const int written = send(sock, data + sent, len - sent, MSG_DONTWAIT);
+    if (written > 0) {
+      sent += static_cast<size_t>(written);
+      lastProgressMs = millis();
+      continue;
     }
-    sent += static_cast<size_t>(written);
+    const int sendError = errno;
+    if (written < 0 && (sendError == EAGAIN || sendError == EWOULDBLOCK ||
+                        sendError == EINTR) &&
+        millis() - lastProgressMs < 15000UL) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      esp_task_wdt_reset();
+      continue;
+    }
+    return false;
   }
   return true;
+}
+
+bool sendMediaChunkWithRetry(int sock, const uint8_t *data, size_t len, String &error) {
+  size_t sent = 0;
+  unsigned long lastProgressMs = millis();
+  while (sent < len) {
+    if (trailMediaUploadAbortRequested || durableMediaJobIsActive()) {
+      error = "camera_job_preempted";
+      return false;
+    }
+    const int written = send(sock, data + sent, len - sent, 0);
+    if (written > 0) {
+      sent += static_cast<size_t>(written);
+      lastProgressMs = millis();
+      esp_task_wdt_reset();
+      continue;
+    }
+    const int sendError = errno;
+    if (written < 0 && (sendError == EAGAIN || sendError == EWOULDBLOCK || sendError == EINTR)) {
+      if (millis() - lastProgressMs < 90000UL) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        esp_task_wdt_reset();
+        continue;
+      }
+      error = "blob_send_no_progress_timeout_" + String(sendError);
+      return false;
+    }
+    error = "blob_send_socket_error_" + String(sendError);
+    return false;
+  }
+  return true;
+}
+
+bool bindSocketToTransferWifi(int sock) {
+  esp_netif_t *wifiNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (wifiNetif == nullptr) return false;
+  char interfaceName[8] = {};
+  if (esp_netif_get_netif_impl_name(wifiNetif, interfaceName) != ESP_OK || interfaceName[0] == '\0') {
+    return false;
+  }
+  const int result = setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+                                interfaceName, strlen(interfaceName) + 1);
+  if (result != 0) {
+    Serial.printf("[network] bind WiFi device=%s failed errno=%d\n", interfaceName, errno);
+  }
+  return result == 0;
+}
+
+bool bindSocketToHaLow(int sock) {
+  struct netif *interface = HaLow.netif();
+  if (interface == nullptr) return false;
+  char interfaceName[NETIF_NAMESIZE] = {};
+  if (netif_index_to_name(netif_get_index(interface), interfaceName) == nullptr) return false;
+  const int result = setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+                                interfaceName, strlen(interfaceName) + 1);
+  if (result != 0) {
+    Serial.printf("[network] bind HaLow device=%s failed errno=%d\n", interfaceName, errno);
+  }
+  return result == 0;
+}
+
+bool bindSocketToLocalAddress(int sock, const IPAddress &localIp) {
+  if (localIp == IPAddress((uint32_t)0)) return false;
+  sockaddr_in localAddress{};
+  localAddress.sin_family = AF_INET;
+  localAddress.sin_addr.s_addr = static_cast<uint32_t>(localIp);
+  localAddress.sin_port = 0;
+  return bind(sock, reinterpret_cast<sockaddr *>(&localAddress), sizeof(localAddress)) == 0;
+}
+
+bool bindSocketToTransport(int sock, UpstreamTransport transport) {
+  if (transport == UPSTREAM_TRANSPORT_TRANSFER_WIFI) {
+    // ESP-IDF's lwIP build for this board rejects SO_BINDTODEVICE with EINVAL.
+    // Binding the source address is sufficient to make source-aware routing
+    // choose the matching netif, including when WiFi and HaLow share a subnet.
+    return transferWifiConnected &&
+           bindSocketToLocalAddress(sock, WiFi.localIP());
+  }
+  if (transport == UPSTREAM_TRANSPORT_HALOW) {
+    return halowConnected && HaLow.status() == WL_CONNECTED &&
+           bindSocketToLocalAddress(sock, HaLow.localIP());
+  }
+  return false;
 }
 
 bool lockTunnelWrite(unsigned long timeoutMs = 1000) {
@@ -981,6 +1233,7 @@ bool sendTunnelControlFrame(int sock, TunnelControlType controlType, const Strin
 void cooperativeDelay(unsigned long durationMs) {
   const unsigned long start = millis();
   while (millis() - start < durationMs) {
+    esp_task_wdt_reset();
     delay(1);
     vTaskDelay(pdMS_TO_TICKS(1));
   }
@@ -1655,6 +1908,19 @@ String buildHaLowStatusJson() {
   payload += ",\"last_event\":" + String(halowLastEventId);
   payload += ",\"last_event_age_ms\":" + String(msSince(halowLastEventMs));
   payload += ",\"event_count\":" + String(halowEventCount);
+  payload += ",\"reconnect_in_progress\":" + String(halowConnectInProgress ? "true" : "false");
+  payload += ",\"recovery_attempts\":" + String(halowRecoveryAttempts);
+  payload += ",\"recovery_successes\":" + String(halowRecoverySuccesses);
+  payload += ",\"last_recovery_attempt_age_ms\":" + String(msSince(halowLastRecoveryAttemptMs));
+  payload += ",\"liveness_probe_successes\":" + String(halowLivenessProbeSuccesses);
+  payload += ",\"liveness_probe_failures\":" + String(halowLivenessProbeFailures);
+  payload += ",\"consecutive_liveness_failures\":" + String(halowConsecutiveLivenessFailures);
+  payload += ",\"last_liveness_error\":" + String(halowLastLivenessError);
+  payload += ",\"last_liveness_probe_age_ms\":" + String(msSince(halowLastLivenessProbeMs));
+  payload += ",\"forced_reconnects\":" + String(halowForcedReconnects);
+  payload += ",\"gratuitous_arp_count\":" + String(halowGratuitousArpCount);
+  payload += ",\"gratuitous_arp_failures\":" + String(halowGratuitousArpFailures);
+  payload += ",\"last_gratuitous_arp_age_ms\":" + String(msSince(halowLastGratuitousArpMs));
   payload += ",\"snr_db\":null";
   payload += ",\"noise_dbm\":null";
   payload += ",\"snr_note\":\"not_exposed_by_current_halow_wrapper\"";
@@ -1696,6 +1962,10 @@ void initBootIdentity() {
   previousBootTemperatureDeciC = runtimePrefs.getShort("last_temp", 0);
   previousBootFreeHeap = runtimePrefs.getUInt("last_heap", 0);
   previousBootHaLowConnected = runtimePrefs.getBool("last_halow", false);
+  failsafeLastReason = runtimePrefs.getString("failsafe", "");
+  failsafeRestartCount = runtimePrefs.getUInt("failsafe_n", 0);
+  failsafeConsecutiveSameReason = runtimePrefs.getUInt("failsafe_same", 0);
+  automaticRecoverySuspended = failsafeConsecutiveSameReason >= 3;
   persistentBootCount = runtimePrefs.getUInt("boot_count", 0) + 1;
   runtimePrefs.putUInt("boot_count", persistentBootCount);
   runtimePrefs.putBool("boot_ok", false);
@@ -2330,11 +2600,21 @@ const char *persistentStorageType() {
 }
 
 uint64_t persistentStorageTotalBytes() {
-  return sdReady ? SD.totalBytes() : LittleFS.totalBytes();
+  if (!sdReady) return LittleFS.totalBytes();
+  uint64_t totalBytes = 0;
+  portENTER_CRITICAL(&sdCapacityCacheMux);
+  totalBytes = sdCachedTotalBytes;
+  portEXIT_CRITICAL(&sdCapacityCacheMux);
+  return totalBytes;
 }
 
 uint64_t persistentStorageUsedBytes() {
-  return sdReady ? SD.usedBytes() : LittleFS.usedBytes();
+  if (!sdReady) return LittleFS.usedBytes();
+  uint64_t usedBytes = 0;
+  portENTER_CRITICAL(&sdCapacityCacheMux);
+  usedBytes = sdCachedUsedBytes;
+  portEXIT_CRITICAL(&sdCapacityCacheMux);
+  return usedBytes;
 }
 
 uint64_t persistentStorageFreeBytes() {
@@ -2492,16 +2772,46 @@ bool initOnboardStorage() {
   return true;
 }
 
+void refreshSdCapacityCache() {
+  if (!sdReady) return;
+  const uint8_t cardType = static_cast<uint8_t>(SD.cardType());
+  const uint64_t cardSize = SD.cardSize();
+  const uint64_t totalBytes = SD.totalBytes();
+  const uint64_t usedBytes = SD.usedBytes();
+  portENTER_CRITICAL(&sdCapacityCacheMux);
+  sdCachedCardType = cardType;
+  sdCachedCardSizeBytes = cardSize;
+  sdCachedTotalBytes = totalBytes;
+  sdCachedUsedBytes = usedBytes;
+  portEXIT_CRITICAL(&sdCapacityCacheMux);
+}
+
 bool mountSdCard(uint32_t frequency = 4000000UL) {
   ++sdMountAttempts;
+  sdLastMountFrequencyHz = frequency;
   SD.end();
   sdSpi.end();
   delay(50);
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
+  pinMode(SD_MOSI_PIN, OUTPUT);
+  digitalWrite(SD_MOSI_PIN, HIGH);
   pinMode(SD_MISO_PIN, INPUT_PULLUP);
   sdSpi.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  // A processor reset can leave an SPI-mode SD card in the middle of a
+  // command or data response. With CS high, provide well over the required
+  // 74 startup clocks at the initialization rate so the card returns to an
+  // idle command boundary before SD.begin() sends CMD0.
+  sdSpi.beginTransaction(SPISettings(400000UL, MSBFIRST, SPI_MODE0));
+  digitalWrite(SD_CS_PIN, HIGH);
+  for (uint8_t i = 0; i < 16; ++i) sdSpi.transfer(0xFF);
+  sdSpi.endTransaction();
+  delay(10);
   if (!SD.begin(SD_CS_PIN, sdSpi, frequency, "/sd", 5, false)) {
+    SD.end();
+    sdSpi.end();
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
     sdReady = false;
     sdLastMessage = "begin_failed";
     Serial.printf("[sd] mount failed freq=%lu\n", static_cast<unsigned long>(frequency));
@@ -2530,12 +2840,75 @@ bool mountSdCard(uint32_t frequency = 4000000UL) {
     if (onboardClockValid()) backfillOnboardMediaTimestamps();
   }
   ++sdMountSuccesses;
+  refreshSdCapacityCache();
   Serial.printf("[sd] mounted type=%u size_mb=%llu total_mb=%llu used_mb=%llu\n",
                 static_cast<unsigned>(SD.cardType()),
                 SD.cardSize() / (1024ULL * 1024ULL),
                 SD.totalBytes() / (1024ULL * 1024ULL),
                 SD.usedBytes() / (1024ULL * 1024ULL));
   return true;
+}
+
+bool mountSdCardWithRetry() {
+  static const uint32_t frequencies[] = {4000000UL, 4000000UL, 2000000UL, 1000000UL, 400000UL};
+  static const uint16_t settleDelaysMs[] = {250, 500, 1000, 1500, 2000};
+  for (size_t attempt = 0; attempt < sizeof(frequencies) / sizeof(frequencies[0]); ++attempt) {
+    delay(settleDelaysMs[attempt]);
+    Serial.printf("[sd] boot/recovery mount attempt=%u/%u settle_ms=%u freq=%lu\n",
+                  static_cast<unsigned>(attempt + 1),
+                  static_cast<unsigned>(sizeof(frequencies) / sizeof(frequencies[0])),
+                  static_cast<unsigned>(settleDelaysMs[attempt]),
+                  static_cast<unsigned long>(frequencies[attempt]));
+    if (mountSdCard(frequencies[attempt])) return true;
+  }
+  Serial.println("[sd] all boot/recovery mount attempts failed");
+  return false;
+}
+
+uint32_t cachedStorageBatteryMv() {
+  const unsigned long now = millis();
+  if (storageBatteryMv == 0 || storageBatteryLastCheckMs == 0 ||
+      now - storageBatteryLastCheckMs >= STORAGE_BATTERY_CHECK_INTERVAL_MS) {
+    storageBatteryMv = readBatteryMilliVolts(8);
+    storageBatteryLastCheckMs = now;
+  }
+  return storageBatteryMv;
+}
+
+void serviceSdRecovery() {
+  if (sdReady || durableMediaJobLoaded || otaInProgress || otaRestartPending) return;
+  const uint32_t batteryMv = cachedStorageBatteryMv();
+  if (batteryMv < SD_RECOVERY_MIN_BATTERY_MV) {
+    sdLastMessage = "recovery_waiting_for_battery";
+    return;
+  }
+  if (sdLastBackgroundRecoveryMs != 0 &&
+      millis() - sdLastBackgroundRecoveryMs < sdBackgroundRecoveryIntervalMs) return;
+  static const uint32_t frequencies[] = {4000000UL, 2000000UL, 1000000UL, 400000UL};
+  const uint32_t frequency = frequencies[sdBackgroundRecoveryAttempts %
+                                         (sizeof(frequencies) / sizeof(frequencies[0]))];
+  sdLastBackgroundRecoveryMs = millis();
+  ++sdBackgroundRecoveryAttempts;
+  Serial.printf("[sd] background recovery attempt=%u freq=%lu uptime_ms=%lu\n",
+                sdBackgroundRecoveryAttempts,
+                static_cast<unsigned long>(frequency),
+                millis());
+  if (!mountSdCard(frequency)) {
+    sdBackgroundRecoveryIntervalMs = std::min(
+        sdBackgroundRecoveryIntervalMs * 2UL, SD_BACKGROUND_RECOVERY_MAX_INTERVAL_MS);
+    return;
+  }
+  if (!loadDurableMediaJob()) {
+    sdLastMessage = "durable_job_load_failed";
+    sdBackgroundRecoveryIntervalMs = std::min(
+        sdBackgroundRecoveryIntervalMs * 2UL, SD_BACKGROUND_RECOVERY_MAX_INTERVAL_MS);
+    return;
+  }
+  sdBackgroundRecoveryIntervalMs = SD_BACKGROUND_RECOVERY_INTERVAL_MS;
+  ++sdBackgroundRecoverySuccesses;
+  Serial.printf("[sd] background recovery succeeded count=%u durable_job=%s\n",
+                sdBackgroundRecoverySuccesses,
+                durableMediaJobIsActive() ? "active" : "idle");
 }
 
 String buildDiagnosticStatusJson() {
@@ -2556,6 +2929,9 @@ String buildDiagnosticStatusJson() {
   payload += ",\"chip_temperature_c\":" + String(temperatureDeciC / 10.0f, 1);
   payload += ",\"free_heap\":" + String(ESP.getFreeHeap());
   payload += ",\"minimum_free_heap\":" + String(ESP.getMinFreeHeap());
+  payload += ",\"largest_free_heap_block\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  payload += ",\"http_task_stack_high_water\":" + String(httpServiceTaskHandle == nullptr ? 0 : uxTaskGetStackHighWaterMark(httpServiceTaskHandle));
+  payload += ",\"upload_task_stack_high_water\":" + String(trailMediaUploadTaskHandle == nullptr ? 0 : uxTaskGetStackHighWaterMark(trailMediaUploadTaskHandle));
   payload += ",\"low_battery_boot_hold\":" + buildLowBatteryBootHoldJson();
   payload += ",\"halow_connected\":" + String(halowConnected ? "true" : "false");
   payload += ",\"halow_ip\":\"" + HaLow.localIP().toString() + "\"";
@@ -2563,6 +2939,17 @@ String buildDiagnosticStatusJson() {
   payload += ",\"sd_write_count\":" + String(diagnosticSdWriteCount);
   payload += ",\"sd_write_failures\":" + String(diagnosticSdWriteFailures);
   payload += ",\"nvs_write_count\":" + String(diagnosticNvsWriteCount);
+  payload += ",\"failsafe\":{";
+  payload += "\"last_reason\":\"" + jsonEscape(failsafeLastReason) + "\"";
+  payload += ",\"restart_count\":" + String(failsafeRestartCount);
+  payload += ",\"consecutive_same_reason\":" + String(failsafeConsecutiveSameReason);
+  payload += ",\"automatic_recovery_suspended\":" + String(automaticRecoverySuspended ? "true" : "false");
+  payload += ",\"http_stall_ms\":" + String(FAILSAFE_HTTP_STALL_MS);
+  payload += ",\"upload_stall_ms\":" + String(FAILSAFE_UPLOAD_STALL_MS);
+  payload += ",\"http_self_test_successes\":" + String(httpSelfTestSuccessCount);
+  payload += ",\"http_self_test_failures\":" + String(httpSelfTestFailureCount);
+  payload += ",\"http_self_test_consecutive_failures\":" + String(httpSelfTestConsecutiveFailures);
+  payload += "}";
   payload += ",\"previous_boot\":{";
   payload += "\"operational\":" + String(previousBootOperational ? "true" : "false");
   payload += ",\"last_checkpoint_uptime_ms\":" + String(previousBootUptimeMs);
@@ -2657,6 +3044,14 @@ String buildSdStatusJson() {
   payload += ",\"last_message\":\"" + jsonEscape(sdLastMessage) + "\"";
   payload += ",\"mount_attempts\":" + String(sdMountAttempts);
   payload += ",\"mount_successes\":" + String(sdMountSuccesses);
+  payload += ",\"last_mount_frequency_hz\":" + String(sdLastMountFrequencyHz);
+  payload += ",\"background_recovery_attempts\":" + String(sdBackgroundRecoveryAttempts);
+  payload += ",\"background_recovery_successes\":" + String(sdBackgroundRecoverySuccesses);
+  payload += ",\"last_background_recovery_age_ms\":" + String(msSince(sdLastBackgroundRecoveryMs));
+  payload += ",\"background_recovery_interval_ms\":" + String(sdBackgroundRecoveryIntervalMs);
+  payload += ",\"recovery_continues_in_safe_mode\":true";
+  payload += ",\"battery_mv\":" + String(cachedStorageBatteryMv());
+  payload += ",\"recovery_min_battery_mv\":" + String(SD_RECOVERY_MIN_BATTERY_MV);
   payload += ",\"pins\":{";
   payload += "\"mosi\":" + String(SD_MOSI_PIN);
   payload += ",\"clk\":" + String(SD_CLK_PIN);
@@ -2664,11 +3059,21 @@ String buildSdStatusJson() {
   payload += ",\"cs\":" + String(SD_CS_PIN);
   payload += "}";
   if (sdReady) {
-    payload += ",\"card_type\":" + String(static_cast<unsigned>(SD.cardType()));
-    payload += ",\"card_size_bytes\":" + String(static_cast<unsigned long long>(SD.cardSize()));
-    payload += ",\"storage_total_bytes\":" + String(static_cast<unsigned long long>(SD.totalBytes()));
-    payload += ",\"storage_used_bytes\":" + String(static_cast<unsigned long long>(SD.usedBytes()));
-    const uint64_t freeBytes = SD.totalBytes() > SD.usedBytes() ? SD.totalBytes() - SD.usedBytes() : 0;
+    uint8_t cardType = CARD_NONE;
+    uint64_t cardSize = 0;
+    uint64_t totalBytes = 0;
+    uint64_t usedBytes = 0;
+    portENTER_CRITICAL(&sdCapacityCacheMux);
+    cardType = sdCachedCardType;
+    cardSize = sdCachedCardSizeBytes;
+    totalBytes = sdCachedTotalBytes;
+    usedBytes = sdCachedUsedBytes;
+    portEXIT_CRITICAL(&sdCapacityCacheMux);
+    payload += ",\"card_type\":" + String(static_cast<unsigned>(cardType));
+    payload += ",\"card_size_bytes\":" + String(static_cast<unsigned long long>(cardSize));
+    payload += ",\"storage_total_bytes\":" + String(static_cast<unsigned long long>(totalBytes));
+    payload += ",\"storage_used_bytes\":" + String(static_cast<unsigned long long>(usedBytes));
+    const uint64_t freeBytes = totalBytes > usedBytes ? totalBytes - usedBytes : 0;
     payload += ",\"storage_free_bytes\":" + String(static_cast<unsigned long long>(freeBytes));
   }
   payload += "}";
@@ -3527,8 +3932,15 @@ bool runIdleWifiScan(String &payload, String &error, int &scanCode) {
     error = "scan_busy";
     return false;
   }
-  if (streamSessionActive || wifiConnected || isControlActionActive()) {
+  if (streamSessionActive || wifiConnected || transferWifiConnected ||
+      trailMediaUploadActive || isControlActionActive()) {
     error = "camera_wifi_active";
+    return false;
+  }
+
+  if (wifiRadioMutex != nullptr &&
+      xSemaphoreTakeRecursive(wifiRadioMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    error = "wifi_radio_busy";
     return false;
   }
 
@@ -3546,6 +3958,7 @@ bool runIdleWifiScan(String &payload, String &error, int &scanCode) {
     WiFi.scanDelete();
     WiFi.mode(previousMode);
     wifiScanBusy = false;
+    if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
     return false;
   }
   payload = buildWifiScanJson(count);
@@ -3556,6 +3969,7 @@ bool runIdleWifiScan(String &payload, String &error, int &scanCode) {
   wifiScanLastMs = millis();
   WiFi.mode(previousMode);
   wifiScanBusy = false;
+  if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
   return true;
 }
 
@@ -3720,6 +4134,40 @@ String buildUploadStatusJson() {
   payload += ",\"last_attempt_age_ms\":" + String(msSince(uploadLastAttemptMs));
   payload += ",\"last_success_age_ms\":" + String(msSince(uploadLastSuccessMs));
   payload += ",\"queued_events\":" + String(static_cast<unsigned>(uploadEventCount));
+  payload += ",\"trail_media\":{";
+  payload += "\"active\":" + String(trailMediaUploadActive ? "true" : "false");
+  payload += ",\"filename\":\"" + jsonEscape(trailMediaUploadFilename) + "\"";
+  payload += ",\"bytes_sent\":" + String(trailMediaUploadBytesSent);
+  payload += ",\"file_bytes\":" + String(trailMediaUploadFileBytes);
+  payload += ",\"bytes_hashed\":" + String(trailMediaUploadBytesHashed);
+  payload += ",\"successes\":" + String(trailMediaUploadSuccessCount);
+  payload += ",\"failures\":" + String(trailMediaUploadFailureCount);
+  payload += ",\"skipped_after_max_attempts\":" + String(trailMediaUploadSkippedCount);
+  payload += ",\"max_attempts_per_file\":" + String(TRAIL_MEDIA_MAX_UPLOAD_ATTEMPTS);
+  payload += ",\"last_skipped_file\":\"" + jsonEscape(trailMediaUploadLastSkipped) + "\"";
+  payload += ",\"last_attempt_age_ms\":" + String(msSince(trailMediaUploadLastAttemptMs));
+  payload += ",\"last_success_age_ms\":" + String(msSince(trailMediaUploadLastSuccessMs));
+  payload += ",\"last_error\":\"" + jsonEscape(trailMediaUploadLastError) + "\"";
+  payload += ",\"blocked_reason\":\"" + jsonEscape(trailMediaUploadBlockedReason) + "\"";
+  payload += ",\"queue_job_id\":" + String(trailMediaUploadCursorJobId);
+  payload += ",\"queue_position\":" + String(trailMediaUploadCursorPosition);
+  payload += ",\"preferred_transport\":\"" + trailMediaUploadPreferredTransport + "\"";
+  payload += ",\"fallback_transport\":\"halow\"";
+  payload += ",\"battery_mv\":" + String(cachedStorageBatteryMv());
+  payload += ",\"minimum_battery_mv\":" + String(MEDIA_UPLOAD_MIN_BATTERY_MV);
+  payload += "}";
+  payload += ",\"transfer_wifi\":{";
+  payload += "\"configured\":" + String(strlen(TRANSFER_WIFI_SSID) > 0 ? "true" : "false");
+  payload += ",\"preferred\":" + String(TRANSFER_WIFI_UPLOAD_ENABLED ? "true" : "false");
+  payload += ",\"connected\":" + String(transferWifiConnected ? "true" : "false");
+  payload += ",\"ip\":\"" + jsonEscape(transferWifiConnected ? WiFi.localIP().toString() : String("0.0.0.0")) + "\"";
+  payload += ",\"connect_attempts\":" + String(transferWifiConnectAttempts);
+  payload += ",\"session_files\":" + String(transferWifiSessionFiles);
+  payload += ",\"batch_file_limit\":" + String(TRANSFER_WIFI_BATCH_FILES);
+  payload += ",\"session_age_ms\":" + String(msSince(transferWifiSessionStartedMs));
+  payload += ",\"session_max_ms\":" + String(TRANSFER_WIFI_SESSION_MAX_MS);
+  payload += ",\"last_error\":\"" + jsonEscape(transferWifiLastError) + "\"";
+  payload += "}";
   payload += ",\"observation_queue\":{";
   payload += "\"storage_type\":\"" + String(persistentStorageType()) + "\"";
   payload += ",\"queued_batches\":" + String(static_cast<unsigned>(observationQueueCachedCount));
@@ -4204,6 +4652,34 @@ void setCameraTargetFromAdvertisement(const String &mac, const String &name) {
                 cameraTargetWifiSsid.c_str());
 }
 
+bool persistCameraTarget() {
+  Preferences prefs;
+  if (!prefs.begin("camera_target", false)) return false;
+  const bool ok = prefs.putString("ble_mac", cameraTargetBleMac) > 0 &&
+                  prefs.putString("ble_name", cameraTargetBleName) > 0 &&
+                  prefs.putString("wifi_ssid", cameraTargetWifiSsid) > 0;
+  prefs.end();
+  return ok;
+}
+
+void loadPersistedCameraTarget() {
+  Preferences prefs;
+  if (!prefs.begin("camera_target", true)) return;
+  String mac = prefs.getString("ble_mac", "");
+  String name = prefs.getString("ble_name", "");
+  String ssid = prefs.getString("wifi_ssid", "");
+  prefs.end();
+  mac.trim();
+  ssid.trim();
+  if (mac.isEmpty() || ssid.isEmpty()) return;
+  cameraTargetBleMac = mac;
+  cameraTargetBleName = name;
+  cameraTargetWifiSsid = ssid;
+  Serial.printf("[camera-target] restored ble_mac=%s name=%s wifi_ssid=%s\n",
+                cameraTargetBleMac.c_str(), cameraTargetBleName.c_str(),
+                cameraTargetWifiSsid.c_str());
+}
+
 bool setCameraTarget(const String &rawBleMac,
                      const String &rawWifiSsid,
                      const String &rawName,
@@ -4267,6 +4743,9 @@ bool setCameraTarget(const String &rawBleMac,
   cameraTargetBleMac = mac;
   cameraTargetBleName = name;
   cameraTargetWifiSsid = ssid;
+  if (changed && !persistCameraTarget()) {
+    Serial.println("[camera-target] warning: failed to persist selection");
+  }
   error = "";
   Serial.printf("[camera-target] selected ble_mac=%s name=%s wifi_ssid=%s changed=%s\n",
                 cameraTargetBleMac.c_str(),
@@ -4302,8 +4781,11 @@ String buildCameraTargetJson() {
 }
 
 bool advertisedDeviceLooksLikeCamera(const String &mac, const String &name, const String &serviceUuid) {
-  if (!cameraTargetBleMac.isEmpty() && mac.equalsIgnoreCase(cameraTargetBleMac)) {
-    return true;
+  // An explicit profile is authoritative. Do not let the first other
+  // GardePro advertisement silently replace it; that previously made E6+
+  // jobs connect to the nearby original E6 and accept its empty gallery.
+  if (!cameraTargetBleMac.isEmpty()) {
+    return mac.equalsIgnoreCase(cameraTargetBleMac);
   }
   if (!name.isEmpty() && (name == CAMERA_BLE_NAME || name.startsWith(CAMERA_BLE_NAME_PREFIX))) {
     return true;
@@ -4379,12 +4861,20 @@ void closeBleWakeSession() {
 }
 
 void refreshWifiState() {
-  wifiConnected = (WiFi.status() == WL_CONNECTED) && (WiFi.localIP() != IPAddress((uint32_t)0));
+  const bool radioConnected = (WiFi.status() == WL_CONNECTED) &&
+                              (WiFi.localIP() != IPAddress((uint32_t)0));
+  wifiConnected = radioConnected && WiFi.SSID() == cameraTargetWifiSsid;
+  transferWifiConnected = radioConnected && WiFi.SSID() == TRANSFER_WIFI_SSID;
 }
 
 void powerDownTrailCameraWifiRadio(const char *reason) {
   if (streamSessionActive) {
     Serial.printf("[power] keeping trail camera WiFi active during stream reason=%s\n", reason);
+    return;
+  }
+  if (wifiRadioMutex != nullptr &&
+      xSemaphoreTakeRecursive(wifiRadioMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.printf("[power] WiFi radio busy; deferring power-down reason=%s\n", reason);
     return;
   }
   closeBleWakeSession();
@@ -4399,6 +4889,8 @@ void powerDownTrailCameraWifiRadio(const char *reason) {
   WiFi.setSleep(true);
   WiFi.mode(WIFI_OFF);
   wifiConnected = false;
+  transferWifiConnected = false;
+  if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
 }
 
 static void bleNotifyCallback(NimBLERemoteCharacteristic *characteristic,
@@ -4890,6 +5382,42 @@ bool connectBleTargetWithRetries() {
   return false;
 }
 
+bool connectBleTargetAddressWithRetries() {
+  bleLastConnectError = 0;
+  bleConnectAttempts = 0;
+  bleStage = "direct_connect";
+  cooperativeDelay(BLE_SCAN_CONNECT_SETTLE_MS);
+
+  const NimBLEAddress targetAddress(cameraTargetBleMac.c_str(), 0 /* public */);
+  for (uint8_t attempt = 1; attempt <= BLE_DIRECT_CONNECT_ATTEMPTS; ++attempt) {
+    bleConnectAttempts = attempt;
+    if (bleClient != nullptr) {
+      NimBLEDevice::deleteClient(bleClient);
+      bleClient = nullptr;
+    }
+    Serial.printf("[BLE] direct connect attempt %u/%u address=%s\n",
+                  static_cast<unsigned>(attempt),
+                  static_cast<unsigned>(BLE_DIRECT_CONNECT_ATTEMPTS),
+                  cameraTargetBleMac.c_str());
+    bleClient = NimBLEDevice::createClient();
+    bleClient->setClientCallbacks(&bridgeBleClientCallbacks, false);
+    bleClient->setConnectTimeout(BLE_DIRECT_CONNECT_TIMEOUT_MS);
+    bleClient->setConnectionParams(24, 40, 0, 400, 160, 120);
+    if (bleClient->connect(targetAddress, true, false, false)) {
+      bleLastConnectError = 0;
+      return true;
+    }
+    bleLastConnectError = bleClient->getLastError();
+    Serial.printf("[BLE] direct connect attempt %u failed last_error=%d\n",
+                  static_cast<unsigned>(attempt), bleLastConnectError);
+    NimBLEDevice::deleteClient(bleClient);
+    bleClient = nullptr;
+    cooperativeDelay(BLE_CONNECT_RETRY_DELAY_MS);
+  }
+  bleStage = "direct_connect_failed";
+  return false;
+}
+
 bool runBleDiscoveryPass(NimBLEScan *scan,
                          bool activeScan,
                          uint8_t attempts,
@@ -4959,6 +5487,7 @@ bool runExactBleWake() {
     runBleDiscoveryPass(scan, false, BLE_PASSIVE_SCAN_ATTEMPTS, BLE_PASSIVE_SCAN_WINDOW_SEC, "passive");
   }
 
+  bool bleConnected = false;
   if (!bleTargetDeviceFound) {
     Serial.printf("[BLE] target advertisement not found results=%u best_mac=%s best_name=%s best_rssi=%d attempts=%u\n",
                   static_cast<unsigned>(bleScanResultCount),
@@ -4966,11 +5495,17 @@ bool runExactBleWake() {
                   bleBestSeenName.c_str(),
                   bleBestSeenRssi,
                   static_cast<unsigned>(bleScanAttemptCounter));
-    bleStage = "scan_not_found";
-    return false;
+    // A powered E6+ may emit only a single advertisement over tens of
+    // seconds.  Let the controller initiate directly to the selected public
+    // address before declaring it absent.
+    bleConnected = connectBleTargetAddressWithRetries();
+    if (!bleConnected) {
+      bleStage = "scan_not_found";
+      return false;
+    }
   }
 
-  if (!connectBleTargetWithRetries()) {
+  if (!bleConnected && !connectBleTargetWithRetries()) {
     Serial.printf("[BLE] connect failed after %u attempts last_error=%d\n",
                   static_cast<unsigned>(bleConnectAttempts),
                   bleLastConnectError);
@@ -5070,11 +5605,8 @@ void printSerialHelp() {
   Serial.println("  onboard_dump [fresh]");
   Serial.println("  sd_status");
   Serial.println("  sd_mount");
-  Serial.println("  scanner_status");
-  Serial.println("  scanner_enable");
-  Serial.println("  scanner_disable");
-  Serial.println("  wifi_scan");
   Serial.println("  upload_status");
+  Serial.println("  upload_requeue");
   Serial.println("  upload_telemetry");
   Serial.println("  upload_events");
   Serial.println("  upload_all");
@@ -5085,6 +5617,12 @@ void printSerialHelp() {
 }
 
 void connectCameraWifi() {
+  if (wifiRadioMutex != nullptr &&
+      xSemaphoreTakeRecursive(wifiRadioMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.println("[WiFi] radio busy; camera connect deferred");
+    wifiConnected = false;
+    return;
+  }
   const unsigned long connectStartedMs = millis();
   Serial.printf("Connecting camera WiFi SSID %s\n", cameraTargetWifiSsid.c_str());
   WiFi.persistent(false);
@@ -5119,6 +5657,7 @@ void connectCameraWifi() {
   } else {
     Serial.println("Camera WiFi connect timed out");
   }
+  if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
 }
 
 bool recoverActiveStream(const char *reason) {
@@ -5176,6 +5715,10 @@ bool recoverActiveStream(const char *reason) {
 bool recoverIdleWifi(const char *reason) {
   if (isControlActionActive()) {
     Serial.printf("[idle] skipping wifi recovery during control action reason=%s\n", reason);
+    return false;
+  }
+  if (durableMediaJobIsActive()) {
+    Serial.printf("[idle] skipping wifi recovery during durable media job reason=%s\n", reason);
     return false;
   }
   if (standbyRequested) {
@@ -5263,6 +5806,14 @@ bool waitForCameraWifiPresence(unsigned long timeoutMs, unsigned long intervalMs
 }
 
 void connectHaLow() {
+  portENTER_CRITICAL(&halowConnectMux);
+  if (halowConnectInProgress) {
+    portEXIT_CRITICAL(&halowConnectMux);
+    return;
+  }
+  halowConnectInProgress = true;
+  portEXIT_CRITICAL(&halowConnectMux);
+  halowLastRecoveryAttemptMs = millis();
   Serial.printf("Connecting HaLow SSID %s\n", HALOW_SSID);
   if (!halowInitialized) {
     HaLow.onEvent(onHaLowEvent);
@@ -5274,7 +5825,7 @@ void connectHaLow() {
   HaLow.begin(HALOW_SSID, HALOW_PASS);
 
   unsigned long start = millis();
-  while (HaLow.status() != WL_CONNECTED && millis() - start < 20000) {
+  while (HaLow.status() != WL_CONNECTED && millis() - start < HALOW_CONNECT_WAIT_MS) {
     cooperativeDelay(100);
     Serial.print("#");
   }
@@ -5282,6 +5833,8 @@ void connectHaLow() {
 
   halowConnected = (HaLow.status() == WL_CONNECTED);
   if (halowConnected) {
+    halowRecoveryIntervalMs = HALOW_RECOVERY_INTERVAL_MS;
+    halowDownSinceMs = 0;
     Serial.printf("HaLow connected, IP=%s gateway=%s\n",
                   HaLow.localIP().toString().c_str(),
                   HaLow.gatewayIP().toString().c_str());
@@ -5293,6 +5846,114 @@ void connectHaLow() {
                   onboardClockValid() ? "yes" : "no");
   } else {
     Serial.println("HaLow connect timed out");
+  }
+  portENTER_CRITICAL(&halowConnectMux);
+  halowConnectInProgress = false;
+  portEXIT_CRITICAL(&halowConnectMux);
+}
+
+bool probeHaLowDataPlane(int &errorCode) {
+  errorCode = 0;
+  const int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) {
+    errorCode = errno;
+    return false;
+  }
+  if (!bindSocketToHaLow(sock)) {
+    errorCode = ENODEV;
+    close(sock);
+    return false;
+  }
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = static_cast<uint32_t>(HaLow.gatewayIP());
+  address.sin_port = htons(UPSTREAM_API_PORT);
+  const bool connected = connectSocketWithTimeout(sock, address, 2000UL, errorCode);
+  close(sock);
+  // A refused TCP connection still proves that ARP, routing, and the remote
+  // network stack are alive; timeouts and unreachable errors do not.
+  return connected || errorCode == ECONNREFUSED;
+}
+
+void forceHaLowReconnect(const char *reason) {
+  ++halowForcedReconnects;
+  Serial.printf("[HaLow] forcing reconnect reason=%s count=%u status=%d\n",
+                reason, halowForcedReconnects, static_cast<int>(HaLow.status()));
+  halowConnected = false;
+  mmwlan_sta_disable();
+  cooperativeDelay(500);
+  HaLow._setStatus(WL_DISCONNECTED);
+  connectHaLow();
+}
+
+void serviceHaLowGratuitousArp() {
+  if (halowLastGratuitousArpMs != 0 &&
+      millis() - halowLastGratuitousArpMs < HALOW_GRATUITOUS_ARP_INTERVAL_MS) return;
+  halowLastGratuitousArpMs = millis();
+  struct netif *interface = HaLow.netif();
+  if (interface == nullptr || ip4_addr_isany_val(*netif_ip4_addr(interface))) {
+    ++halowGratuitousArpFailures;
+    return;
+  }
+  const err_t result = etharp_gratuitous(interface);
+  if (result == ERR_OK) ++halowGratuitousArpCount;
+  else ++halowGratuitousArpFailures;
+}
+
+void serviceHaLowRecovery() {
+  // HaLow driver reconnects are comparatively expensive and have previously
+  // overlapped BLE/GATT discovery, starving the control worker and breaking
+  // an otherwise valid camera wake. Defer them until camera bring-up exits.
+  if (otaInProgress || otaRestartPending || halowConnectInProgress ||
+      cameraBringupInProgress) return;
+  if (HaLow.status() == WL_CONNECTED) {
+    halowConnected = true;
+    halowDownSinceMs = 0;
+    serviceHaLowGratuitousArp();
+    if (halowLastLivenessProbeMs == 0 ||
+        millis() - halowLastLivenessProbeMs >= HALOW_LIVENESS_INTERVAL_MS) {
+      halowLastLivenessProbeMs = millis();
+      int errorCode = 0;
+      if (probeHaLowDataPlane(errorCode)) {
+        ++halowLivenessProbeSuccesses;
+        halowConsecutiveLivenessFailures = 0;
+        halowLastLivenessError = 0;
+      } else {
+        ++halowLivenessProbeFailures;
+        ++halowConsecutiveLivenessFailures;
+        halowLastLivenessError = errorCode;
+        Serial.printf("[HaLow] liveness failed consecutive=%u total=%u error=%d\n",
+                      halowConsecutiveLivenessFailures,
+                      halowLivenessProbeFailures,
+                      errorCode);
+        if (halowConsecutiveLivenessFailures >= HALOW_LIVENESS_FAILURE_THRESHOLD) {
+          halowConsecutiveLivenessFailures = 0;
+          forceHaLowReconnect("data_plane_unreachable");
+        }
+      }
+    }
+    return;
+  }
+  halowConnected = false;
+  if (halowDownSinceMs == 0) halowDownSinceMs = millis();
+  if (halowConnectInProgress ||
+      (halowLastRecoveryAttemptMs != 0 &&
+       millis() - halowLastRecoveryAttemptMs < halowRecoveryIntervalMs)) return;
+  ++halowRecoveryAttempts;
+  Serial.printf("[HaLow] recovery attempt=%u camera_wifi=%s durable_job=%s\n",
+                halowRecoveryAttempts,
+                wifiConnected ? "up" : "down",
+                durableMediaJobIsActive() ? "active" : "idle");
+  connectHaLow();
+  if (halowConnected) {
+    halowRecoveryIntervalMs = HALOW_RECOVERY_INTERVAL_MS;
+    ++halowRecoverySuccesses;
+    Serial.printf("[HaLow] recovery succeeded count=%u ip=%s\n",
+                  halowRecoverySuccesses,
+                  HaLow.localIP().toString().c_str());
+  } else {
+    halowRecoveryIntervalMs = std::min(halowRecoveryIntervalMs * 2UL,
+                                       HALOW_RECOVERY_MAX_INTERVAL_MS);
   }
 }
 
@@ -5315,13 +5976,22 @@ bool postJsonToApi(const char *apiHost,
                    const String &requestPath,
                    const String &requestBody,
                    String &responseBody,
-                   int &statusCode) {
-  if (!halowConnected || HaLow.status() != WL_CONNECTED) {
-    connectHaLow();
+                   int &statusCode,
+                   UpstreamTransport requestedTransport = UPSTREAM_TRANSPORT_AUTO) {
+  UpstreamTransport transport = requestedTransport;
+  if (transport == UPSTREAM_TRANSPORT_AUTO) {
+    // Management traffic remains on HaLow even while bulk media uses 2.4 GHz.
+    // This avoids default-route ambiguity when both interfaces share a subnet.
+    transport = (halowConnected && HaLow.status() == WL_CONNECTED)
+                  ? UPSTREAM_TRANSPORT_HALOW
+                  : UPSTREAM_TRANSPORT_TRANSFER_WIFI;
   }
-  if (!halowConnected) {
+  const bool transportReady = transport == UPSTREAM_TRANSPORT_TRANSFER_WIFI
+                                ? transferWifiConnected
+                                : (halowConnected && HaLow.status() == WL_CONNECTED);
+  if (!transportReady) {
     statusCode = 0;
-    responseBody = "{\"error\":\"halow_down\"}";
+    responseBody = "{\"error\":\"requested_transport_down\"}";
     return false;
   }
 
@@ -5335,16 +6005,30 @@ bool postJsonToApi(const char *apiHost,
   receiveTimeout.tv_sec = 10;
   receiveTimeout.tv_usec = 0;
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, sizeof(receiveTimeout));
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &receiveTimeout, sizeof(receiveTimeout));
+  if (!bindSocketToTransport(sock, transport)) {
+    Serial.printf("[upload] transport bind failed transport=%s errno=%d\n",
+                  transport == UPSTREAM_TRANSPORT_TRANSFER_WIFI ? "wifi_2_4ghz" : "halow",
+                  errno);
+    close(sock);
+    statusCode = 0;
+    responseBody = "{\"error\":\"transport_bind_failed\"}";
+    return false;
+  }
 
   sockaddr_in upstreamAddr{};
   upstreamAddr.sin_family = AF_INET;
   upstreamAddr.sin_addr.s_addr = inet_addr(apiHost);
   upstreamAddr.sin_port = htons(apiPort);
 
-  if (connect(sock, reinterpret_cast<sockaddr *>(&upstreamAddr), sizeof(upstreamAddr)) != 0) {
+  int connectError = 0;
+  if (!connectSocketWithTimeout(sock, upstreamAddr, 10000UL, connectError)) {
+    Serial.printf("[upload] connect failed transport=%s host=%s:%u error=%d\n",
+                  transport == UPSTREAM_TRANSPORT_TRANSFER_WIFI ? "wifi_2_4ghz" : "halow",
+                  apiHost, apiPort, connectError);
     close(sock);
     statusCode = 0;
-    responseBody = "{\"error\":\"api_connect_failed\"}";
+    responseBody = "{\"error\":\"api_connect_failed_" + String(connectError) + "\"}";
     return false;
   }
 
@@ -5414,13 +6098,15 @@ bool postJsonToApi(const char *apiHost,
 bool postJsonToUpstream(const String &path,
                         const String &requestBody,
                         String &responseBody,
-                        int &statusCode) {
+                        int &statusCode,
+                        UpstreamTransport transport = UPSTREAM_TRANSPORT_AUTO) {
   return postJsonToApi(UPSTREAM_API_HOST,
                        UPSTREAM_API_PORT,
                        normalizeApiPath(path),
                        requestBody,
                        responseBody,
-                       statusCode);
+                       statusCode,
+                       transport);
 }
 
 String observationQueuePath(uint32_t id, const String &kind) {
@@ -6506,11 +7192,27 @@ void runCameraHttpSelfTest() {
 }
 
 bool runBringupSequence() {
+  const uint32_t bringupBatteryMv = readBatteryMilliVolts(8);
+  if (bringupBatteryMv < CAMERA_BRINGUP_MIN_BATTERY_MV) {
+    bleStage = "low_battery";
+    bleWakeConfirmed = false;
+    Serial.printf("[bringup] refused: battery=%u mV minimum=%u mV\n",
+                  bringupBatteryMv, CAMERA_BRINGUP_MIN_BATTERY_MV);
+    return false;
+  }
+  if (wifiRadioMutex != nullptr &&
+      xSemaphoreTakeRecursive(wifiRadioMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.println("[bringup] WiFi radio busy");
+    return false;
+  }
+  cameraBringupInProgress = true;
   const unsigned long bringupStartedMs = millis();
   refreshWifiState();
   if (wifiConnected) {
     lastBringupElapsedMs = millis() - bringupStartedMs;
     Serial.println("[bringup] camera WiFi already connected");
+    cameraBringupInProgress = false;
+    if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
     return true;
   }
 
@@ -6520,9 +7222,13 @@ bool runBringupSequence() {
   cooperativeDelay(250);
   refreshWifiState();
   bleWakeAttempted = true;
+  // Preserve the known-good radio sequence: initialize and scan BLE before
+  // running any 2.4 GHz Wi-Fi scan. A hotspot pre-scan here was added with the
+  // storage/recovery work and could leave coexistence favoring Wi-Fi while the
+  // following NimBLE scan received no advertisements at all.
   bool hotspotVisible = false;
 
-  if (tryExistingBleWakeSession()) {
+  if (!hotspotVisible && tryExistingBleWakeSession()) {
     const unsigned long hotspotStartedMs = millis();
     hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
                                                BRINGUP_HOTSPOT_POLL_MS);
@@ -6544,22 +7250,34 @@ bool runBringupSequence() {
     Serial.printf("[BLE] exact wake result: %s stage=%s\n",
                   bleWakeConfirmed ? "success" : "no-confirmation",
                   bleStage.c_str());
-    if (!bleWakeConfirmed) {
-      Serial.println("[bringup] aborting after BLE wake failure");
-      refreshWifiState();
-      lastBringupElapsedMs = millis() - bringupStartedMs;
-      return false;
-    }
     const unsigned long hotspotStartedMs = millis();
-    hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
+    const unsigned long hotspotWaitMs = bleWakeConfirmed
+                                          ? BRINGUP_HOTSPOT_WAIT_MS
+                                          : BRINGUP_FAILED_WAKE_HOTSPOT_WAIT_MS;
+    hotspotVisible = waitForCameraWifiPresence(hotspotWaitMs,
                                                BRINGUP_HOTSPOT_POLL_MS);
     lastHotspotWaitElapsedMs = millis() - hotspotStartedMs;
     Serial.printf("[WiFi] hotspot visibility after BLE wake: %s\n", hotspotVisible ? "yes" : "no");
+    if (hotspotVisible && !bleWakeConfirmed) {
+      bleWakeConfirmed = true;
+      bleStage = "wake_hotspot_visible";
+      Serial.println("[BLE] wake confirmed by camera hotspot visibility");
+    }
+    if (!bleWakeConfirmed && !hotspotVisible) {
+      Serial.println("[bringup] aborting after BLE wake failure and hotspot absence");
+      refreshWifiState();
+      lastBringupElapsedMs = millis() - bringupStartedMs;
+      cameraBringupInProgress = false;
+      if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+      return false;
+    }
   }
   if (!hotspotVisible) {
     Serial.println("[bringup] aborting because camera hotspot did not appear");
     refreshWifiState();
     lastBringupElapsedMs = millis() - bringupStartedMs;
+    cameraBringupInProgress = false;
+    if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
     return false;
   }
   connectCameraWifi();
@@ -6571,7 +7289,10 @@ bool runBringupSequence() {
   }
   refreshWifiState();
   lastBringupElapsedMs = millis() - bringupStartedMs;
-  return wifiConnected;
+  const bool connected = wifiConnected;
+  cameraBringupInProgress = false;
+  if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+  return connected;
 }
 
 void printRuntimeStatus() {
@@ -6960,6 +7681,18 @@ void handleDiagnosticStatus() {
   server.send(200, "application/json", buildDiagnosticStatusJson());
 }
 
+void handleRecoveryResume() {
+  automaticRecoverySuspended = false;
+  failsafeConsecutiveSameReason = 0;
+  Preferences prefs;
+  if (prefs.begin("runtime", false)) {
+    prefs.putUInt("failsafe_same", 0);
+    prefs.end();
+  }
+  server.send(200, "application/json",
+              "{\"ok\":true,\"automatic_recovery_suspended\":false}");
+}
+
 void handleDiagnosticLog() {
   if (!sdReady) {
     server.send(503, "application/json", "{\"error\":\"sd_unavailable\"}");
@@ -6984,6 +7717,50 @@ void handleHaLowStatusHttp() {
 
 void handleWifiStatus() {
   server.send(200, "application/json", buildWifiStatusJson());
+}
+
+void handleTransferWifiTest() {
+  if (isControlActionActive() || streamSessionActive || trailMediaUploadActive || wifiConnected) {
+    server.send(409, "application/json",
+                "{\"ok\":false,\"error\":\"radio_busy\"}");
+    return;
+  }
+  const unsigned long startedMs = millis();
+  const bool associated = ensureTransferWifiConnected();
+  const String ip = associated ? WiFi.localIP().toString() : String("0.0.0.0");
+  const String gateway = associated ? WiFi.gatewayIP().toString() : String("0.0.0.0");
+  const int rssi = associated ? WiFi.RSSI() : 0;
+  const int channel = associated ? WiFi.channel() : 0;
+  bool serverReachable = false;
+  int connectError = 0;
+  if (associated) {
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock >= 0 && bindSocketToTransferWifi(sock)) {
+      sockaddr_in address{};
+      address.sin_family = AF_INET;
+      address.sin_addr.s_addr = inet_addr(UPSTREAM_API_HOST);
+      address.sin_port = htons(UPSTREAM_API_PORT);
+      serverReachable = connectSocketWithTimeout(sock, address, 5000UL, connectError);
+    } else {
+      connectError = errno == 0 ? ENODEV : errno;
+    }
+    if (sock >= 0) close(sock);
+  }
+  disconnectTransferWifi();
+  String payload = "{";
+  payload += "\"ok\":" + String((associated && serverReachable) ? "true" : "false");
+  payload += ",\"ssid_configured\":" + String(strlen(TRANSFER_WIFI_SSID) > 0 ? "true" : "false");
+  payload += ",\"associated\":" + String(associated ? "true" : "false");
+  payload += ",\"ip\":\"" + ip + "\"";
+  payload += ",\"gateway\":\"" + gateway + "\"";
+  payload += ",\"rssi\":" + String(rssi);
+  payload += ",\"channel\":" + String(channel);
+  payload += ",\"server_reachable_over_wifi\":" + String(serverReachable ? "true" : "false");
+  payload += ",\"server_connect_error\":" + String(connectError);
+  payload += ",\"elapsed_ms\":" + String(millis() - startedMs);
+  payload += ",\"disconnected_after_test\":true";
+  payload += "}";
+  server.send(associated && serverReachable ? 200 : 503, "application/json", payload);
 }
 
 void handleCameraBridgeStatus() {
@@ -7015,7 +7792,13 @@ void handleTrailMediaStatus() {
   payload += "\"ready\":" + String(sdReady ? "true" : "false");
   payload += ",\"job\":" + buildDurableMediaJobJson();
   if (sdReady) {
-    const uint64_t freeBytes = SD.totalBytes() > SD.usedBytes() ? SD.totalBytes() - SD.usedBytes() : 0;
+    uint64_t totalBytes = 0;
+    uint64_t usedBytes = 0;
+    portENTER_CRITICAL(&sdCapacityCacheMux);
+    totalBytes = sdCachedTotalBytes;
+    usedBytes = sdCachedUsedBytes;
+    portEXIT_CRITICAL(&sdCapacityCacheMux);
+    const uint64_t freeBytes = totalBytes > usedBytes ? totalBytes - usedBytes : 0;
     payload += ",\"free_bytes\":" + String(static_cast<unsigned long long>(freeBytes));
   }
   payload += "}";
@@ -7062,17 +7845,45 @@ void handleTrailMediaFile() {
     return;
   }
   const String path = String(TRAIL_MEDIA_DIR) + "/" + filename;
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    server.send(503, "application/json", "{\"error\":\"storage_busy\"}");
+    return;
+  }
   File file = SD.open(path, FILE_READ);
   if (!file) {
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
     return;
   }
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
-  server.streamFile(file, filename.endsWith(".JPG") ? "image/jpeg" : "video/mp4");
-  file.close();
+  const size_t fileBytes = file.size();
   if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+  server.setContentLength(fileBytes);
+  server.send(200, filename.endsWith(".JPG") ? "image/jpeg" : "video/mp4", "");
+  WiFiClient client = server.client();
+  // Pace direct SD-to-HTTP streaming so the SPI and network drivers do not
+  // starve the monitored idle task.
+  uint8_t buffer[512];
+  size_t sent = 0;
+  httpLongOperationActive = true;
+  httpLongOperationLastProgressMs = millis();
+  while (sent < fileBytes && client.connected()) {
+    if (onboardStorageMutex != nullptr &&
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) break;
+    const int count = file.read(buffer, std::min(sizeof(buffer), fileBytes - sent));
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    if (count <= 0 || client.write(buffer, static_cast<size_t>(count)) != static_cast<size_t>(count)) break;
+    sent += static_cast<size_t>(count);
+    httpLongOperationLastProgressMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  if (onboardStorageMutex == nullptr ||
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    file.close();
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  }
+  httpLongOperationActive = false;
 }
 
 void handleSystemRestart() {
@@ -7120,7 +7931,11 @@ void handleOnboardCameraLatest() {
     server.send(404, "application/json", "{\"error\":\"media_not_found\"}");
     return;
   }
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    server.send(503, "application/json", "{\"error\":\"storage_busy\"}");
+    return;
+  }
   File file = onboardMediaFs().open(onboardMediaImagePath(onboardLatestMediaId), FILE_READ);
   if (!file) {
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
@@ -7128,9 +7943,31 @@ void handleOnboardCameraLatest() {
     return;
   }
   server.sendHeader("Cache-Control", "no-store");
-  server.streamFile(file, "image/jpeg");
-  file.close();
+  const size_t fileBytes = file.size();
   if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  server.setContentLength(fileBytes);
+  server.send(200, "image/jpeg", "");
+  WiFiClient client = server.client();
+  uint8_t buffer[4096];
+  size_t sent = 0;
+  httpLongOperationActive = true;
+  httpLongOperationLastProgressMs = millis();
+  while (sent < fileBytes && client.connected()) {
+    if (onboardStorageMutex != nullptr &&
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) break;
+    const int count = file.read(buffer, std::min(sizeof(buffer), fileBytes - sent));
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    if (count <= 0 || client.write(buffer, static_cast<size_t>(count)) != static_cast<size_t>(count)) break;
+    sent += static_cast<size_t>(count);
+    httpLongOperationLastProgressMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  if (onboardStorageMutex == nullptr ||
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    file.close();
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  }
+  httpLongOperationActive = false;
 }
 
 void handleOnboardCameraCapture() {
@@ -7181,7 +8018,10 @@ bool deleteAllOnboardMedia(unsigned &deleted, unsigned &failed) {
   deleted = 0;
   failed = 0;
   if (!onboardStorageReady) return false;
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    return false;
+  }
   fs::FS &fs = onboardMediaFs();
   std::vector<uint32_t> ids;
   File dir = fs.open(ONBOARD_MEDIA_DIR, FILE_READ);
@@ -7204,6 +8044,10 @@ bool deleteAllOnboardMedia(unsigned &deleted, unsigned &failed) {
     const bool metaDeleted = !fs.exists(onboardMediaMetaPath(id)) || fs.remove(onboardMediaMetaPath(id));
     if (imageDeleted && metaDeleted) ++deleted; else ++failed;
   }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+
+  // refreshOnboardMediaState() takes the storage mutex itself. Calling it while
+  // holding the non-recursive mutex deadlocked the sole HTTP service task.
   refreshOnboardMediaState();
   if (onboardFrameMutex != nullptr) {
     xSemaphoreTake(onboardFrameMutex, portMAX_DELAY);
@@ -7215,7 +8059,6 @@ bool deleteAllOnboardMedia(unsigned &deleted, unsigned &failed) {
     onboardLastCaptureMs = 0;
     xSemaphoreGive(onboardFrameMutex);
   }
-  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
   return true;
 }
 
@@ -7234,7 +8077,11 @@ void handleOnboardMediaList() {
   uint32_t fromEpoch = server.hasArg("from") ? strtoul(server.arg("from").c_str(), nullptr, 10) : 0;
   uint32_t toEpoch = server.hasArg("to") ? strtoul(server.arg("to").c_str(), nullptr, 10) : UINT32_MAX;
   std::vector<OnboardMediaInfo> media;
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    server.send(503, "application/json", "{\"error\":\"storage_busy\"}");
+    return;
+  }
   fs::FS &fs = onboardMediaFs();
   File dir = fs.open(ONBOARD_MEDIA_DIR, FILE_READ);
   if (dir && dir.isDirectory()) {
@@ -7286,7 +8133,11 @@ void handleOnboardMediaFile() {
     server.send(400, "application/json", "{\"error\":\"invalid_request\"}");
     return;
   }
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    server.send(503, "application/json", "{\"error\":\"storage_busy\"}");
+    return;
+  }
   OnboardMediaInfo info{};
   File file;
   if (readOnboardMediaInfo(id, info)) file = onboardMediaFs().open(onboardMediaImagePath(id), FILE_READ);
@@ -7325,7 +8176,11 @@ void handleOnboardMediaDelete() {
     server.send(400, "application/json", "{\"error\":\"invalid_request\"}");
     return;
   }
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    server.send(503, "application/json", "{\"error\":\"storage_busy\"}");
+    return;
+  }
   OnboardMediaInfo info{};
   if (!readOnboardMediaInfo(id, info)) {
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
@@ -7349,9 +8204,15 @@ void handleOnboardMediaDeleteAll() {
     server.send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
     return;
   }
+  // Do not let the staged-media uploader immediately reacquire the SD lock
+  // between a busy response and the caller's retry.
+  trailMediaUploadPauseUntilMs = millis() + 60000UL;
   unsigned deleted = 0;
   unsigned failed = 0;
-  deleteAllOnboardMedia(deleted, failed);
+  if (!deleteAllOnboardMedia(deleted, failed)) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"storage_busy\"}");
+    return;
+  }
   String payload = "{\"ok\":" + String(failed == 0 ? "true" : "false") +
                    ",\"deleted\":" + String(deleted) + ",\"failed\":" + String(failed) + "}";
   server.send(failed == 0 ? 200 : 500, "application/json", payload);
@@ -7549,6 +8410,65 @@ void handleUploadStatus() {
   server.send(200, "application/json", buildUploadStatusJson());
 }
 
+void clearTrailMediaUploadMarkers(uint32_t &removed, bool &storageBusy) {
+  removed = 0;
+  storageBusy = false;
+  trailMediaRequeueActive = true;
+  trailMediaUploadBlockedReason = "requeue_in_progress";
+  bool storageLockHeld = onboardStorageMutex == nullptr;
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    storageBusy = true;
+  } else if (onboardStorageMutex != nullptr) {
+    storageLockHeld = true;
+  }
+  File manifest;
+  if (!storageBusy) {
+    manifest = SD.open(DURABLE_JOB_MANIFEST_PATH, FILE_READ);
+    if (!manifest) storageBusy = true;
+  }
+  for (uint32_t index = 0; !storageBusy && index < durableMediaJob.manifestCount; ++index) {
+    DurableMediaRecord record{};
+    if (manifest.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) == sizeof(record)) {
+      const String marker = String(TRAIL_MEDIA_DIR) + "/" + String(record.id) +
+                            (record.type == 1 ? ".JPG.uploaded" : ".mp4.uploaded");
+      if (SD.remove(marker)) ++removed;
+      const String mediaPath = marker.substring(0, marker.length() - 9);
+      SD.remove(mediaPath + ".upload_attempts");
+      SD.remove(mediaPath + ".upload_failed");
+    } else {
+      storageBusy = true;
+      break;
+    }
+    lastHttpServiceMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  if (manifest) manifest.close();
+  if (onboardStorageMutex != nullptr && storageLockHeld) xSemaphoreGive(onboardStorageMutex);
+  trailMediaRequeueActive = false;
+  trailMediaUploadLastAttemptMs = 0;
+  trailMediaUploadBlockedReason = "";
+}
+
+void handleTrailMediaRequeue() {
+  if (!sdReady) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"sd_unavailable\"}");
+    return;
+  }
+  if (trailMediaUploadActive || trailMediaRequeueActive || durableMediaJobIsActive()) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"media_busy\"}");
+    return;
+  }
+  uint32_t removed = 0;
+  bool storageBusy = false;
+  clearTrailMediaUploadMarkers(removed, storageBusy);
+  String payload = "{\"ok\":" + String(storageBusy ? "false" : "true");
+  payload += ",\"markers_removed\":" + String(removed);
+  if (storageBusy) payload += ",\"error\":\"storage_busy\"";
+  payload += ",\"upload_resumes_automatically\":true}";
+  server.send(storageBusy ? 503 : 200, "application/json", payload);
+}
+
 void handleUploadBleLast() {
   if (bleObservationsLastJson.isEmpty()) {
     server.send(404, "application/json", "{\"error\":\"no_ble_observation_payload\"}");
@@ -7562,7 +8482,11 @@ void handleSdStatus() {
 }
 
 void handleSdMount() {
-  bool ok = mountSdCard();
+  if (sdReady && durableMediaJobLoaded && durableMediaJobIsActive()) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"durable_job_active\"}");
+    return;
+  }
+  bool ok = mountSdCardWithRetry();
   if (ok && !loadDurableMediaJob()) {
     sdLastMessage = "durable_job_load_failed";
     ok = false;
@@ -7731,6 +8655,8 @@ void handleFirmwareUploadStream() {
 
   if (upload.status == UPLOAD_FILE_START) {
     otaInProgress = true;
+    httpLongOperationActive = true;
+    httpLongOperationLastProgressMs = millis();
     otaSucceeded = false;
     otaRestartPending = false;
     otaStartedMs = millis();
@@ -7743,6 +8669,7 @@ void handleFirmwareUploadStream() {
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
+    httpLongOperationLastProgressMs = millis();
     if (!otaLastError.isEmpty()) return;
     const size_t written = Update.write(upload.buf, upload.currentSize);
     otaBytesWritten += written;
@@ -7760,9 +8687,11 @@ void handleFirmwareUploadStream() {
       Update.printError(Serial);
     }
     otaInProgress = false;
+    httpLongOperationActive = false;
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
     otaInProgress = false;
+    httpLongOperationActive = false;
     otaSucceeded = false;
     otaFinishedMs = millis();
     otaLastError = "aborted";
@@ -8031,6 +8960,45 @@ uint32_t durableJobChecksum(const DurableMediaJobState &state) {
   return hash;
 }
 
+bool persistDurableMediaJobMirror(bool force = false) {
+  const bool importantChange = durableMediaJob.jobId != durableMirrorLastJobId ||
+                               durableMediaJob.status != durableMirrorLastStatus;
+  const bool progressCheckpoint = durableMediaJob.currentIndex >= durableMirrorLastIndex + 10;
+  const bool timeCheckpoint = durableMirrorLastWriteMs == 0 ||
+                              millis() - durableMirrorLastWriteMs >= 300000UL;
+  if (!force && !importantChange && !progressCheckpoint && !timeCheckpoint) return true;
+  Preferences mirrorPrefs;
+  if (!mirrorPrefs.begin("durable", false)) return false;
+  const size_t written = mirrorPrefs.putBytes("job", &durableMediaJob, sizeof(durableMediaJob));
+  mirrorPrefs.end();
+  if (written != sizeof(durableMediaJob)) return false;
+  durableMirrorLastJobId = durableMediaJob.jobId;
+  durableMirrorLastIndex = durableMediaJob.currentIndex;
+  durableMirrorLastStatus = durableMediaJob.status;
+  durableMirrorLastWriteMs = millis();
+  return true;
+}
+
+bool loadDurableMediaJobMirror() {
+  Preferences mirrorPrefs;
+  if (!mirrorPrefs.begin("durable", true)) return false;
+  DurableMediaJobState mirrored{};
+  const size_t read = mirrorPrefs.getBytes("job", &mirrored, sizeof(mirrored));
+  mirrorPrefs.end();
+  if (read != sizeof(mirrored) || mirrored.magic != DURABLE_MEDIA_JOB_MAGIC ||
+      mirrored.version != DURABLE_MEDIA_JOB_VERSION ||
+      mirrored.checksum != durableJobChecksum(mirrored)) return false;
+  durableMediaJob = mirrored;
+  durableMediaJobFromMirror = true;
+  durableMirrorLastJobId = mirrored.jobId;
+  durableMirrorLastIndex = mirrored.currentIndex;
+  durableMirrorLastStatus = mirrored.status;
+  Serial.printf("[durable-job] loaded NVS mirror id=%u status=%s index=%u/%u\n",
+                mirrored.jobId, durableMediaStatusName(mirrored.status),
+                mirrored.currentIndex, mirrored.manifestCount);
+  return true;
+}
+
 const char *durableMediaActionName(uint8_t action) {
   switch (action) {
     case DURABLE_MEDIA_ACTION_DOWNLOAD_ALL: return "download_all_media";
@@ -8057,12 +9025,21 @@ void setDurableJobText(char *target, size_t targetSize, const String &value) {
 }
 
 bool saveDurableMediaJob() {
-  if (!sdReady || !ensureFsDir(SD, DURABLE_JOB_DIR)) return false;
   if (durableMediaJobMutex != nullptr) xSemaphoreTake(durableMediaJobMutex, portMAX_DELAY);
   durableMediaJob.magic = DURABLE_MEDIA_JOB_MAGIC;
   durableMediaJob.version = DURABLE_MEDIA_JOB_VERSION;
   durableMediaJob.updatedBoot = bootSessionId;
   durableMediaJob.checksum = durableJobChecksum(durableMediaJob);
+  persistDurableMediaJobMirror();
+  if (!sdReady || !ensureFsDir(SD, DURABLE_JOB_DIR)) {
+    if (durableMediaJobMutex != nullptr) xSemaphoreGive(durableMediaJobMutex);
+    return false;
+  }
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    if (durableMediaJobMutex != nullptr) xSemaphoreGive(durableMediaJobMutex);
+    return false;
+  }
   SD.remove(DURABLE_JOB_STATE_TEMP_PATH);
   File file = SD.open(DURABLE_JOB_STATE_TEMP_PATH, FILE_WRITE);
   const bool wrote = file && file.write(reinterpret_cast<const uint8_t *>(&durableMediaJob), sizeof(durableMediaJob)) == sizeof(durableMediaJob);
@@ -8072,51 +9049,121 @@ bool saveDurableMediaJob() {
   }
   bool ok = wrote;
   if (ok) {
-    SD.remove(DURABLE_JOB_STATE_PATH);
+    // Keep the previous checkpoint until the replacement is completely
+    // written. A reset at any point leaves at least one valid state among the
+    // primary, temporary, backup, and NVS mirror copies.
+    SD.remove(DURABLE_JOB_STATE_BACKUP_PATH);
+    if (SD.exists(DURABLE_JOB_STATE_PATH)) {
+      ok = SD.rename(DURABLE_JOB_STATE_PATH, DURABLE_JOB_STATE_BACKUP_PATH);
+    }
+  }
+  if (ok) {
     ok = SD.rename(DURABLE_JOB_STATE_TEMP_PATH, DURABLE_JOB_STATE_PATH);
   }
-  if (!ok) SD.remove(DURABLE_JOB_STATE_TEMP_PATH);
+  if (!ok && !SD.exists(DURABLE_JOB_STATE_PATH) &&
+      SD.exists(DURABLE_JOB_STATE_BACKUP_PATH)) {
+    SD.rename(DURABLE_JOB_STATE_BACKUP_PATH, DURABLE_JOB_STATE_PATH);
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
   if (durableMediaJobMutex != nullptr) xSemaphoreGive(durableMediaJobMutex);
   return ok;
 }
 
+bool readDurableMediaJobFile(const char *path, DurableMediaJobState &state) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  const bool readOk = file.read(reinterpret_cast<uint8_t *>(&state), sizeof(state)) == sizeof(state);
+  file.close();
+  return readOk && state.magic == DURABLE_MEDIA_JOB_MAGIC &&
+         state.version == DURABLE_MEDIA_JOB_VERSION &&
+         state.checksum == durableJobChecksum(state);
+}
+
+bool durableCheckpointIsNewer(const DurableMediaJobState &candidate,
+                              const DurableMediaJobState &selected) {
+  if (candidate.jobId != selected.jobId) return candidate.jobId > selected.jobId;
+  if (candidate.currentIndex != selected.currentIndex) {
+    return candidate.currentIndex > selected.currentIndex;
+  }
+  // For the same item, prefer a terminal state, then the checkpoint written
+  // by the later boot. Temporary is examined first, so equal active records
+  // retain the newly written replacement.
+  const bool candidateTerminal = candidate.status == DURABLE_MEDIA_SUCCEEDED ||
+                                 candidate.status == DURABLE_MEDIA_FAILED ||
+                                 candidate.status == DURABLE_MEDIA_CANCELLED;
+  const bool selectedTerminal = selected.status == DURABLE_MEDIA_SUCCEEDED ||
+                                selected.status == DURABLE_MEDIA_FAILED ||
+                                selected.status == DURABLE_MEDIA_CANCELLED;
+  if (candidateTerminal != selectedTerminal) return candidateTerminal;
+  return candidate.updatedBoot > selected.updatedBoot;
+}
+
 bool loadDurableMediaJob() {
   durableMediaJobLoaded = false;
-  durableMediaJob = {};
-  durableMediaJob.magic = DURABLE_MEDIA_JOB_MAGIC;
-  durableMediaJob.version = DURABLE_MEDIA_JOB_VERSION;
   if (!sdReady) return false;
+  // setup() loads the NVS mirror before SD. Preserve it as a recovery
+  // candidate instead of replacing it with an empty job when the primary was
+  // interrupted between rename operations.
+  DurableMediaJobState selected{};
+  bool haveSelected = false;
+  String selectedSource;
+  if (durableMediaJobFromMirror && durableMediaJob.magic == DURABLE_MEDIA_JOB_MAGIC &&
+      durableMediaJob.version == DURABLE_MEDIA_JOB_VERSION &&
+      durableMediaJob.checksum == durableJobChecksum(durableMediaJob)) {
+    selected = durableMediaJob;
+    haveSelected = true;
+    selectedSource = "nvs_mirror";
+  }
   ensureFsDir(SD, DURABLE_JOB_DIR);
   ensureFsDir(SD, TRAIL_MEDIA_DIR);
-  File file = SD.open(DURABLE_JOB_STATE_PATH, FILE_READ);
-  if (!file) {
+  const char *paths[] = {DURABLE_JOB_STATE_TEMP_PATH, DURABLE_JOB_STATE_PATH,
+                         DURABLE_JOB_STATE_BACKUP_PATH};
+  const char *sources[] = {"sd_temp", "sd", "sd_backup"};
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+    DurableMediaJobState candidate{};
+    if (readDurableMediaJobFile(paths[i], candidate) &&
+        (!haveSelected || durableCheckpointIsNewer(candidate, selected))) {
+      selected = candidate;
+      haveSelected = true;
+      selectedSource = sources[i];
+    }
+  }
+  if (!haveSelected) {
+    durableMediaJob = {};
+    durableMediaJob.magic = DURABLE_MEDIA_JOB_MAGIC;
+    durableMediaJob.version = DURABLE_MEDIA_JOB_VERSION;
     durableMediaJobLoaded = true;
     const bool saved = saveDurableMediaJob();
     if (!saved) durableMediaJobLoaded = false;
     return saved;
   }
-  DurableMediaJobState loaded{};
-  const bool readOk = file.read(reinterpret_cast<uint8_t *>(&loaded), sizeof(loaded)) == sizeof(loaded);
-  file.close();
-  if (!readOk || loaded.magic != DURABLE_MEDIA_JOB_MAGIC ||
-      loaded.version != DURABLE_MEDIA_JOB_VERSION || loaded.checksum != durableJobChecksum(loaded)) {
-    Serial.println("[durable-job] invalid state file; preserving as media_job.bad");
-    SD.remove("/jobs/media_job.bad");
-    SD.rename(DURABLE_JOB_STATE_PATH, "/jobs/media_job.bad");
-    durableMediaJobLoaded = true;
-    const bool saved = saveDurableMediaJob();
-    if (!saved) durableMediaJobLoaded = false;
-    return saved;
-  }
-  durableMediaJob = loaded;
+  durableMediaJob = selected;
   durableMediaJobLoaded = true;
+  durableMediaJobFromMirror = selectedSource == "nvs_mirror";
   if (durableMediaJob.status == DURABLE_MEDIA_RUNNING) {
     durableMediaJob.status = DURABLE_MEDIA_WAITING_RETRY;
     setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "resume_after_reset");
     setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), "board_reset_during_job");
-    saveDurableMediaJob();
   }
-  Serial.printf("[durable-job] loaded id=%u action=%s status=%s index=%u/%u\n",
+  if (durableMediaJob.status == DURABLE_MEDIA_SUCCEEDED &&
+      durableMediaJob.action == DURABLE_MEDIA_ACTION_DOWNLOAD_AND_DELETE &&
+      durableMediaJob.deletedCount != durableMediaJob.manifestCount) {
+    durableMediaJob.status = DURABLE_MEDIA_FAILED;
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
+                      "incomplete_delete");
+    setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError),
+                      "incomplete_delete:deleted=" + String(durableMediaJob.deletedCount) +
+                      ",total=" + String(durableMediaJob.manifestCount) +
+                      ",skipped=" + String(durableMediaJob.skippedCount));
+    Serial.printf("[durable-job] corrected false success id=%u deleted=%u/%u skipped=%u\n",
+                  durableMediaJob.jobId, durableMediaJob.deletedCount,
+                  durableMediaJob.manifestCount, durableMediaJob.skippedCount);
+  }
+  // Repair the canonical SD checkpoint from whichever valid copy won.
+  saveDurableMediaJob();
+  persistDurableMediaJobMirror(true);
+  Serial.printf("[durable-job] loaded source=%s id=%u action=%s status=%s index=%u/%u\n",
+                selectedSource.c_str(),
                 durableMediaJob.jobId,
                 durableMediaActionName(durableMediaJob.action),
                 durableMediaStatusName(durableMediaJob.status),
@@ -8128,6 +9175,7 @@ bool loadDurableMediaJob() {
 String buildDurableMediaJobJson() {
   String payload = "{";
   payload += "\"job_id\":" + String(durableMediaJob.jobId);
+  payload += ",\"state_source\":\"" + String(durableMediaJobLoaded ? "sd" : (durableMediaJobFromMirror ? "nvs_mirror" : "memory")) + "\"";
   payload += ",\"action\":\"" + String(durableMediaActionName(durableMediaJob.action)) + "\"";
   payload += ",\"status\":\"" + String(durableMediaStatusName(durableMediaJob.status)) + "\"";
   payload += ",\"stage\":\"" + jsonEscape(String(durableMediaJob.stage)) + "\"";
@@ -8139,7 +9187,14 @@ String buildDurableMediaJobJson() {
   payload += ",\"deleted\":" + String(durableMediaJob.deletedCount);
   payload += ",\"retry_count\":" + String(durableMediaJob.retryCount);
   payload += ",\"bytes_downloaded\":" + String(durableMediaJob.bytesDownloaded);
+  payload += ",\"item_bytes_received\":" + String(durableTransferBytes);
+  payload += ",\"item_expected_bytes\":" + String(durableTransferExpectedBytes);
+  payload += ",\"item_elapsed_ms\":" + String(durableTransferStartedMs == 0 ? 0 : msSince(durableTransferStartedMs));
+  payload += ",\"item_progress_age_ms\":" + String(durableTransferLastProgressMs == 0 ? 0 : msSince(durableTransferLastProgressMs));
   payload += ",\"last_error\":\"" + jsonEscape(String(durableMediaJob.lastError)) + "\"";
+  payload += ",\"battery_mv\":" + String(cachedStorageBatteryMv());
+  payload += ",\"minimum_battery_mv\":" + String(DURABLE_MEDIA_MIN_BATTERY_MV);
+  payload += ",\"recovery_battery_mv\":" + String(DURABLE_MEDIA_RECOVER_BATTERY_MV);
   payload += ",\"staging_directory\":\"" + String(TRAIL_MEDIA_DIR) + "\"";
   payload += "}";
   return payload;
@@ -8169,6 +9224,12 @@ void handleJobsGet() {
 }
 
 void handleJobsPost() {
+  if (automaticRecoverySuspended) {
+    server.send(503, "application/json",
+                "{\"ok\":false,\"error\":\"automatic_recovery_suspended\","
+                "\"resume_url\":\"/recovery/resume\"}");
+    return;
+  }
   String actionArg = server.hasArg("action") ? server.arg("action") : "";
   if (actionArg.isEmpty() && server.hasArg("plain")) {
     String body = server.arg("plain");
@@ -8456,6 +9517,17 @@ bool readDurableManifestRecord(uint32_t index, DurableMediaRecord &record) {
   return ok;
 }
 
+bool writeDurableManifestRecord(uint32_t index, const DurableMediaRecord &record) {
+  File manifest = SD.open(DURABLE_JOB_MANIFEST_PATH, "r+");
+  if (!manifest) return false;
+  const size_t offset = static_cast<size_t>(index) * sizeof(DurableMediaRecord);
+  const bool ok = offset + sizeof(record) <= manifest.size() && manifest.seek(offset) &&
+                  manifest.write(reinterpret_cast<const uint8_t *>(&record), sizeof(record)) == sizeof(record);
+  if (ok) manifest.flush();
+  manifest.close();
+  return ok;
+}
+
 String durableMediaFilePath(const DurableMediaRecord &record, bool partial = false) {
   String path = String(TRAIL_MEDIA_DIR) + "/" + String(record.id) + (record.type == 1 ? ".JPG" : ".mp4");
   if (partial) path += ".part";
@@ -8464,6 +9536,15 @@ String durableMediaFilePath(const DurableMediaRecord &record, bool partial = fal
 
 String durableMediaSizeSidecarPath(const String &mediaPath) {
   return mediaPath + ".size";
+}
+
+void invalidateTrailMediaUploadState(const String &mediaPath) {
+  // Camera media IDs and therefore staged filenames can be reused.  A fresh
+  // download must never inherit the previous file's terminal upload marker.
+  // Otherwise the uploader silently treats new bytes as already delivered.
+  SD.remove(mediaPath + ".uploaded");
+  SD.remove(mediaPath + ".upload_failed");
+  SD.remove(mediaPath + ".upload_attempts");
 }
 
 uint32_t readDurableMediaStoredSize(const String &mediaPath) {
@@ -8547,21 +9628,75 @@ uint32_t parseContentRangeTotal(const String &line) {
   return parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
 }
 
-bool flushCameraSdBuffer(File &output, uint8_t *sdBuffer, size_t &buffered) {
+bool flushCameraSdBuffer(File &output, uint8_t *sdBuffer, size_t &buffered,
+                         String &error) {
   if (buffered == 0) return true;
-  const bool ok = output.write(sdBuffer, buffered) == buffered;
-  if (ok) buffered = 0;
-  return ok;
+  // The control worker shares core 0 with the radio/idle tasks. Large blocking
+  // FAT writes can starve IDLE0 long enough for the ESP task watchdog to fire.
+  const size_t requested = buffered;
+  size_t committed = 0;
+  uint8_t lockTimeouts = 0;
+  uint8_t zeroWrites = 0;
+  while (committed < requested && lockTimeouts + zeroWrites < 3) {
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(1));
+    if (onboardStorageMutex != nullptr &&
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(750)) != pdTRUE) {
+      ++lockTimeouts;
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    const size_t wrote = output.write(sdBuffer + committed, requested - committed);
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    if (wrote == 0) {
+      ++zeroWrites;
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    committed += wrote;
+  }
+  if (committed == requested) {
+    buffered = 0;
+    return true;
+  }
+  if (committed > 0 && committed < requested) {
+    memmove(sdBuffer, sdBuffer + committed, requested - committed);
+    buffered = requested - committed;
+  }
+  if (lockTimeouts >= 3 && committed == 0) {
+    error = "storage_lock_timeout";
+  } else {
+    error = "sd_short_write_expected_" + String(requested) +
+            "_got_" + String(committed);
+  }
+  return false;
 }
 
 bool writeCameraBytesToFile(WiFiClient &client, File &output, size_t count, size_t &written,
-                            uint8_t *sdBuffer, size_t sdBufferSize, size_t &buffered) {
+                            uint8_t *sdBuffer, size_t sdBufferSize, size_t &buffered,
+                            String &error) {
   uint8_t buffer[1024];
   size_t remaining = count;
+  unsigned long lastDataMs = millis();
   while (remaining > 0) {
-    const size_t wanted = std::min(remaining, sizeof(buffer));
-    const size_t got = client.readBytes(buffer, wanted);
-    if (got == 0) return false;
+    if (cachedStorageBatteryMv() < DURABLE_MEDIA_MIN_BATTERY_MV) {
+      error = "low_battery_pause";
+      return false;
+    }
+    const int available = client.available();
+    if (available <= 0) {
+      if (!client.connected() || millis() - lastDataMs > 15000UL) return false;
+      cooperativeDelay(2);
+      continue;
+    }
+    const size_t wanted = std::min(remaining,
+                                   std::min(static_cast<size_t>(available), sizeof(buffer)));
+    const int readCount = client.read(buffer, wanted);
+    if (readCount <= 0) {
+      cooperativeDelay(2);
+      continue;
+    }
+    const size_t got = static_cast<size_t>(readCount);
     size_t copied = 0;
     while (copied < got) {
       const size_t space = sdBufferSize - buffered;
@@ -8569,16 +9704,25 @@ bool writeCameraBytesToFile(WiFiClient &client, File &output, size_t count, size
       memcpy(sdBuffer + buffered, buffer + copied, take);
       buffered += take;
       copied += take;
-      if (buffered == sdBufferSize && !flushCameraSdBuffer(output, sdBuffer, buffered)) return false;
+      if (buffered == sdBufferSize &&
+          !flushCameraSdBuffer(output, sdBuffer, buffered, error)) return false;
     }
     written += static_cast<size_t>(got);
     remaining -= static_cast<size_t>(got);
+    durableTransferBytes = static_cast<uint32_t>(written);
+    durableTransferLastProgressMs = millis();
+    lastDataMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
   return true;
 }
 
 bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, uint32_t &bytesWritten) {
   bytesWritten = 0;
+  durableTransferBytes = 0;
+  durableTransferExpectedBytes = record.expectedBytes;
+  durableTransferStartedMs = millis();
+  durableTransferLastProgressMs = durableTransferStartedMs;
   const String finalPath = durableMediaFilePath(record, false);
   const String partialPath = durableMediaFilePath(record, true);
   const bool isVideo = record.type == 2;
@@ -8610,6 +9754,7 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
       } else {
         SD.remove(finalPath);
         if (SD.rename(partialPath, finalPath)) {
+          invalidateTrailMediaUploadState(finalPath);
           bytesWritten = resumeOffset;
           writeDurableMediaStoredSize(finalPath, static_cast<uint32_t>(resumeOffset));
           error = "already_staged";
@@ -8624,6 +9769,9 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
       resumeOffset = 0;
     }
   }
+  // From this point onward the camera will supply at least part of the file,
+  // so any terminal marker belonging to an older file at this path is stale.
+  invalidateTrailMediaUploadState(finalPath);
   WiFiClient client;
   if (!client.connect(CAMERA_IP, CAMERA_HTTP_PORT)) {
     error = "camera_connect_failed";
@@ -8677,14 +9825,25 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
   if (expectedTotalBytes == 0 && contentLength >= 0 && !chunked) {
     expectedTotalBytes = static_cast<uint32_t>((rangeAccepted ? resumeOffset : 0) + static_cast<size_t>(contentLength));
   }
-  if (onboardStorageMutex != nullptr) xSemaphoreTake(onboardStorageMutex, portMAX_DELAY);
+  durableTransferBytes = static_cast<uint32_t>(resumeOffset);
+  durableTransferExpectedBytes = expectedTotalBytes;
+  durableTransferLastProgressMs = millis();
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    client.stop();
+    error = "storage_busy";
+    return false;
+  }
   File output = SD.open(partialPath, rangeAccepted ? FILE_APPEND : FILE_WRITE);
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
   bool ok = static_cast<bool>(output);
   size_t written = resumeOffset;
-  size_t sdBufferSize = 32768;
+  // Bound each synchronous SD write. 32 KiB bursts have taken multiple
+  // watchdog periods on cards whose erase/program latency spikes.
+  size_t sdBufferSize = 4096;
   uint8_t *sdBuffer = static_cast<uint8_t *>(heap_caps_malloc(sdBufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (sdBuffer == nullptr) {
-    sdBufferSize = 8192;
+    sdBufferSize = 2048;
     sdBuffer = static_cast<uint8_t *>(malloc(sdBufferSize));
   }
   size_t buffered = 0;
@@ -8696,9 +9855,11 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
       if (chunkSize < 0) { ok = false; error = "invalid_chunk"; break; }
       if (chunkSize == 0) break;
       if (!writeCameraBytesToFile(client, output, static_cast<size_t>(chunkSize), written,
-                                  sdBuffer, sdBufferSize, buffered)) {
+                                  sdBuffer, sdBufferSize, buffered, error)) {
         ok = false;
-        error = "chunk_read_failed_size_" + String(chunkSize) + "_total_" + String(written);
+        if (error.isEmpty()) {
+          error = "chunk_read_failed_size_" + String(chunkSize) + "_total_" + String(written);
+        }
         break;
       }
       uint8_t chunkTerminator[2];
@@ -8708,12 +9869,17 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     }
   } else if (ok && contentLength >= 0) {
     ok = writeCameraBytesToFile(client, output, static_cast<size_t>(contentLength), written,
-                                sdBuffer, sdBufferSize, buffered);
-    if (!ok) error = "body_read_failed";
+                                sdBuffer, sdBufferSize, buffered, error);
+    if (!ok && error.isEmpty()) error = "body_read_failed";
   } else if (ok) {
     uint8_t buffer[2048];
     unsigned long lastDataMs = millis();
     while (client.connected() || client.available()) {
+      if (cachedStorageBatteryMv() < DURABLE_MEDIA_MIN_BATTERY_MV) {
+        ok = false;
+        error = "low_battery_pause";
+        break;
+      }
       const int available = client.available();
       if (available <= 0) {
         if (millis() - lastDataMs > 15000UL) { ok = false; error = "body_timeout"; break; }
@@ -8729,23 +9895,37 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
           memcpy(sdBuffer + buffered, buffer + copied, take);
           buffered += take;
           copied += take;
-          if (buffered == sdBufferSize && !flushCameraSdBuffer(output, sdBuffer, buffered)) {
-            ok = false; error = "sd_write_failed"; break;
+          if (buffered == sdBufferSize &&
+              !flushCameraSdBuffer(output, sdBuffer, buffered, error)) {
+            ok = false;
+            if (error.isEmpty()) error = "sd_write_failed";
+            break;
           }
         }
         if (!ok) break;
         written += got;
+        durableTransferBytes = static_cast<uint32_t>(written);
+        durableTransferLastProgressMs = millis();
         lastDataMs = millis();
+        taskYIELD();
       }
     }
   }
-  if (output && !flushCameraSdBuffer(output, sdBuffer, buffered)) {
+  String finalFlushError;
+  if (output && !flushCameraSdBuffer(output, sdBuffer, buffered, finalFlushError)) {
     ok = false;
-    error = "sd_flush_failed";
+    if (error.isEmpty()) error = finalFlushError;
+    else error += ";" + finalFlushError;
   }
   if (sdBuffer != nullptr) free(sdBuffer);
-  if (output) { output.flush(); output.close(); }
-  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  if (output) vTaskDelay(pdMS_TO_TICKS(1));
+  if (output && (onboardStorageMutex == nullptr ||
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE)) {
+    output.flush();
+    output.close();
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
   client.stop();
   if (ok && written > 0 && expectedTotalBytes > 0 && written != expectedTotalBytes) {
     ok = false;
@@ -8767,6 +9947,7 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     else if (expectedTotalBytes > 0) writeDurableMediaStoredSize(finalPath, expectedTotalBytes);
   }
   bytesWritten = static_cast<uint32_t>(written);
+  refreshSdCapacityCache();
   return ok;
 }
 
@@ -8814,6 +9995,803 @@ bool deleteCameraMediaRecord(const DurableMediaRecord &record, String &error) {
   return false;
 }
 
+bool sha256SdFile(const String &path, String &hexDigest, uint32_t &fileBytes) {
+  hexDigest = "";
+  fileBytes = 0;
+  trailMediaUploadBytesHashed = 0;
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    return false;
+  }
+  const uint64_t size = file.size();
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  if (size == 0 || size > UINT32_MAX) {
+    if (onboardStorageMutex == nullptr ||
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+      file.close();
+      if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    }
+    return false;
+  }
+  fileBytes = static_cast<uint32_t>(size);
+  mbedtls_sha256_context context;
+  mbedtls_sha256_init(&context);
+  mbedtls_sha256_starts(&context, 0);
+  // Hash in large PSRAM-backed chunks. The old 512-byte/10 ms pacing added
+  // more than three minutes of artificial delay to a 10 MB video.
+  static const size_t HASH_CHUNK_BYTES = 16384;
+  uint8_t *buffer = static_cast<uint8_t *>(
+    heap_caps_malloc(HASH_CHUNK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (buffer == nullptr) buffer = static_cast<uint8_t *>(malloc(HASH_CHUNK_BYTES));
+  if (buffer == nullptr) {
+    mbedtls_sha256_free(&context);
+    if (onboardStorageMutex == nullptr ||
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+      file.close();
+      if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    }
+    return false;
+  }
+  bool readOk = true;
+  while (trailMediaUploadBytesHashed < fileBytes) {
+    if (trailMediaUploadAbortRequested || durableMediaJobIsActive()) {
+      readOk = false;
+      break;
+    }
+    const size_t remaining = fileBytes - trailMediaUploadBytesHashed;
+    const size_t requested = remaining < HASH_CHUNK_BYTES ? remaining : HASH_CHUNK_BYTES;
+    if (onboardStorageMutex != nullptr &&
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      readOk = false;
+      break;
+    }
+    const int count = file.read(buffer, requested);
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    if (count <= 0) { readOk = false; break; }
+    mbedtls_sha256_update(&context, buffer, static_cast<size_t>(count));
+    trailMediaUploadBytesHashed += static_cast<uint32_t>(count);
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  uint8_t digest[32];
+  mbedtls_sha256_finish(&context, digest);
+  mbedtls_sha256_free(&context);
+  free(buffer);
+  if (onboardStorageMutex == nullptr ||
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    file.close();
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  } else {
+    readOk = false;
+  }
+  char encoded[65];
+  for (size_t i = 0; i < sizeof(digest); ++i) snprintf(encoded + i * 2, 3, "%02x", digest[i]);
+  encoded[64] = '\0';
+  hexDigest = encoded;
+  return readOk && trailMediaUploadBytesHashed == fileBytes;
+}
+
+bool readOutboundHttpResponse(int sock, int &statusCode, String &body) {
+  statusCode = 0;
+  body = "";
+  String raw;
+  uint8_t buffer[512];
+  const unsigned long started = millis();
+  while (millis() - started < 15000UL) {
+    const int count = recv(sock, buffer, sizeof(buffer), 0);
+    if (count > 0) {
+      raw.concat(reinterpret_cast<const char *>(buffer), count);
+      continue;
+    }
+    if (count == 0) break;
+    if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+    cooperativeDelay(5);
+  }
+  const int headerEnd = raw.indexOf("\r\n\r\n");
+  if (headerEnd < 0) return false;
+  const int firstLineEnd = raw.indexOf("\r\n");
+  const String statusLine = raw.substring(0, firstLineEnd >= 0 ? firstLineEnd : headerEnd);
+  const int firstSpace = statusLine.indexOf(' ');
+  statusCode = firstSpace >= 0 ? statusLine.substring(firstSpace + 1).toInt() : 0;
+  body = raw.substring(headerEnd + 4);
+  return statusCode > 0;
+}
+
+bool putTrailMediaBlob(const String &uploadUrl, const String &mediaPath,
+                       const String &contentType, const String &sha256,
+                       uint32_t fileBytes, String &error,
+                       UpstreamTransport transport) {
+  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) { error = "blob_socket_failed"; return false; }
+  if (!bindSocketToTransport(sock, transport)) {
+    close(sock); error = "blob_transport_bind_failed"; return false;
+  }
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = inet_addr(UPSTREAM_API_HOST);
+  address.sin_port = htons(UPSTREAM_API_PORT);
+  int connectError = 0;
+  if (!connectSocketWithTimeout(sock, address, 10000UL, connectError)) {
+    close(sock); error = "blob_connect_failed_" + String(connectError); return false;
+  }
+  timeval timeout{};
+  // Keep each blocking send shorter than the task watchdog interval. The
+  // media sender retries transient backpressure for up to 90 seconds.
+  timeout.tv_sec = 1;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  String requestPath = uploadUrl;
+  if (!requestPath.startsWith(String(UPSTREAM_API_PREFIX) + "/")) requestPath = normalizeApiPath(requestPath);
+  String headers = "PUT " + requestPath + " HTTP/1.1\r\n";
+  headers += "Host: " + String(UPSTREAM_API_HOST) + ":" + String(UPSTREAM_API_PORT) + "\r\n";
+  headers += "User-Agent: esp32-gardepro-media/1\r\n";
+  headers += "Content-Type: " + contentType + "\r\n";
+  headers += "Content-Length: " + String(fileBytes) + "\r\n";
+  headers += "X-SHA256: " + sha256 + "\r\n";
+  if (strlen(UPSTREAM_API_TOKEN) > 0) headers += "Authorization: Bearer " + String(UPSTREAM_API_TOKEN) + "\r\n";
+  headers += "Accept: application/json\r\nConnection: close\r\n\r\n";
+  if (!sendAll(sock, reinterpret_cast<const uint8_t *>(headers.c_str()), headers.length())) {
+    close(sock); error = "blob_header_send_failed"; return false;
+  }
+  // Never allow HaLow backpressure to trap this task inside lwIP send() long
+  // enough to trip the task watchdog. The media-specific sender below handles
+  // EAGAIN/EWOULDBLOCK with bounded retries and explicit watchdog service.
+  const int socketFlags = fcntl(sock, F_GETFL, 0);
+  if (socketFlags < 0 || fcntl(sock, F_SETFL, socketFlags | O_NONBLOCK) != 0) {
+    close(sock); error = "blob_nonblocking_setup_failed_" + String(errno); return false;
+  }
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    close(sock); error = "blob_storage_busy"; return false;
+  }
+  File file = SD.open(mediaPath, FILE_READ);
+  bool sent = static_cast<bool>(file);
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  // HaLow needs conservative submissions; normal 2.4 GHz Wi-Fi can safely use
+  // larger chunks and should not inherit HaLow's throughput throttling.
+  const size_t uploadChunkBytes = transport == UPSTREAM_TRANSPORT_TRANSFER_WIFI ? 4096 : 512;
+  const TickType_t uploadYieldTicks = pdMS_TO_TICKS(
+    transport == UPSTREAM_TRANSPORT_TRANSFER_WIFI ? 1 : 10);
+  uint8_t *buffer = static_cast<uint8_t *>(malloc(uploadChunkBytes));
+  if (buffer == nullptr) {
+    if (file && (onboardStorageMutex == nullptr ||
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE)) {
+      file.close();
+      if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    }
+    close(sock);
+    error = "blob_buffer_alloc_failed";
+    return false;
+  }
+  trailMediaUploadBytesSent = 0;
+  while (sent && trailMediaUploadBytesSent < fileBytes) {
+    if (trailMediaUploadAbortRequested || durableMediaJobIsActive()) {
+      sent = false;
+      error = "camera_job_preempted";
+      break;
+    }
+    if (onboardStorageMutex != nullptr &&
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      sent = false;
+      error = "blob_storage_busy";
+      break;
+    }
+    const int count = file.read(buffer, uploadChunkBytes);
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    if (count <= 0 || !sendMediaChunkWithRetry(sock, buffer, static_cast<size_t>(count), error)) {
+      sent = false;
+      break;
+    }
+    trailMediaUploadBytesSent += static_cast<uint32_t>(count);
+    esp_task_wdt_reset();
+    // Leave airtime and lwIP servicing capacity for the board's management
+    // API and HaLow driver tasks. Saturating TX can starve the other core's
+    // web response path and trip its idle-task watchdog.
+    vTaskDelay(uploadYieldTicks);
+  }
+  free(buffer);
+  if (file && (onboardStorageMutex == nullptr ||
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE)) {
+    file.close();
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  }
+  if (!sent || trailMediaUploadBytesSent != fileBytes) {
+    close(sock);
+    if (error.isEmpty()) error = "blob_send_failed_" + String(trailMediaUploadBytesSent);
+    else error += "_at_" + String(trailMediaUploadBytesSent);
+    return false;
+  }
+  int statusCode = 0;
+  String response;
+  fcntl(sock, F_SETFL, socketFlags);
+  const bool responseOk = readOutboundHttpResponse(sock, statusCode, response);
+  close(sock);
+  if (!responseOk || statusCode < 200 || statusCode >= 300) {
+    error = "blob_http_" + String(statusCode);
+    return false;
+  }
+  Serial.printf("[trail-upload] PUT complete bytes=%u status=%d transport=%s\n",
+                fileBytes, statusCode,
+                transport == UPSTREAM_TRANSPORT_TRANSFER_WIFI ? "wifi_2_4ghz" : "halow");
+  return true;
+}
+
+bool loadTrailMediaUploadCursor(uint32_t jobId, uint32_t &position) {
+  position = 0;
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+  File file = SD.open(TRAIL_MEDIA_UPLOAD_CURSOR_PATH, FILE_READ);
+  TrailMediaUploadCursorDisk state{};
+  const bool readOk = file &&
+                      file.read(reinterpret_cast<uint8_t *>(&state), sizeof(state)) == sizeof(state);
+  if (file) file.close();
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  const uint32_t expectedCheck = state.magic ^ state.jobId ^ state.position ^ 0xA55A5AA5UL;
+  if (!readOk || state.magic != TRAIL_MEDIA_UPLOAD_CURSOR_MAGIC ||
+      state.jobId != jobId || state.check != expectedCheck) return false;
+  position = state.position;
+  return true;
+}
+
+bool saveTrailMediaUploadCursor(uint32_t jobId, uint32_t position) {
+  TrailMediaUploadCursorDisk state{};
+  state.magic = TRAIL_MEDIA_UPLOAD_CURSOR_MAGIC;
+  state.jobId = jobId;
+  state.position = position;
+  state.check = state.magic ^ state.jobId ^ state.position ^ 0xA55A5AA5UL;
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+  File file = SD.open(TRAIL_MEDIA_UPLOAD_CURSOR_PATH, "r+");
+  if (!file) file = SD.open(TRAIL_MEDIA_UPLOAD_CURSOR_PATH, FILE_WRITE);
+  bool writeOk = false;
+  if (file) {
+    file.seek(0);
+    writeOk = file.write(reinterpret_cast<const uint8_t *>(&state), sizeof(state)) == sizeof(state);
+    if (writeOk) file.flush();
+    file.close();
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  return writeOk;
+}
+
+bool findPendingTrailMedia(String &mediaPath, String &filename) {
+  mediaPath = "";
+  filename = "";
+  // Completed durable jobs already contain an authoritative, bounded manifest.
+  // Prefer it over walking the FAT directory, which can be very slow or wedge
+  // on large cards with many sidecar/marker entries.
+  if (durableMediaJob.manifestCount > 0) {
+    std::vector<DurableMediaRecord> records;
+    records.reserve(durableMediaJob.manifestCount);
+    if (onboardStorageMutex != nullptr &&
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+    File manifest = SD.open(DURABLE_JOB_MANIFEST_PATH, FILE_READ);
+    if (manifest) {
+      DurableMediaRecord record{};
+      while (records.size() < durableMediaJob.manifestCount &&
+             manifest.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) == sizeof(record)) {
+        records.push_back(record);
+      }
+      manifest.close();
+    }
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    Serial.printf("[trail-upload] manifest loaded records=%u expected=%u\n",
+                  static_cast<unsigned>(records.size()), durableMediaJob.manifestCount);
+    if (records.empty()) return false;
+    std::sort(records.begin(), records.end(),
+              [](const DurableMediaRecord &left, const DurableMediaRecord &right) {
+      const uint32_t leftBytes = left.expectedBytes == 0 ? UINT32_MAX : left.expectedBytes;
+      const uint32_t rightBytes = right.expectedBytes == 0 ? UINT32_MAX : right.expectedBytes;
+      if (leftBytes != rightBytes) return leftBytes < rightBytes;
+      // For equal/unknown sizes, try still images before videos.
+      if (left.type != right.type) return left.type == 1;
+      return left.id < right.id;
+    });
+    Serial.println("[trail-upload] manifest sorted by ascending size");
+    if (!trailMediaUploadCursorLoaded ||
+        trailMediaUploadCursorJobId != durableMediaJob.jobId) {
+      trailMediaUploadCursorJobId = durableMediaJob.jobId;
+      if (!loadTrailMediaUploadCursor(durableMediaJob.jobId,
+                                      trailMediaUploadCursorPosition)) {
+        trailMediaUploadCursorPosition = 0;
+      }
+      trailMediaUploadCursorLoaded = true;
+      Serial.printf("[trail-upload] cursor restored job=%u position=%u\n",
+                    trailMediaUploadCursorJobId, trailMediaUploadCursorPosition);
+    }
+    if (trailMediaUploadCursorPosition >= records.size()) {
+      return false;
+    }
+    const DurableMediaRecord &record = records[trailMediaUploadCursorPosition];
+    mediaPath = durableMediaFilePath(record);
+    const int slash = mediaPath.lastIndexOf('/');
+    filename = slash >= 0 ? mediaPath.substring(slash + 1) : mediaPath;
+    return true;
+  }
+  uint64_t smallestBytes = UINT64_MAX;
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+  File directory = SD.open(TRAIL_MEDIA_DIR, FILE_READ);
+  if (!directory || !directory.isDirectory()) {
+    if (directory) directory.close();
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    return false;
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  while (true) {
+    if (onboardStorageMutex != nullptr &&
+        xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    File file = directory.openNextFile(FILE_READ);
+    if (!file) {
+      directory.close();
+      if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+      break;
+    }
+    String fullPath = file.name();
+    if (!fullPath.startsWith("/")) fullPath = String(TRAIL_MEDIA_DIR) + "/" + fullPath;
+    const int slash = fullPath.lastIndexOf('/');
+    const String name = slash >= 0 ? fullPath.substring(slash + 1) : fullPath;
+    const uint64_t bytes = file.isDirectory() ? 0 : file.size();
+    String lowerName = name;
+    lowerName.toLowerCase();
+    const bool media = !file.isDirectory() &&
+                       (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") ||
+                        lowerName.endsWith(".mp4") || lowerName.endsWith(".avi"));
+    file.close();
+    if (media && bytes > 0 && bytes <= UINT32_MAX &&
+        bytes < smallestBytes && !SD.exists(fullPath + ".uploaded") &&
+        !SD.exists(fullPath + ".upload_failed")) {
+      smallestBytes = bytes;
+      mediaPath = fullPath;
+      filename = name;
+    }
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  return !mediaPath.isEmpty();
+}
+
+void advanceTrailMediaUploadCursor() {
+  if (!trailMediaUploadCursorLoaded ||
+      trailMediaUploadCursorJobId != durableMediaJob.jobId) return;
+  ++trailMediaUploadCursorPosition;
+  trailMediaUploadCursorAttempts = 0;
+  if (!saveTrailMediaUploadCursor(trailMediaUploadCursorJobId,
+                                  trailMediaUploadCursorPosition)) {
+    Serial.printf("[trail-upload] cursor save failed job=%u position=%u\n",
+                  trailMediaUploadCursorJobId, trailMediaUploadCursorPosition);
+  }
+}
+
+bool ensureTransferWifiConnected() {
+  if (!TRANSFER_WIFI_UPLOAD_ENABLED) {
+    transferWifiLastError = "automatic_upload_disabled_after_radio_panic";
+    return false;
+  }
+  if (wifiRadioMutex != nullptr &&
+      xSemaphoreTakeRecursive(wifiRadioMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    transferWifiLastError = "wifi_radio_busy";
+    return false;
+  }
+  refreshWifiState();
+  if (transferWifiConnected) {
+    if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+    return true;
+  }
+  if (strlen(TRANSFER_WIFI_SSID) == 0) {
+    transferWifiLastError = "not_configured";
+    if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+    return false;
+  }
+  ++transferWifiConnectAttempts;
+  transferWifiLastError = "";
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(BOARD_HOSTNAME);
+  WiFi.setSleep(false);
+  cooperativeDelay(200);
+  WiFi.begin(TRANSFER_WIFI_SSID, TRANSFER_WIFI_PASS);
+  const unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < 15000UL) {
+    if (trailMediaUploadAbortRequested || durableMediaJobIsActive()) {
+      transferWifiLastError = "camera_job_preempted";
+      WiFi.disconnect(true, true);
+      WiFi.mode(WIFI_OFF);
+      refreshWifiState();
+      if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+      return false;
+    }
+    cooperativeDelay(100);
+  }
+  refreshWifiState();
+  if (!transferWifiConnected) {
+    transferWifiLastError = "connect_failed";
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    refreshWifiState();
+    Serial.println("[trail-upload] transfer WiFi unavailable; falling back to HaLow");
+    if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+    return false;
+  }
+  transferWifiSessionFiles = 0;
+  transferWifiSessionStartedMs = millis();
+  Serial.printf("[trail-upload] transfer WiFi connected ip=%s\n", WiFi.localIP().toString().c_str());
+  if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+  return true;
+}
+
+void disconnectTransferWifi() {
+  if (wifiRadioMutex != nullptr &&
+      xSemaphoreTakeRecursive(wifiRadioMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.println("[trail-upload] WiFi radio busy; disconnect deferred");
+    return;
+  }
+  refreshWifiState();
+  if (!transferWifiConnected) {
+    if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+    return;
+  }
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  transferWifiSessionFiles = 0;
+  transferWifiSessionStartedMs = 0;
+  refreshWifiState();
+  Serial.println("[trail-upload] transfer WiFi disconnected");
+  if (wifiRadioMutex != nullptr) xSemaphoreGiveRecursive(wifiRadioMutex);
+}
+
+void serviceTrailMediaUpload() {
+  trailMediaUploadBlockedReason = "";
+  if (trailMediaRequeueActive) { trailMediaUploadBlockedReason = "requeue_in_progress"; return; }
+  if (cachedStorageBatteryMv() < MEDIA_UPLOAD_MIN_BATTERY_MV) {
+    trailMediaUploadBlockedReason = "battery_below_upload_threshold";
+    return;
+  }
+  if (trailMediaUploadPauseUntilMs != 0 &&
+      static_cast<long>(trailMediaUploadPauseUntilMs - millis()) > 0) {
+    trailMediaUploadBlockedReason = "maintenance_pause";
+    return;
+  }
+  if (!sdReady) { trailMediaUploadBlockedReason = "sd_unavailable"; return; }
+  if (!durableMediaJobLoaded) { trailMediaUploadBlockedReason = "durable_job_not_loaded"; return; }
+  if (durableMediaJobIsActive()) { trailMediaUploadBlockedReason = "camera_job_active"; return; }
+  trailMediaUploadAbortRequested = false;
+  if (trailMediaUploadActive) return;
+  if (isControlActionActive()) { trailMediaUploadBlockedReason = "control_action_active"; return; }
+  if (streamSessionActive) { trailMediaUploadBlockedReason = "live_view_active"; return; }
+  if (wifiConnected) { trailMediaUploadBlockedReason = "camera_wifi_active"; return; }
+  if (trailMediaUploadLastAttemptMs != 0 &&
+      millis() - trailMediaUploadLastAttemptMs < TRAIL_MEDIA_UPLOAD_RETRY_MS) return;
+  trailMediaUploadLastAttemptMs = millis();
+  String mediaPath;
+  String filename;
+  Serial.printf("[trail-upload] queue scan begin job=%u manifest=%u cursor=%u\n",
+                durableMediaJob.jobId, durableMediaJob.manifestCount,
+                trailMediaUploadCursorPosition);
+  if (!findPendingTrailMedia(mediaPath, filename)) {
+    Serial.printf("[trail-upload] queue scan found no candidate job=%u cursor=%u\n",
+                  durableMediaJob.jobId, trailMediaUploadCursorPosition);
+    disconnectTransferWifi();
+    return;
+  }
+  if (durableMediaJobIsActive()) {
+    trailMediaUploadBlockedReason = "camera_job_active";
+    disconnectTransferWifi();
+    return;
+  }
+  trailMediaUploadActive = true;
+  trailMediaUploadFilename = filename;
+  trailMediaUploadBytesSent = 0;
+  trailMediaUploadFileBytes = 0;
+  trailMediaUploadBytesHashed = 0;
+  trailMediaUploadLastError = "";
+  // Do not change either core's watchdog state here. Those APIs have
+  // deadlocked this worker on the vendor dual-radio runtime. Hashing and
+  // socket loops yield/feed normally, while the independent failsafe watches
+  // byte progress and can restart a genuinely stalled transfer.
+  Serial.printf("[trail-upload] selected file=%s\n", filename.c_str());
+  bool transferRadioLeaseHeld = false;
+  if (TRANSFER_WIFI_UPLOAD_ENABLED && strlen(TRANSFER_WIFI_SSID) > 0 &&
+      wifiRadioMutex != nullptr) {
+    transferRadioLeaseHeld =
+      xSemaphoreTakeRecursive(wifiRadioMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+    if (!transferRadioLeaseHeld) transferWifiLastError = "radio_lease_busy";
+  }
+  bool usingTransferWifi = transferRadioLeaseHeld && ensureTransferWifiConnected();
+  trailMediaUploadPreferredTransport = usingTransferWifi ? "wifi_2_4ghz" : "halow";
+  Serial.printf("[trail-upload] transport=%s file=%s\n",
+                usingTransferWifi ? "wifi_2_4ghz" : "halow", filename.c_str());
+  String sha256;
+  uint32_t fileBytes = 0;
+  bool ok = sha256SdFile(mediaPath, sha256, fileBytes);
+  trailMediaUploadFileBytes = fileBytes;
+  Serial.printf("[trail-upload] hash %s file=%s bytes=%u\n",
+                ok ? "complete" : "failed", filename.c_str(), fileBytes);
+  if (!ok) {
+    trailMediaUploadLastError = (trailMediaUploadAbortRequested || durableMediaJobIsActive())
+                                  ? "camera_job_preempted"
+                                  : "sha256_failed";
+  }
+  String lowerFilename = filename;
+  lowerFilename.toLowerCase();
+  const String contentType = lowerFilename.endsWith(".mp4") ? "video/mp4" :
+                             (lowerFilename.endsWith(".avi") ? "video/x-msvideo" : "image/jpeg");
+  String metadata = "{";
+  metadata += "\"scanner_host\":\"" + jsonEscape(SCANNER_HOST) + "\"";
+  metadata += ",\"source\":\"trail_camera\"";
+  metadata += ",\"media_type\":\"" + contentType + "\"";
+  metadata += ",\"filename\":\"" + jsonEscape(filename) + "\"";
+  metadata += ",\"recorded_at\":" + buildRecordedAtJsonValue();
+  metadata += ",\"bytes\":" + String(fileBytes);
+  metadata += ",\"sha256\":\"" + sha256 + "\"";
+  metadata += ",\"metadata\":{\"trail_media_id\":" + String(filename.toInt()) + "}}";
+  String response;
+  int statusCode = 0;
+  if (ok && !trailMediaUploadAbortRequested && !durableMediaJobIsActive()) {
+    const UpstreamTransport uploadTransport = usingTransferWifi
+                                                ? UPSTREAM_TRANSPORT_TRANSFER_WIFI
+                                                : UPSTREAM_TRANSPORT_HALOW;
+    ok = postJsonToUpstream("/api/board/media", metadata, response, statusCode,
+                            uploadTransport);
+    if (!ok && usingTransferWifi) {
+      Serial.printf("[trail-upload] metadata failed over WiFi status=%d; retrying over HaLow\n",
+                    statusCode);
+      disconnectTransferWifi();
+      usingTransferWifi = false;
+      response = "";
+      statusCode = 0;
+      ok = postJsonToUpstream("/api/board/media", metadata, response, statusCode,
+                              UPSTREAM_TRANSPORT_HALOW);
+    }
+    if (!ok) trailMediaUploadLastError = "metadata_http_" + String(statusCode);
+  }
+  bool wifiBlobAttempted = false;
+  if (ok && !trailMediaUploadAbortRequested && !durableMediaJobIsActive()) {
+    const String uploadUrl = jsonObjectStringField(response, "upload_url");
+    if (!uploadUrl.isEmpty()) {
+      wifiBlobAttempted = usingTransferWifi;
+      ok = putTrailMediaBlob(uploadUrl, mediaPath, contentType, sha256, fileBytes,
+                             trailMediaUploadLastError,
+                             usingTransferWifi ? UPSTREAM_TRANSPORT_TRANSFER_WIFI
+                                               : UPSTREAM_TRANSPORT_HALOW);
+    } else {
+      ok = false;
+      trailMediaUploadLastError = "metadata_missing_upload_url";
+    }
+  }
+  if (!ok && usingTransferWifi && wifiBlobAttempted) {
+    const String wifiError = trailMediaUploadLastError;
+    Serial.printf("[trail-upload] WiFi blob failed error=%s; retrying file over HaLow\n",
+                  wifiError.c_str());
+    disconnectTransferWifi();
+    usingTransferWifi = false;
+    trailMediaUploadPreferredTransport = "halow_fallback";
+    response = "";
+    statusCode = 0;
+    ok = postJsonToUpstream("/api/board/media", metadata, response, statusCode,
+                            UPSTREAM_TRANSPORT_HALOW);
+    if (ok) {
+      const String uploadUrl = jsonObjectStringField(response, "upload_url");
+      if (!uploadUrl.isEmpty()) {
+        trailMediaUploadLastError = "";
+        ok = putTrailMediaBlob(uploadUrl, mediaPath, contentType, sha256, fileBytes,
+                               trailMediaUploadLastError, UPSTREAM_TRANSPORT_HALOW);
+      } else {
+        ok = false;
+        trailMediaUploadLastError = "halow_metadata_missing_upload_url";
+      }
+    } else {
+      trailMediaUploadLastError = "wifi_" + wifiError +
+                                  "_halow_metadata_http_" + String(statusCode);
+    }
+  }
+  if (ok) {
+    ++trailMediaUploadSuccessCount;
+    ++transferWifiSessionFiles;
+    trailMediaUploadLastSuccessMs = millis();
+    advanceTrailMediaUploadCursor();
+    // A successful item is not a retry. Continue draining the queue on the
+    // next worker pass instead of imposing the failure backoff per file.
+    trailMediaUploadLastAttemptMs = 0;
+    Serial.printf("[trail-upload] complete file=%s bytes=%u\n", filename.c_str(), fileBytes);
+  } else {
+    ++trailMediaUploadFailureCount;
+    if (trailMediaUploadCursorAttempts < UINT8_MAX) ++trailMediaUploadCursorAttempts;
+    const uint8_t fileAttempts = trailMediaUploadCursorAttempts;
+    if (fileAttempts >= TRAIL_MEDIA_MAX_UPLOAD_ATTEMPTS) {
+      ++trailMediaUploadSkippedCount;
+      trailMediaUploadLastSkipped = filename;
+      advanceTrailMediaUploadCursor();
+      Serial.printf("[trail-upload] skipping file=%s after %u attempts\n",
+                    filename.c_str(), fileAttempts);
+    }
+    Serial.printf("[trail-upload] failed file=%s error=%s\n",
+                  filename.c_str(), trailMediaUploadLastError.c_str());
+  }
+  trailMediaUploadActive = false;
+  trailMediaUploadAbortRequested = false;
+  const bool rotateTransferWifi = !ok ||
+                                  transferWifiSessionFiles >= TRANSFER_WIFI_BATCH_FILES ||
+                                  (transferWifiSessionStartedMs != 0 &&
+                                   millis() - transferWifiSessionStartedMs >= TRANSFER_WIFI_SESSION_MAX_MS);
+  if (rotateTransferWifi) disconnectTransferWifi();
+  if (transferRadioLeaseHeld && wifiRadioMutex != nullptr) {
+    xSemaphoreGiveRecursive(wifiRadioMutex);
+  }
+}
+
+void trailMediaUploadTask(void *pvParameters) {
+  (void)pvParameters;
+  Serial.printf("[trail-upload] task started core=%d\n", xPortGetCoreID());
+  while (true) {
+    serviceTrailMediaUpload();
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void startTrailMediaUploadTask() {
+  if (trailMediaUploadTaskHandle != nullptr) return;
+  const BaseType_t result = xTaskCreatePinnedToCore(trailMediaUploadTask,
+                                                    "trail-upload",
+                                                    8192,
+                                                    nullptr,
+                                                    1,
+                                                    &trailMediaUploadTaskHandle,
+                                                    TRAIL_UPLOAD_WORKER_CORE);
+  Serial.printf("[trail-upload] task create result=%d handle=%p core=%d\n",
+                static_cast<int>(result), trailMediaUploadTaskHandle,
+                static_cast<int>(TRAIL_UPLOAD_WORKER_CORE));
+}
+
+void triggerFailsafeRestart(const char *reason) {
+  const String nextReason = reason == nullptr ? "unknown" : String(reason);
+  if (nextReason == failsafeLastReason) {
+    ++failsafeConsecutiveSameReason;
+  } else {
+    failsafeConsecutiveSameReason = 1;
+  }
+  failsafeLastReason = nextReason;
+  ++failsafeRestartCount;
+  Preferences failsafePrefs;
+  if (failsafePrefs.begin("runtime", false)) {
+    failsafePrefs.putString("failsafe", failsafeLastReason);
+    failsafePrefs.putUInt("failsafe_n", failsafeRestartCount);
+    failsafePrefs.putUInt("failsafe_same", failsafeConsecutiveSameReason);
+    failsafePrefs.end();
+  }
+  Serial.printf("[failsafe] restarting reason=%s count=%u uptime_ms=%lu\n",
+                failsafeLastReason.c_str(), failsafeRestartCount, millis());
+  delay(100);
+  ESP.restart();
+}
+
+bool probeLocalHttpListener() {
+  if (!httpServerStarted) return false;
+  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) return false;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = inet_addr("127.0.0.1");
+  address.sin_port = htons(BRIDGE_HTTP_PORT);
+  int connectError = 0;
+  if (!connectSocketWithTimeout(sock, address, 2000UL, connectError)) {
+    close(sock);
+    return false;
+  }
+  timeval timeout{};
+  timeout.tv_sec = 2;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  const char request[] = "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+  if (!sendAll(sock, reinterpret_cast<const uint8_t *>(request), sizeof(request) - 1)) {
+    close(sock);
+    return false;
+  }
+  char response[64] = {};
+  const int count = recv(sock, response, sizeof(response) - 1, 0);
+  close(sock);
+  return count > 0 && strstr(response, " 200 ") != nullptr;
+}
+
+bool restartHttpServerFromFailsafe() {
+  if (httpServiceMutex != nullptr &&
+      xSemaphoreTake(httpServiceMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+  server.close();
+  vTaskDelay(pdMS_TO_TICKS(25));
+  server.begin();
+  lastHttpServerRestartMs = millis();
+  ++httpServerRestartCount;
+  httpServerLastRestartReason = "loopback_self_test_failed";
+  if (httpServiceMutex != nullptr) xSemaphoreGive(httpServiceMutex);
+  return true;
+}
+
+void failsafeTask(void *pvParameters) {
+  (void)pvParameters;
+  unsigned long uploadLastProgressMs = millis();
+  uint32_t previousBytesHashed = 0;
+  uint32_t previousBytesSent = 0;
+  uint32_t previousSuccesses = 0;
+  uint32_t previousFailures = 0;
+  String previousFilename;
+  unsigned long lastHttpSelfTestMs = 0;
+  while (true) {
+    const unsigned long now = millis();
+    if (!bootMarkedOperational && setupStartedMs != 0 && now - setupStartedMs > 180000UL) {
+      triggerFailsafeRestart("startup_timeout");
+    }
+    if (bootMarkedOperational && loopHeartbeatMs != 0 &&
+        now - loopHeartbeatMs > 120000UL && !httpLongOperationActive) {
+      triggerFailsafeRestart("main_loop_stalled");
+    }
+    if (halowDownSinceMs != 0 && now - halowDownSinceMs > 600000UL &&
+        !otaInProgress && !otaRestartPending) {
+      triggerFailsafeRestart("halow_down_10_minutes");
+    }
+    const bool healthyLongHttpOperation = httpLongOperationActive &&
+                                          now - httpLongOperationLastProgressMs < FAILSAFE_LONG_HTTP_STALL_MS;
+    const bool healthyMediaUpload = trailMediaUploadActive &&
+                                    now - uploadLastProgressMs < FAILSAFE_UPLOAD_STALL_MS;
+    if (!healthyLongHttpOperation && !healthyMediaUpload && lastHttpServiceMs != 0 &&
+        now - lastHttpServiceMs > FAILSAFE_HTTP_STALL_MS) {
+      triggerFailsafeRestart("http_service_stalled");
+    }
+    if (httpLongOperationActive &&
+        now - httpLongOperationLastProgressMs >= FAILSAFE_LONG_HTTP_STALL_MS) {
+      triggerFailsafeRestart("http_long_operation_stalled");
+    }
+
+    if (!httpLongOperationActive && httpServerStarted &&
+        (lastHttpSelfTestMs == 0 || now - lastHttpSelfTestMs >= HTTP_SELF_TEST_INTERVAL_MS)) {
+      lastHttpSelfTestMs = now;
+      if (probeLocalHttpListener()) {
+        ++httpSelfTestSuccessCount;
+        httpSelfTestConsecutiveFailures = 0;
+      } else {
+        ++httpSelfTestFailureCount;
+        ++httpSelfTestConsecutiveFailures;
+        Serial.printf("[failsafe] HTTP loopback failed consecutive=%u total=%u\n",
+                      httpSelfTestConsecutiveFailures, httpSelfTestFailureCount);
+        if (httpSelfTestConsecutiveFailures == 2) restartHttpServerFromFailsafe();
+        if (httpSelfTestConsecutiveFailures >= 4) triggerFailsafeRestart("http_listener_dead");
+      }
+    }
+
+    const bool uploadProgressed = trailMediaUploadBytesHashed != previousBytesHashed ||
+                                  trailMediaUploadBytesSent != previousBytesSent ||
+                                  trailMediaUploadSuccessCount != previousSuccesses ||
+                                  trailMediaUploadFailureCount != previousFailures ||
+                                  trailMediaUploadFilename != previousFilename;
+    if (!trailMediaUploadActive || uploadProgressed) uploadLastProgressMs = now;
+    if (trailMediaUploadActive && now - uploadLastProgressMs > FAILSAFE_UPLOAD_STALL_MS) {
+      triggerFailsafeRestart("trail_upload_stalled");
+    }
+    previousBytesHashed = trailMediaUploadBytesHashed;
+    previousBytesSent = trailMediaUploadBytesSent;
+    previousSuccesses = trailMediaUploadSuccessCount;
+    previousFailures = trailMediaUploadFailureCount;
+    previousFilename = trailMediaUploadFilename;
+    vTaskDelay(pdMS_TO_TICKS(FAILSAFE_CHECK_INTERVAL_MS));
+  }
+}
+
+void startFailsafeTask() {
+  if (failsafeTaskHandle != nullptr) return;
+  xTaskCreatePinnedToCore(failsafeTask,
+                          "failsafe",
+                          4096,
+                          nullptr,
+                          3,
+                          &failsafeTaskHandle,
+                          HTTP_SERVICE_CORE);
+}
+
 bool durableMediaJobIsActive() {
   return durableMediaJob.status == DURABLE_MEDIA_QUEUED ||
          durableMediaJob.status == DURABLE_MEDIA_RUNNING ||
@@ -8839,6 +10817,7 @@ bool queueDurableMediaJob(DurableMediaJobAction action, String &message) {
   setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "queued");
   SD.remove(DURABLE_JOB_MANIFEST_PATH);
   const bool saved = saveDurableMediaJob();
+  if (saved) trailMediaUploadAbortRequested = true;
   message = saved ? "queued:" + String(durableMediaJob.jobId) : "persist_failed";
   return saved;
 }
@@ -8855,19 +10834,117 @@ void durableMediaJobRetry(const String &error) {
   requestCameraStandbyAndPowerDownWifi("durable_media_retry_wait");
 }
 
+void durableMediaLowBatteryHold(uint32_t batteryMv) {
+  const bool entering = String(durableMediaJob.stage) != "low_battery_wait";
+  durableMediaJob.status = DURABLE_MEDIA_WAITING_RETRY;
+  setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
+                    "low_battery_wait");
+  setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError),
+                    "low_battery:" + String(batteryMv) + "mV");
+  durableMediaNextRetryMs = millis() + DURABLE_MEDIA_LOW_BATTERY_RECHECK_MS;
+  durableTransferBytes = 0;
+  durableTransferExpectedBytes = 0;
+  durableTransferStartedMs = 0;
+  durableTransferLastProgressMs = 0;
+  saveDurableMediaJob();
+  if (entering) {
+    Serial.printf("[durable-job] id=%u low-battery hold battery=%u recover=%u\n",
+                  durableMediaJob.jobId, batteryMv,
+                  DURABLE_MEDIA_RECOVER_BATTERY_MV);
+    requestCameraStandbyAndPowerDownWifi("durable_low_battery_hold");
+  }
+}
+
+void durableMediaCameraBringupFailed() {
+  const String prefix = "camera_bringup_failed:attempt=";
+  uint8_t attempt = 1;
+  const String previousError(durableMediaJob.lastError);
+  if (previousError.startsWith(prefix)) {
+    const long previousAttempt = previousError.substring(prefix.length()).toInt();
+    if (previousAttempt > 0 && previousAttempt < UINT8_MAX) {
+      attempt = static_cast<uint8_t>(previousAttempt + 1);
+    }
+  }
+
+  if (attempt >= DURABLE_MEDIA_CAMERA_BRINGUP_MAX_ATTEMPTS) {
+    durableMediaJob.status = DURABLE_MEDIA_FAILED;
+    ++durableMediaJob.retryCount;
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
+                      "camera_unavailable");
+    setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError),
+                      "camera_bringup_failed_after_" + String(attempt));
+    saveDurableMediaJob();
+    Serial.printf("[durable-job] id=%u stopped after %u camera bring-up failures\n",
+                  durableMediaJob.jobId, static_cast<unsigned>(attempt));
+    requestCameraStandbyAndPowerDownWifi("durable_camera_unavailable");
+    return;
+  }
+
+  durableMediaJobRetry(prefix + String(attempt));
+}
+
+bool durableMediaItemFailed(DurableMediaRecord &record, const String &error) {
+  if (record.reserved[0] < UINT8_MAX) ++record.reserved[0];
+  if (!writeDurableManifestRecord(durableMediaJob.currentIndex, record)) {
+    durableMediaJobRetry("manifest_attempt_write_failed");
+    return false;
+  }
+  if (record.reserved[0] < DURABLE_MEDIA_ITEM_MAX_ATTEMPTS) {
+    durableMediaJobRetry(error);
+    return false;
+  }
+
+  ++durableMediaJob.retryCount;
+  ++durableMediaJob.skippedCount;
+  ++durableMediaJob.currentIndex;
+  durableMediaJob.currentMediaId = 0;
+  setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "item_skipped_after_failures");
+  setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError),
+                    "skipped_after_3:" + error);
+  durableTransferBytes = 0;
+  durableTransferExpectedBytes = 0;
+  durableTransferStartedMs = 0;
+  durableTransferLastProgressMs = 0;
+  saveDurableMediaJob();
+  Serial.printf("[durable-job] id=%u skipped media=%u after %u attempts error=%s\n",
+                durableMediaJob.jobId, record.id, record.reserved[0], error.c_str());
+  return true;
+}
+
 void serviceDurableMediaJob() {
-  if (!durableMediaJobLoaded || !durableMediaJobIsActive()) return;
+  if (automaticRecoverySuspended) return;
+  if (!durableMediaJobLoaded || !durableMediaJobIsActive() || trailMediaUploadActive) return;
   if (durableMediaJob.status == DURABLE_MEDIA_WAITING_RETRY &&
       static_cast<long>(millis() - durableMediaNextRetryMs) < 0) return;
+  const bool recoveringFromLowBattery =
+    String(durableMediaJob.stage) == "low_battery_wait";
+  const uint32_t durableBatteryMv = cachedStorageBatteryMv();
+  const uint32_t requiredBatteryMv = recoveringFromLowBattery
+                                      ? DURABLE_MEDIA_RECOVER_BATTERY_MV
+                                      : DURABLE_MEDIA_MIN_BATTERY_MV;
+  if (durableBatteryMv < requiredBatteryMv) {
+    durableMediaLowBatteryHold(durableBatteryMv);
+    return;
+  }
+  if (recoveringFromLowBattery) {
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
+                      "resume_after_low_battery");
+    setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), "");
+    saveDurableMediaJob();
+  }
   durableMediaJob.status = DURABLE_MEDIA_RUNNING;
-  setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), "");
   if (!wifiConnected) {
     setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "camera_bringup");
     saveDurableMediaJob();
     if (!runBringupSequence()) {
-      durableMediaJobRetry("camera_bringup_failed");
+      // Camera availability is a job-level prerequisite, not an individual
+      // media failure.  Do not walk and skip an entire manifest when the
+      // camera is absent; stop after a small bounded number of attempts.
+      durableMediaCameraBringupFailed();
       return;
     }
+    setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), "");
+    saveDurableMediaJob();
   }
   if (durableMediaJob.manifestCount == 0 && durableMediaJob.currentIndex == 0) {
     setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "building_manifest");
@@ -8907,6 +10984,25 @@ void serviceDurableMediaJob() {
       durableMediaJobRetry(manifestOk ? "manifest_page_limit_reached" : "manifest_pagination_failed");
       return;
     }
+    if (totalCount == 0) {
+      // An empty gallery is only authoritative when the camera's independent
+      // storage counters also say there is no media. This prevents a transient
+      // empty page or wrong-session response from becoming false success.
+      String storageInfo;
+      int storageStatus = 0;
+      if (!proxyCameraRequest("GET", "/cmd/info/3", storageInfo, storageStatus) ||
+          storageStatus < 200 || storageStatus >= 300) {
+        durableMediaJobRetry("empty_gallery_storage_check_failed_" + String(storageStatus));
+        return;
+      }
+      const long photoCount = jsonObjectIntField(storageInfo, "photo", 0);
+      const long videoCount = jsonObjectIntField(storageInfo, "video", 0);
+      if (photoCount > 0 || videoCount > 0) {
+        durableMediaJobRetry("empty_gallery_count_mismatch:photo=" + String(photoCount) +
+                             ",video=" + String(videoCount));
+        return;
+      }
+    }
     durableMediaJob.manifestCount = totalCount;
     setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), totalCount == 0 ? "complete" : "downloading");
     saveDurableMediaJob();
@@ -8918,13 +11014,32 @@ void serviceDurableMediaJob() {
     }
   }
   if (durableMediaJob.currentIndex >= durableMediaJob.manifestCount) {
-    durableMediaJob.status = DURABLE_MEDIA_SUCCEEDED;
+    const bool deleteIncomplete =
+      durableMediaJob.action == DURABLE_MEDIA_ACTION_DOWNLOAD_AND_DELETE &&
+      durableMediaJob.deletedCount != durableMediaJob.manifestCount;
+    durableMediaJob.status = deleteIncomplete ? DURABLE_MEDIA_FAILED
+                                              : DURABLE_MEDIA_SUCCEEDED;
     durableMediaJob.currentMediaId = 0;
-    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "complete");
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
+                      deleteIncomplete ? "incomplete_delete" : "complete");
+    if (deleteIncomplete) {
+      setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError),
+                        "incomplete_delete:deleted=" + String(durableMediaJob.deletedCount) +
+                        ",total=" + String(durableMediaJob.manifestCount) +
+                        ",skipped=" + String(durableMediaJob.skippedCount));
+    } else {
+      setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), "");
+    }
+    durableTransferBytes = 0;
+    durableTransferExpectedBytes = 0;
+    durableTransferStartedMs = 0;
+    durableTransferLastProgressMs = 0;
     saveDurableMediaJob();
-    Serial.printf("[durable-job] id=%u complete downloaded=%u skipped=%u deleted=%u bytes=%u\n",
-                  durableMediaJob.jobId, durableMediaJob.downloadedCount,
+    Serial.printf("[durable-job] id=%u terminal=%s downloaded=%u skipped=%u deleted=%u/%u bytes=%u\n",
+                  durableMediaJob.jobId, durableMediaStatusName(durableMediaJob.status),
+                  durableMediaJob.downloadedCount,
                   durableMediaJob.skippedCount, durableMediaJob.deletedCount,
+                  durableMediaJob.manifestCount,
                   durableMediaJob.bytesDownloaded);
     requestCameraStandbyAndPowerDownWifi("durable_media_complete");
     return;
@@ -8940,27 +11055,47 @@ void serviceDurableMediaJob() {
   String transferMessage;
   uint32_t bytesWritten = 0;
   if (!downloadCameraMediaToSd(record, transferMessage, bytesWritten)) {
-    durableMediaJobRetry(transferMessage);
+    if (transferMessage == "low_battery_pause") {
+      durableMediaLowBatteryHold(cachedStorageBatteryMv());
+      return;
+    }
+    durableMediaItemFailed(record, transferMessage);
     return;
   }
-  if (transferMessage == "already_staged") ++durableMediaJob.skippedCount;
-  else {
-    ++durableMediaJob.downloadedCount;
-    durableMediaJob.bytesDownloaded += bytesWritten;
+  if (record.reserved[1] == 0) {
+    record.reserved[1] = transferMessage == "already_staged" ? 2 : 1;
+    if (!writeDurableManifestRecord(durableMediaJob.currentIndex, record)) {
+      durableMediaJobRetry("manifest_result_write_failed");
+      return;
+    }
   }
   if (durableMediaJob.action == DURABLE_MEDIA_ACTION_DOWNLOAD_AND_DELETE) {
     setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "deleting_verified_item");
     saveDurableMediaJob();
     String deleteError;
     if (!deleteCameraMediaRecord(record, deleteError)) {
-      durableMediaJobRetry(deleteError);
+      durableMediaItemFailed(record, deleteError);
+      return;
+    }
+    record.reserved[2] = 1;
+    if (!writeDurableManifestRecord(durableMediaJob.currentIndex, record)) {
+      durableMediaJobRetry("manifest_delete_result_write_failed");
       return;
     }
     ++durableMediaJob.deletedCount;
   }
+  if (record.reserved[1] == 2) ++durableMediaJob.skippedCount;
+  else {
+    ++durableMediaJob.downloadedCount;
+    durableMediaJob.bytesDownloaded += record.expectedBytes > 0 ? record.expectedBytes : bytesWritten;
+  }
   ++durableMediaJob.currentIndex;
   durableMediaJob.currentMediaId = 0;
   setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "item_complete");
+  durableTransferBytes = 0;
+  durableTransferExpectedBytes = 0;
+  durableTransferStartedMs = 0;
+  durableTransferLastProgressMs = 0;
   saveDurableMediaJob();
 }
 
@@ -9105,6 +11240,12 @@ void handleCameraTargetGet() {
 }
 
 void handleCameraTargetPost() {
+  if (durableMediaJobIsActive()) {
+    server.send(409, "application/json",
+                "{\"ok\":false,\"error\":\"durable_job_active\",\"job_id\":" +
+                String(durableMediaJob.jobId) + "}");
+    return;
+  }
   String id = server.hasArg("id") ? server.arg("id") : "";
   String bleMac = server.hasArg("ble_mac") ? server.arg("ble_mac") : "";
   String wifiSsid = server.hasArg("wifi_ssid") ? server.arg("wifi_ssid") : "";
@@ -9198,8 +11339,10 @@ void startHttpServer() {
   server.on("/system/status", HTTP_GET, handleSystemStatus);
   server.on("/diagnostics/status", HTTP_GET, handleDiagnosticStatus);
   server.on("/diagnostics/log", HTTP_GET, handleDiagnosticLog);
+  server.on("/recovery/resume", HTTP_POST, handleRecoveryResume);
   server.on("/halow/status", HTTP_GET, handleHaLowStatusHttp);
   server.on("/wifi/status", HTTP_GET, handleWifiStatus);
+  server.on("/wifi/transfer_test", HTTP_POST, handleTransferWifiTest);
   server.on("/camera/status", HTTP_GET, handleCameraBridgeStatus);
   server.on("/camera/target", HTTP_GET, handleCameraTargetGet);
   server.on("/camera/target", HTTP_POST, handleCameraTargetPost);
@@ -9235,18 +11378,12 @@ void startHttpServer() {
   server.on("/onboard/config", HTTP_POST, handleOnboardCameraConfig);
   server.on("/onboard/timelapse/start", HTTP_POST, handleOnboardTimelapseStart);
   server.on("/onboard/timelapse/stop", HTTP_POST, handleOnboardTimelapseStop);
-  server.on("/scan/wifi", HTTP_GET, handleWifiScan);
-  server.on("/scanner/config", HTTP_GET, handleScannerConfigGet);
-  server.on("/scanner/config", HTTP_POST, handleScannerConfigPost);
-  server.on("/scanner/enable", HTTP_POST, handleScannerEnable);
-  server.on("/scanner/disable", HTTP_POST, handleScannerDisable);
   server.on("/upload/status", HTTP_GET, handleUploadStatus);
-  server.on("/upload/ble/last", HTTP_GET, handleUploadBleLast);
+  server.on("/trail-media/requeue", HTTP_POST, handleTrailMediaRequeue);
   server.on("/sd/status", HTTP_GET, handleSdStatus);
   server.on("/sd/mount", HTTP_POST, handleSdMount);
   server.on("/upload/telemetry", HTTP_POST, handleUploadTelemetry);
   server.on("/upload/events", HTTP_POST, handleUploadEvents);
-  server.on("/upload/observations", HTTP_POST, handleUploadObservations);
   server.on("/upload/all", HTTP_POST, handleUploadAll);
   server.on("/firmware/status", HTTP_GET, handleFirmwareStatus);
   server.on("/firmware/update", HTTP_POST, handleFirmwareUpdateFinished, handleFirmwareUploadStream);
@@ -9628,26 +11765,10 @@ void handleSerialCommand(const String &line) {
     return;
   }
   if (cmd == "sd_mount") {
-    if (mountSdCard() && !loadDurableMediaJob()) {
+    if (mountSdCardWithRetry() && !loadDurableMediaJob()) {
       sdLastMessage = "durable_job_load_failed";
     }
     Serial.println(buildSdStatusJson());
-    return;
-  }
-  if (cmd == "scanner_status") {
-    Serial.println(buildScannerConfigJson());
-    return;
-  }
-  if (cmd == "scanner_enable") {
-    scannerScheduleEnabled = true;
-    saveScannerConfig();
-    Serial.println(buildScannerConfigJson());
-    return;
-  }
-  if (cmd == "scanner_disable") {
-    scannerScheduleEnabled = false;
-    saveScannerConfig();
-    Serial.println(buildScannerConfigJson());
     return;
   }
   if (cmd.startsWith("onboard_config")) {
@@ -9747,21 +11868,21 @@ void handleSerialCommand(const String &line) {
     dumpOnboardJpegBase64(cmd.endsWith("fresh"));
     return;
   }
-  if (cmd == "wifi_scan") {
-    String payload;
-    String error;
-    int scanCode = 0;
-    if (runIdleWifiScan(payload, error, scanCode)) {
-      Serial.println(payload);
-    } else if (error == "scan_failed") {
-      Serial.printf("[wifi-scan] failed error=%s code=%d\n", error.c_str(), scanCode);
-    } else {
-      Serial.printf("[wifi-scan] failed error=%s\n", error.c_str());
-    }
-    return;
-  }
   if (cmd == "upload_status") {
     Serial.println(buildUploadStatusJson());
+    return;
+  }
+  if (cmd == "upload_requeue") {
+    if (!sdReady || !durableMediaJobLoaded || durableMediaJobIsActive() ||
+        trailMediaUploadActive || trailMediaRequeueActive) {
+      Serial.println("[trail-upload] requeue rejected: media_not_ready_or_busy");
+      return;
+    }
+    uint32_t removed = 0;
+    bool storageBusy = false;
+    clearTrailMediaUploadMarkers(removed, storageBusy);
+    Serial.printf("[trail-upload] requeue %s markers_removed=%u\n",
+                  storageBusy ? "incomplete" : "complete", removed);
     return;
   }
   if (cmd == "upload_telemetry") {
@@ -9913,7 +12034,13 @@ void pollSerialConsole() {
 }
 
 void setup() {
+  setupStartedMs = millis();
   Serial.begin(115200);
+  // Keep the SD card deselected throughout early boot. GPIO15/GPIO16 are also
+  // sampled for charger telemetry before SPI starts, so a floating CS can make
+  // those transitions look like an invalid command sequence to a slow card.
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
   delay(500);
   Serial.println("GardePro dual-radio bridge starting");
   WiFi.setHostname(BOARD_HOSTNAME);
@@ -9937,15 +12064,19 @@ void setup() {
   onboardFrameMutex = xSemaphoreCreateMutex();
   onboardStorageMutex = xSemaphoreCreateMutex();
   onboardCameraMutex = xSemaphoreCreateMutex();
+  wifiRadioMutex = xSemaphoreCreateRecursiveMutex();
   observationUploadMutex = xSemaphoreCreateMutex();
   httpServiceMutex = xSemaphoreCreateMutex();
   durableMediaJobMutex = xSemaphoreCreateMutex();
+  loadPersistedCameraTarget();
+  loadDurableMediaJobMirror();
+  startFailsafeTask();
   initOnboardStorage();
-  mountSdCard();
-  loadDurableMediaJob();
+  if (mountSdCardWithRetry()) {
+    loadDurableMediaJob();
+  }
   appendDiagnosticJournal("boot");
   loadOnboardConfig();
-  loadScannerConfig();
   if (onboardCaptureEnabled && onboardCaptureWindowActive()) {
     initOnboardCamera();
   } else {
@@ -9994,7 +12125,8 @@ void setup() {
                               &controlWorkerTaskHandle,
                               CONTROL_WORKER_CORE);
     }
-    startWifiScannerTask();
+    startTrailMediaUploadTask();
+    startFailsafeTask();
     startStreamPacketPipeline();
     return;
   }
@@ -10034,12 +12166,14 @@ void setup() {
                             &controlWorkerTaskHandle,
                             CONTROL_WORKER_CORE);
   }
-  startWifiScannerTask();
+  startTrailMediaUploadTask();
+  startFailsafeTask();
 
   startStreamPacketPipeline();
 }
 
 void loop() {
+  loopHeartbeatMs = millis();
   if (lowBatteryBootHold) {
     pollSerialConsole();
     serviceLowBatteryBootHold();
@@ -10053,6 +12187,8 @@ void loop() {
     delay(100);
     ESP.restart();
   }
+  serviceSdRecovery();
+  serviceHaLowRecovery();
 
   if (RUN_LOCAL_SERIAL_TEST) {
     halowConnected = (HaLow.status() == WL_CONNECTED);
@@ -10109,6 +12245,8 @@ void loop() {
     }
     if ((CAMERA_AUTO_RECOVERY_ENABLED != 0) &&
         !streamSessionActive && !wifiConnected && cameraWifiEverConnected && !isControlActionActive() &&
+        !transferWifiConnected &&
+        !durableMediaJobIsActive() &&
         millis() - lastRescanMs > 15000) {
       lastRescanMs = millis();
       Serial.printf("[state] ble_attempted=%s ble_ok=%s notify_count=%u last=%s\n",
