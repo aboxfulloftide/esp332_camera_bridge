@@ -564,6 +564,8 @@ Durable camera jobs have priority over staged uploads. Accepting a durable job p
 
 Durable media jobs enter `waiting_retry` with stage `low_battery_wait` below 3.8 V. Camera Wi-Fi/BLE activity is shut down, the manifest and current position remain durable, and the low-voltage hold does not increment retry counters. Firmware rechecks every five minutes and resumes only after battery voltage reaches 3.9 V. The job JSON exposes `battery_mv`, `minimum_battery_mv`, and `recovery_battery_mv`.
 
+Camera bring-up uses a sequential radio lifecycle. After the BLE wake token is sent (and its notification is collected when available), firmware closes and deletes the BLE client before scanning for or joining the camera Wi-Fi hotspot. BLE is not kept connected during the camera Wi-Fi session.
+
 Firmware 0.2.25 separates camera-job safe mode from storage/upload recovery. Repeated HTTP failures may suspend new camera work, but SD remount attempts continue with exponential backoff from 15 seconds to 10 minutes. After the SD and durable job state recover, already-staged media resumes uploading automatically. SD recovery waits below 3.5 V and media uploads wait below 3.6 V to avoid high-current storage/network work on a collapsing battery.
 
 The durable job summary is mirrored periodically to NVS (on state changes, every ten completed entries, or every five minutes). If SD is temporarily unavailable, job JSON reports `state_source: "nvs_mirror"` instead of incorrectly appearing as a new idle job.
@@ -584,11 +586,24 @@ Outbound connect and send operations have bounded socket timeouts. Transfer Wi-F
 
 The supervisor starts before storage, camera, and network initialization complete. It additionally checks the HTTP listener over loopback once per minute, restarts a dead listener after two failures, reboots after four failures, detects stalled startup/main-loop/long HTTP operations, and reboots after HaLow has remained down for ten minutes. OTA and file streaming callbacks update explicit long-operation progress heartbeats.
 
-HaLow liveness probes are bound to the HaLow interface and target the configured gateway rather than the application server. Association gets up to 75 seconds to finish, and failed recovery attempts back off from 30 seconds to a maximum of ten minutes.
+HaLow liveness probes are bound to the HaLow source address (this lwIP build cannot use `SO_BINDTODEVICE`; before 0.2.77 every probe failed with `ENODEV` and forced a HaLow reconnect each minute) and target the configured gateway rather than the application server. Association gets up to 75 seconds to finish, and failed recovery attempts back off from 30 seconds to a maximum of ten minutes.
 
 SD-backed HTTP handlers wait at most two seconds for storage and otherwise return `503 storage_busy`. Trail-media streaming, staged-upload hashing/blob reads, and camera-to-SD writes hold the storage mutex only for individual chunks rather than for the entire network transfer.
 
 Each manifest item has a persistent failure counter. After three failed download or delete attempts, the durable job records `skipped_after_3:<error>`, advances to the next manifest item, and continues instead of retrying one camera file forever.
+
+Firmware 0.2.77 narrows what counts as an item failure:
+
+- Storage faults (`sd_*`, `storage_*`, manifest write failures) never consume an item attempt; the job remounts the card, reloads its state, and retries the same item.
+- Camera link loss (`camera_connect_failed`, `camera_header_timeout`, a connection closed before data, or camera Wi-Fi dropping) re-runs bring-up and reports `camera_link_lost_<n>:<error>`. After eight consecutive link losses with no stored progress, the item is charged a normal attempt.
+- A response that grows the `.part` file reports `partial_progress_<bytes>:<error>` and resumes by Range without charging an attempt. Progress is the `.part` size on the card, not bytes received.
+- `skipped` counts only items left on the camera after failures. Items staged by an earlier attempt and then deleted count as `downloaded`.
+
+Camera bring-up failures retry quickly three times, then every 15 minutes with stage `camera_unavailable_backoff`; the job fails with `camera_bringup_failed_after_15` only after roughly three hours of consecutive failures.
+
+Camera media IDs are reused after deletion, so each staged or partial file has a `<file>.src` sidecar recording the camera item it came from (`id|type|size|date|uid`). Staged bytes are trusted, and partials resumed, only when the sidecar matches the manifest record. A staged file from a different item is removed if already uploaded, or otherwise renamed to `<id>_r<n>.<ext>` so it is still uploaded. JPEGs must start with SOI and contain an EOI marker in the final 4 KiB before the camera copy is deleted. Delete confirmation by listing queries the specific media ID rather than the newest 60 items.
+
+Camera Wi-Fi is joined as an 802.11b-only station first, which forces the camera to transmit with DSSS/CCK rates that survive weaker signal; if the camera refuses, firmware falls back to b/g/n and stops trying b-only until reboot.
 
 Video staging is intentionally strict. MP4 downloads are not promoted from `.part` to
 final `.mp4` unless the firmware can determine the complete byte count from the camera

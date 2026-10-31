@@ -27,3 +27,7 @@ sd_card_transfer_*/
 
 # Local extracted APK contents
 apk_extract/
+
+# Arduino build output. Compiled firmware embeds the Wi-Fi credentials from
+# local_config.h, so it must never be committed.
+gardepro_dual_radio_bridge/build/

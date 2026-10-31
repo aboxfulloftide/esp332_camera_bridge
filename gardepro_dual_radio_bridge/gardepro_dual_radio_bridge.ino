@@ -14,6 +14,15 @@
 #include <Update.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#include <esp_wifi.h>
+
+// Shared helpers (cooperative delays, SD/camera loops) run on tasks that are
+// not all subscribed to the task watchdog. esp_task_wdt_reset() on such a task
+// logs "task not found" thousands of times a minute, which stalls serial.
+// (A macro, not a function: a function here would make the Arduino builder
+// insert its generated prototypes above the remaining #includes.)
+#define feedTaskWdt() \
+  do { if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset(); } while (0)
 #include <mbedtls/sha256.h>
 #include <uri/UriRegex.h>
 #include <algorithm>
@@ -137,7 +146,7 @@ static const uint16_t LOCAL_MEDIA_PORT_SECONDARY = 25749;
 // API server unless local_config.h defines UPSTREAM_TUNNEL_HOST separately.
 static const bool RUN_LOCAL_SERIAL_TEST = true;
 static const char *FIRMWARE_NAME = "gardepro_unified";
-static const char *FIRMWARE_VERSION = "0.2.68";
+static const char *FIRMWARE_VERSION = "0.2.77";
 static const char *FIRMWARE_BUILD = __DATE__ " " __TIME__;
 static const char *DIAGNOSTIC_DIR = "/diagnostics";
 static const char *DIAGNOSTIC_LOG_PATH = "/diagnostics/health.jsonl";
@@ -232,6 +241,9 @@ bool httpServerStarted = false;
 
 volatile bool halowConnected = false;
 volatile bool wifiConnected = false;
+// Join the camera AP as 802.11b-only first (see connectCameraWifi()).
+bool cameraWifiPrefer11b = true;
+bool cameraWifiLast11b = false;
 portMUX_TYPE halowConnectMux = portMUX_INITIALIZER_UNLOCKED;
 bool halowConnectInProgress = false;
 unsigned long halowLastRecoveryAttemptMs = 0;
@@ -377,7 +389,7 @@ static const uint32_t MEDIA_UPLOAD_MIN_BATTERY_MV = 3600;
 static const uint32_t CAMERA_BRINGUP_MIN_BATTERY_MV = 3600;
 static const uint32_t DURABLE_MEDIA_MIN_BATTERY_MV = 3800;
 static const uint32_t DURABLE_MEDIA_RECOVER_BATTERY_MV = 3900;
-static const unsigned long DURABLE_MEDIA_LOW_BATTERY_RECHECK_MS = 300000UL;
+static const unsigned long DURABLE_MEDIA_LOW_BATTERY_RECHECK_MS = 30000UL;
 static const unsigned long STORAGE_BATTERY_CHECK_INTERVAL_MS = 30000;
 static const unsigned long CAMERA_SESSION_DEFAULT_LEASE_MS = 120000;
 static const unsigned long CAMERA_SESSION_MAX_LEASE_MS = 600000;
@@ -482,6 +494,10 @@ SemaphoreHandle_t observationUploadMutex = nullptr;
 
 SemaphoreHandle_t onboardFrameMutex = nullptr;
 SemaphoreHandle_t onboardStorageMutex = nullptr;
+// Serializes SD.end()/SD.begin() and the follow-up job reload. The durable
+// job worker and loop()'s background recovery could otherwise remount the
+// card concurrently. Recursive so a retry sequence can hold it across mounts.
+SemaphoreHandle_t sdMountMutex = nullptr;
 SemaphoreHandle_t onboardCameraMutex = nullptr;
 SemaphoreHandle_t wifiRadioMutex = nullptr;
 TaskHandle_t onboardCaptureTaskHandle = nullptr;
@@ -499,6 +515,11 @@ static const size_t OBSERVATION_QUEUE_MAX_FILES = 48;
 static const size_t OBSERVATION_QUEUE_MIN_FREE_BYTES = 32768;
 static SPIClass sdSpi(HSPI);
 bool sdReady = false;
+// True while a camera response is being written through an open FAT file.
+// No background task may open another SD file during this interval. FatFS is
+// nominally re-entrant, but concurrent directory/journal activity has caused
+// zero-byte writes on the field card.
+volatile bool cameraSdTransferActive = false;
 String sdLastMessage = "not_started";
 uint32_t sdMountAttempts = 0;
 uint32_t sdMountSuccesses = 0;
@@ -929,6 +950,14 @@ static const uint16_t DURABLE_MEDIA_JOB_VERSION = 1;
 static const unsigned long DURABLE_MEDIA_RETRY_MS = 10000UL;
 static const uint8_t DURABLE_MEDIA_ITEM_MAX_ATTEMPTS = 3;
 static const uint8_t DURABLE_MEDIA_CAMERA_BRINGUP_MAX_ATTEMPTS = 3;
+// After MAX_ATTEMPTS quick retries, retry every 15 minutes; give up only
+// after roughly three hours of consecutive bring-up failures.
+static const uint8_t DURABLE_MEDIA_CAMERA_BRINGUP_GIVE_UP_ATTEMPTS = 15;
+static const unsigned long DURABLE_MEDIA_CAMERA_BACKOFF_MS = 15UL * 60UL * 1000UL;
+// Consecutive camera-link drops with no stored progress before the current
+// item is charged a normal failure attempt.
+static const uint8_t DURABLE_MEDIA_MAX_LINK_FAILURES = 8;
+uint8_t durableMediaLinkFailures = 0;
 DurableMediaJobState durableMediaJob{};
 bool durableMediaJobLoaded = false;
 bool durableMediaJobFromMirror = false;
@@ -1026,7 +1055,7 @@ bool connectSocketWithTimeout(int sock, const sockaddr_in &addr, unsigned long t
     selected = select(sock + 1, nullptr, &writeSet, nullptr, &slice);
     if (selected > 0) break;
     if (selected < 0 && errno != EINTR) break;
-    esp_task_wdt_reset();
+    feedTaskWdt();
     vTaskDelay(pdMS_TO_TICKS(1));
   }
   if (selected <= 0) {
@@ -1095,7 +1124,7 @@ bool sendAll(int sock, const uint8_t *data, size_t len) {
                         sendError == EINTR) &&
         millis() - lastProgressMs < 15000UL) {
       vTaskDelay(pdMS_TO_TICKS(10));
-      esp_task_wdt_reset();
+      feedTaskWdt();
       continue;
     }
     return false;
@@ -1115,14 +1144,14 @@ bool sendMediaChunkWithRetry(int sock, const uint8_t *data, size_t len, String &
     if (written > 0) {
       sent += static_cast<size_t>(written);
       lastProgressMs = millis();
-      esp_task_wdt_reset();
+      feedTaskWdt();
       continue;
     }
     const int sendError = errno;
     if (written < 0 && (sendError == EAGAIN || sendError == EWOULDBLOCK || sendError == EINTR)) {
       if (millis() - lastProgressMs < 90000UL) {
         vTaskDelay(pdMS_TO_TICKS(20));
-        esp_task_wdt_reset();
+        feedTaskWdt();
         continue;
       }
       error = "blob_send_no_progress_timeout_" + String(sendError);
@@ -1233,7 +1262,7 @@ bool sendTunnelControlFrame(int sock, TunnelControlType controlType, const Strin
 void cooperativeDelay(unsigned long durationMs) {
   const unsigned long start = millis();
   while (millis() - start < durationMs) {
-    esp_task_wdt_reset();
+    feedTaskWdt();
     delay(1);
     vTaskDelay(pdMS_TO_TICKS(1));
   }
@@ -2773,7 +2802,9 @@ bool initOnboardStorage() {
 }
 
 void refreshSdCapacityCache() {
-  if (!sdReady) return;
+  if (!sdReady || cameraSdTransferActive) return;
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
   const uint8_t cardType = static_cast<uint8_t>(SD.cardType());
   const uint64_t cardSize = SD.cardSize();
   const uint64_t totalBytes = SD.totalBytes();
@@ -2784,6 +2815,7 @@ void refreshSdCapacityCache() {
   sdCachedTotalBytes = totalBytes;
   sdCachedUsedBytes = usedBytes;
   portEXIT_CRITICAL(&sdCapacityCacheMux);
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
 }
 
 bool mountSdCard(uint32_t frequency = 4000000UL) {
@@ -2849,8 +2881,19 @@ bool mountSdCard(uint32_t frequency = 4000000UL) {
   return true;
 }
 
+bool mountSdCardWithRetryLocked();
+
 bool mountSdCardWithRetry() {
-  static const uint32_t frequencies[] = {4000000UL, 4000000UL, 2000000UL, 1000000UL, 400000UL};
+  if (sdMountMutex != nullptr) xSemaphoreTakeRecursive(sdMountMutex, portMAX_DELAY);
+  const bool mounted = mountSdCardWithRetryLocked();
+  if (sdMountMutex != nullptr) xSemaphoreGiveRecursive(sdMountMutex);
+  return mounted;
+}
+
+bool mountSdCardWithRetryLocked() {
+  // This bridge is network-bound, so 1 MHz provides ample throughput while
+  // leaving substantially more signal margin for long writes and field wiring.
+  static const uint32_t frequencies[] = {1000000UL, 1000000UL, 400000UL, 400000UL, 400000UL};
   static const uint16_t settleDelaysMs[] = {250, 500, 1000, 1500, 2000};
   for (size_t attempt = 0; attempt < sizeof(frequencies) / sizeof(frequencies[0]); ++attempt) {
     delay(settleDelaysMs[attempt]);
@@ -2865,6 +2908,8 @@ bool mountSdCardWithRetry() {
   return false;
 }
 
+void serviceSdRecoveryLocked();
+
 uint32_t cachedStorageBatteryMv() {
   const unsigned long now = millis();
   if (storageBatteryMv == 0 || storageBatteryLastCheckMs == 0 ||
@@ -2876,7 +2921,10 @@ uint32_t cachedStorageBatteryMv() {
 }
 
 void serviceSdRecovery() {
-  if (sdReady || durableMediaJobLoaded || otaInProgress || otaRestartPending) return;
+  // A durable job may be available from the NVS mirror while the SD card is
+  // still absent. That is exactly when recovery must continue so the manifest
+  // and full state can be reloaded from SD.
+  if (sdReady || otaInProgress || otaRestartPending) return;
   const uint32_t batteryMv = cachedStorageBatteryMv();
   if (batteryMv < SD_RECOVERY_MIN_BATTERY_MV) {
     sdLastMessage = "recovery_waiting_for_battery";
@@ -2884,7 +2932,17 @@ void serviceSdRecovery() {
   }
   if (sdLastBackgroundRecoveryMs != 0 &&
       millis() - sdLastBackgroundRecoveryMs < sdBackgroundRecoveryIntervalMs) return;
-  static const uint32_t frequencies[] = {4000000UL, 2000000UL, 1000000UL, 400000UL};
+  // Another task (normally the durable job worker) is already remounting.
+  if (sdMountMutex != nullptr && xSemaphoreTakeRecursive(sdMountMutex, 0) != pdTRUE) return;
+  if (!sdReady) serviceSdRecoveryLocked();
+  if (sdMountMutex != nullptr) xSemaphoreGiveRecursive(sdMountMutex);
+}
+
+void serviceSdRecoveryLocked() {
+  // Match mountSdCardWithRetry(): the field card has needed 400 kHz, and the
+  // old 4 MHz-first rotation could take over half an hour to reach it at the
+  // maximum backoff interval.
+  static const uint32_t frequencies[] = {1000000UL, 400000UL};
   const uint32_t frequency = frequencies[sdBackgroundRecoveryAttempts %
                                          (sizeof(frequencies) / sizeof(frequencies[0]))];
   sdLastBackgroundRecoveryMs = millis();
@@ -2980,12 +3038,18 @@ bool writeDiagnosticCheckpointNvs(bool operational) {
 }
 
 bool appendDiagnosticJournal(const char *eventName) {
-  if (!sdReady) {
+  if (!sdReady || cameraSdTransferActive) {
+    ++diagnosticSdWriteFailures;
+    return false;
+  }
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
     ++diagnosticSdWriteFailures;
     return false;
   }
   if (!ensureFsDir(SD, DIAGNOSTIC_DIR)) {
     ++diagnosticSdWriteFailures;
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     return false;
   }
   File existing = SD.open(DIAGNOSTIC_LOG_PATH, FILE_READ);
@@ -2998,6 +3062,7 @@ bool appendDiagnosticJournal(const char *eventName) {
   File log = SD.open(DIAGNOSTIC_LOG_PATH, FILE_APPEND);
   if (!log) {
     ++diagnosticSdWriteFailures;
+    if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     return false;
   }
   String record = "{";
@@ -3014,6 +3079,7 @@ bool appendDiagnosticJournal(const char *eventName) {
   } else {
     ++diagnosticSdWriteFailures;
   }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
   return ok;
 }
 
@@ -5634,16 +5700,37 @@ void connectCameraWifi() {
   WiFi.setHostname(BOARD_HOSTNAME);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  cooperativeDelay(250);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  WiFi.begin(cameraTargetWifiSsid.c_str(), CAMERA_WIFI_PASS);
+  // The field camera sits near -90 dBm. Joining as an 802.11b-only station
+  // makes the camera send to us with DSSS/CCK rates, which decode several dB
+  // below the weakest OFDM rate. Fall back to b/g/n if it refuses b-only.
+  for (uint8_t pass = 0; pass < 2 && WiFi.status() != WL_CONNECTED; ++pass) {
+    const bool bOnly = pass == 0 && cameraWifiPrefer11b;
+    if (pass == 1 && !cameraWifiPrefer11b) break;
+    if (pass == 1) {
+      WiFi.disconnect(false, true);
+      cooperativeDelay(200);
+    }
+    esp_wifi_set_protocol(WIFI_IF_STA, bOnly ? WIFI_PROTOCOL_11B
+                                             : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    cooperativeDelay(250);
+    Serial.printf("[WiFi] camera join phy=%s\n", bOnly ? "11b" : "11bgn");
+    WiFi.begin(cameraTargetWifiSsid.c_str(), CAMERA_WIFI_PASS);
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    cooperativeDelay(100);
-    Serial.print(".");
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+      cooperativeDelay(100);
+      Serial.print(".");
+    }
+    Serial.println();
+    cameraWifiLast11b = bOnly && WiFi.status() == WL_CONNECTED;
+    if (pass == 1 && WiFi.status() == WL_CONNECTED) {
+      // This camera rejects b-only stations; stop paying the extra timeout.
+      Serial.println("[WiFi] camera refused 11b-only join; using 11bgn from now on");
+      cameraWifiPrefer11b = false;
+    }
   }
-  Serial.println();
 
   wifiConnected = (WiFi.status() == WL_CONNECTED);
   lastWifiJoinElapsedMs = millis() - connectStartedMs;
@@ -5859,7 +5946,10 @@ bool probeHaLowDataPlane(int &errorCode) {
     errorCode = errno;
     return false;
   }
-  if (!bindSocketToHaLow(sock)) {
+  // SO_BINDTODEVICE is unusable on this lwIP build (netif name lookup fails),
+  // which made every probe report ENODEV and forced a HaLow reconnect every
+  // minute. Source-address binding selects the HaLow netif, as for uploads.
+  if (!bindSocketToLocalAddress(sock, HaLow.localIP())) {
     errorCode = ENODEV;
     close(sock);
     return false;
@@ -6550,6 +6640,12 @@ bool proxyCameraRequest(const String &method,
     responseBody = "{\"error\":\"camera_connect_failed\"}";
     return false;
   }
+  // Trail cameras can pause for several seconds between HTTP chunks while
+  // reading their own card. Stream's one-second default timeout turned that
+  // normal pause into an empty chunk-size line and aborted otherwise healthy
+  // downloads. The byte loops below still enforce their own 15-second stall
+  // limit, so this remains bounded.
+  client.setTimeout(5000UL);
 
   String request = method + " " + path + " HTTP/1.1\r\n";
   request += "Host: " + CAMERA_IP.toString() + ":" + String(CAMERA_HTTP_PORT) + "\r\n";
@@ -6745,10 +6841,18 @@ long parseHttpChunkSize(const String &line) {
   if (semicolon >= 0) {
     chunkLine = chunkLine.substring(0, semicolon);
   }
-  if (chunkLine.isEmpty()) {
+  chunkLine.trim();
+  if (chunkLine.isEmpty() || chunkLine.length() > 8) {
     return -1;
   }
-  return strtol(chunkLine.c_str(), nullptr, 16);
+  // strtol() returns 0 for non-hex text, which previously turned a garbled
+  // header into a clean end-of-body and could stage a truncated file.
+  char *end = nullptr;
+  const long size = strtol(chunkLine.c_str(), &end, 16);
+  if (end == nullptr || *end != '\0' || size < 0) {
+    return -1;
+  }
+  return size;
 }
 
 void printBodySnippet(const String &body) {
@@ -7229,6 +7333,10 @@ bool runBringupSequence() {
   bool hotspotVisible = false;
 
   if (!hotspotVisible && tryExistingBleWakeSession()) {
+    // The wake token has been delivered; BLE is no longer needed. Release the
+    // shared 2.4 GHz controller before scanning for or joining the camera AP.
+    Serial.println("[BLE] wake sent; closing cached session before WiFi");
+    closeBleWakeSession();
     const unsigned long hotspotStartedMs = millis();
     hotspotVisible = waitForCameraWifiPresence(BRINGUP_HOTSPOT_WAIT_MS,
                                                BRINGUP_HOTSPOT_POLL_MS);
@@ -7250,6 +7358,12 @@ bool runBringupSequence() {
     Serial.printf("[BLE] exact wake result: %s stage=%s\n",
                   bleWakeConfirmed ? "success" : "no-confirmation",
                   bleStage.c_str());
+    // Match the camera application's sequential radio lifecycle: BLE wake,
+    // BLE shutdown, then WiFi discovery/association. Keeping GATT connected
+    // here adds power draw and radio-coexistence pressure without helping the
+    // already-issued wake command.
+    Serial.println("[BLE] wake transaction complete; closing session before WiFi");
+    closeBleWakeSession();
     const unsigned long hotspotStartedMs = millis();
     const unsigned long hotspotWaitMs = bleWakeConfirmed
                                           ? BRINGUP_HOTSPOT_WAIT_MS
@@ -7281,12 +7395,6 @@ bool runBringupSequence() {
     return false;
   }
   connectCameraWifi();
-  if (RUN_LOCAL_SERIAL_TEST) {
-    Serial.println("[BLE] closing wake session after camera WiFi connect");
-    closeBleWakeSession();
-  } else {
-    closeBleWakeSession();
-  }
   refreshWifiState();
   lastBringupElapsedMs = millis() - bringupStartedMs;
   const bool connected = wifiConnected;
@@ -7694,7 +7802,7 @@ void handleRecoveryResume() {
 }
 
 void handleDiagnosticLog() {
-  if (!sdReady) {
+  if (!sdReady || cameraSdTransferActive) {
     server.send(503, "application/json", "{\"error\":\"sd_unavailable\"}");
     return;
   }
@@ -7806,7 +7914,7 @@ void handleTrailMediaStatus() {
 }
 
 void handleTrailMediaList() {
-  if (!sdReady) {
+  if (!sdReady || cameraSdTransferActive) {
     server.send(503, "application/json", "{\"error\":\"sd_unavailable\"}");
     return;
   }
@@ -7845,6 +7953,10 @@ void handleTrailMediaFile() {
     return;
   }
   const String path = String(TRAIL_MEDIA_DIR) + "/" + filename;
+  if (cameraSdTransferActive) {
+    server.send(503, "application/json", "{\"error\":\"storage_busy_camera_transfer\"}");
+    return;
+  }
   if (onboardStorageMutex != nullptr &&
       xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
     server.send(503, "application/json", "{\"error\":\"storage_busy\"}");
@@ -9557,6 +9669,96 @@ uint32_t readDurableMediaStoredSize(const String &mediaPath) {
   return parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
 }
 
+String durableMediaIdentitySidecarPath(const String &mediaPath) {
+  return mediaPath + ".src";
+}
+
+// Camera media IDs are reused after deletion, so "<id>.JPG" on the SD card
+// may belong to an older capture. The .src sidecar records which camera item
+// a staged or partial file came from; staged bytes are only trusted when it
+// matches the manifest record exactly.
+String durableMediaIdentity(const DurableMediaRecord &record) {
+  return String(record.id) + "|" + String(record.type) + "|" + String(record.expectedBytes) +
+         "|" + String(record.date) + "|" + String(record.uid);
+}
+
+bool durableMediaIdentityMatches(const String &mediaPath, const DurableMediaRecord &record) {
+  File file = SD.open(durableMediaIdentitySidecarPath(mediaPath), FILE_READ);
+  if (!file) return false;
+  String value = file.readString();
+  file.close();
+  value.trim();
+  return value == durableMediaIdentity(record);
+}
+
+bool writeDurableMediaIdentity(const String &mediaPath, const DurableMediaRecord &record) {
+  File file = SD.open(durableMediaIdentitySidecarPath(mediaPath), FILE_WRITE);
+  if (!file) return false;
+  const String identity = durableMediaIdentity(record);
+  const bool ok = file.print(identity) == identity.length();
+  file.flush();
+  file.close();
+  return ok;
+}
+
+// A staged file that belongs to a different camera item. If the server
+// already has it, drop it; otherwise move it aside so an un-uploaded capture
+// is never overwritten. The "<id>_rN" name keeps the media ID prefix that the
+// uploader reports as trail_media_id.
+void retireStaleStagedMedia(const String &finalPath, const DurableMediaRecord &record) {
+  if (SD.exists(finalPath + ".uploaded")) {
+    SD.remove(finalPath);
+  } else {
+    const String ext = record.type == 1 ? ".JPG" : ".mp4";
+    for (uint16_t n = 1; n < 1000; ++n) {
+      const String aside = String(TRAIL_MEDIA_DIR) + "/" + String(record.id) + "_r" + String(n) + ext;
+      if (SD.exists(aside)) continue;
+      if (!SD.rename(finalPath, aside)) SD.remove(finalPath);
+      Serial.printf("[durable-job] retired stale staged %s -> %s\n", finalPath.c_str(), aside.c_str());
+      break;
+    }
+  }
+  SD.remove(durableMediaSizeSidecarPath(finalPath));
+  SD.remove(durableMediaIdentitySidecarPath(finalPath));
+  invalidateTrailMediaUploadState(finalPath);
+}
+
+// Cheap structural check before a JPEG's camera copy can be deleted: SOI at
+// the start and an EOI marker near the end (cameras may pad after EOI).
+bool validateJpegFileBasic(const String &path) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  const size_t size = file.size();
+  uint8_t head[2] = {0, 0};
+  bool ok = size > 4 && file.read(head, 2) == 2 && head[0] == 0xFF && head[1] == 0xD8;
+  if (ok) {
+    const size_t tailBytes = std::min(size, static_cast<size_t>(4096));
+    uint8_t *tail = static_cast<uint8_t *>(malloc(tailBytes));
+    ok = tail != nullptr && file.seek(size - tailBytes) && file.read(tail, tailBytes) == tailBytes;
+    bool sawEoi = false;
+    for (size_t i = 0; ok && i + 1 < tailBytes; ++i) {
+      if (tail[i] == 0xFF && tail[i + 1] == 0xD9) { sawEoi = true; break; }
+    }
+    free(tail);
+    ok = ok && sawEoi;
+  }
+  file.close();
+  return ok;
+}
+
+size_t durableSdFileSize(const String &path) {
+  if (onboardStorageMutex != nullptr &&
+      xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return 0;
+  size_t size = 0;
+  File file = SD.open(path, FILE_READ);
+  if (file) {
+    size = file.size();
+    file.close();
+  }
+  if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
+  return size;
+}
+
 void writeDurableMediaStoredSize(const String &mediaPath, uint32_t bytes) {
   if (bytes == 0) return;
   File file = SD.open(durableMediaSizeSidecarPath(mediaPath), FILE_WRITE);
@@ -9637,8 +9839,14 @@ bool flushCameraSdBuffer(File &output, uint8_t *sdBuffer, size_t &buffered,
   size_t committed = 0;
   uint8_t lockTimeouts = 0;
   uint8_t zeroWrites = 0;
-  while (committed < requested && lockTimeouts + zeroWrites < 3) {
-    esp_task_wdt_reset();
+  // SD cards can remain busy for hundreds of milliseconds while completing an
+  // internal erase/program operation. Three 20 ms retries falsely treated
+  // that normal latency as permanent media failure. Keep this bounded to
+  // roughly one second and continue feeding the task watchdog.
+  static const uint8_t MAX_TRANSIENT_WRITE_FAILURES = 10;
+  while (committed < requested &&
+         lockTimeouts + zeroWrites < MAX_TRANSIENT_WRITE_FAILURES) {
+    feedTaskWdt();
     vTaskDelay(pdMS_TO_TICKS(1));
     if (onboardStorageMutex != nullptr &&
         xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(750)) != pdTRUE) {
@@ -9650,7 +9858,7 @@ bool flushCameraSdBuffer(File &output, uint8_t *sdBuffer, size_t &buffered,
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     if (wrote == 0) {
       ++zeroWrites;
-      vTaskDelay(pdMS_TO_TICKS(20));
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
     committed += wrote;
@@ -9663,7 +9871,7 @@ bool flushCameraSdBuffer(File &output, uint8_t *sdBuffer, size_t &buffered,
     memmove(sdBuffer, sdBuffer + committed, requested - committed);
     buffered = requested - committed;
   }
-  if (lockTimeouts >= 3 && committed == 0) {
+  if (lockTimeouts >= MAX_TRANSIENT_WRITE_FAILURES && committed == 0) {
     error = "storage_lock_timeout";
   } else {
     error = "sd_short_write_expected_" + String(requested) +
@@ -9717,6 +9925,8 @@ bool writeCameraBytesToFile(WiFiClient &client, File &output, size_t count, size
   return true;
 }
 
+bool durableStorageError(const String &error);
+
 bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, uint32_t &bytesWritten) {
   bytesWritten = 0;
   durableTransferBytes = 0;
@@ -9726,20 +9936,33 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
   const String finalPath = durableMediaFilePath(record, false);
   const String partialPath = durableMediaFilePath(record, true);
   const bool isVideo = record.type == 2;
-  const uint32_t storedExpectedBytes = readDurableMediaStoredSize(finalPath);
+  const bool identityMatches = durableMediaIdentityMatches(finalPath, record);
+  const uint32_t storedExpectedBytes = identityMatches ? readDurableMediaStoredSize(finalPath) : 0;
   const uint32_t knownExpectedBytes = record.expectedBytes > 0 ? record.expectedBytes : storedExpectedBytes;
   File existing = SD.open(finalPath, FILE_READ);
   if (existing) {
     const size_t size = existing.size();
     existing.close();
-    if (size > 0 && ((knownExpectedBytes > 0 && size == knownExpectedBytes) ||
-                     (!isVideo && knownExpectedBytes == 0))) {
+    if (identityMatches && size > 0 &&
+        ((knownExpectedBytes > 0 && size == knownExpectedBytes) ||
+         (!isVideo && knownExpectedBytes == 0 && validateJpegFileBasic(finalPath)))) {
       bytesWritten = size;
       error = "already_staged";
       return true;
     }
-    SD.remove(finalPath);
-    SD.remove(durableMediaSizeSidecarPath(finalPath));
+    if (identityMatches) {
+      // Our own incomplete or corrupt copy of an item still on the camera.
+      SD.remove(finalPath);
+      SD.remove(durableMediaSizeSidecarPath(finalPath));
+    } else {
+      retireStaleStagedMedia(finalPath, record);
+    }
+  }
+  // A partial file is only resumable if it was started from this exact camera
+  // item. Partials are never the only copy of anything, so drop strangers.
+  if (!identityMatches && SD.exists(partialPath)) {
+    Serial.printf("[durable-job] discarding partial with unknown source %s\n", partialPath.c_str());
+    SD.remove(partialPath);
   }
   size_t resumeOffset = 0;
   File partial = SD.open(partialPath, FILE_READ);
@@ -9747,7 +9970,8 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     resumeOffset = partial.size();
     partial.close();
     if (knownExpectedBytes > 0 && resumeOffset == knownExpectedBytes) {
-      if (isVideo && !validateMp4FileBasic(partialPath)) {
+      if ((isVideo && !validateMp4FileBasic(partialPath)) ||
+          (!isVideo && !validateJpegFileBasic(partialPath))) {
         SD.remove(partialPath);
         SD.remove(durableMediaSizeSidecarPath(finalPath));
         resumeOffset = 0;
@@ -9818,6 +10042,11 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     SD.remove(partialPath);
     resumeOffset = 0;
   }
+  if (resumeOffset == 0 && !writeDurableMediaIdentity(finalPath, record)) {
+    client.stop();
+    error = "sd_identity_write_failed";
+    return false;
+  }
   uint32_t expectedTotalBytes = record.expectedBytes;
   if (expectedTotalBytes == 0 && contentRangeTotal > 0) {
     expectedTotalBytes = contentRangeTotal;
@@ -9834,7 +10063,9 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     error = "storage_busy";
     return false;
   }
+  cameraSdTransferActive = true;
   File output = SD.open(partialPath, rangeAccepted ? FILE_APPEND : FILE_WRITE);
+  if (!output) cameraSdTransferActive = false;
   if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
   bool ok = static_cast<bool>(output);
   size_t written = resumeOffset;
@@ -9850,9 +10081,39 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
   if (sdBuffer == nullptr) { ok = false; error = "sd_buffer_allocation_failed"; }
   if (ok && chunked) {
     while (true) {
-      String sizeLine = client.readStringUntil('\n');
+      // Some GardePro firmware inserts an extra blank separator (observed
+      // consistently after 47,104 bytes), and can also pause while reading its
+      // card. Ignore blank lines within a bounded window; a non-empty malformed
+      // chunk header remains a hard protocol error.
+      String sizeLine;
+      const unsigned long chunkHeaderStartedMs = millis();
+      while (sizeLine.isEmpty() &&
+             millis() - chunkHeaderStartedMs < 60000UL) {
+        sizeLine = client.readStringUntil('\n');
+        sizeLine.trim();
+        if (sizeLine.isEmpty()) {
+          if (!client.connected() && !client.available()) break;
+          feedTaskWdt();
+          cooperativeDelay(5);
+        }
+      }
       const long chunkSize = parseHttpChunkSize(sizeLine);
-      if (chunkSize < 0) { ok = false; error = "invalid_chunk"; break; }
+      if (chunkSize < 0) {
+        ok = false;
+        // Record what the camera actually sent so the recurring 47,104-byte
+        // boundary can be diagnosed from job status.
+        String hex;
+        for (size_t i = 0; i < sizeLine.length() && i < 12; ++i) {
+          char part[3];
+          snprintf(part, sizeof(part), "%02x", static_cast<uint8_t>(sizeLine[i]));
+          hex += part;
+        }
+        error = "invalid_chunk_len" + String(sizeLine.length()) + "_hex" + hex +
+                (client.connected() ? "" : "_closed");
+        Serial.printf("[durable-job] invalid chunk header at %u: %s\n",
+                      static_cast<unsigned>(written), error.c_str());
+        break;
+      }
       if (chunkSize == 0) break;
       if (!writeCameraBytesToFile(client, output, static_cast<size_t>(chunkSize), written,
                                   sdBuffer, sdBufferSize, buffered, error)) {
@@ -9923,13 +10184,29 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
       xSemaphoreTake(onboardStorageMutex, pdMS_TO_TICKS(2000)) == pdTRUE)) {
     output.flush();
     output.close();
+    cameraSdTransferActive = false;
     if (onboardStorageMutex != nullptr) xSemaphoreGive(onboardStorageMutex);
     vTaskDelay(pdMS_TO_TICKS(1));
   }
+  // Never leave background SD users suspended after an error path. File's
+  // destructor closes any handle that could not be closed above.
+  cameraSdTransferActive = false;
   client.stop();
-  if (ok && written > 0 && expectedTotalBytes > 0 && written != expectedTotalBytes) {
+  // `written` counts bytes received from the camera, including bytes still
+  // sitting in the SD buffer when a write failed. Only the file size on the
+  // card is evidence of what was stored.
+  const size_t onDisk = durableSdFileSize(partialPath);
+  if (ok && written != onDisk) {
     ok = false;
-    error = "size_mismatch_expected_" + String(expectedTotalBytes) + "_got_" + String(written);
+    error = "sd_stored_size_mismatch_received_" + String(written) + "_stored_" + String(onDisk);
+  }
+  if (ok && onDisk == 0) {
+    ok = false;
+    error = "empty_body";
+  }
+  if (ok && expectedTotalBytes > 0 && onDisk != expectedTotalBytes) {
+    ok = false;
+    error = "size_mismatch_expected_" + String(expectedTotalBytes) + "_got_" + String(onDisk);
   }
   if (ok && isVideo && expectedTotalBytes == 0) {
     ok = false;
@@ -9940,13 +10217,25 @@ bool downloadCameraMediaToSd(const DurableMediaRecord &record, String &error, ui
     error = "mp4_validation_failed";
     SD.remove(partialPath);
   }
-  if (ok && written > 0) {
+  if (ok && !isVideo && !validateJpegFileBasic(partialPath)) {
+    ok = false;
+    error = "jpeg_validation_failed";
+    SD.remove(partialPath);
+  }
+  if (ok) {
     SD.remove(finalPath);
     ok = SD.rename(partialPath, finalPath);
     if (!ok) error = "stage_rename_failed";
     else if (expectedTotalBytes > 0) writeDurableMediaStoredSize(finalPath, expectedTotalBytes);
   }
-  bytesWritten = static_cast<uint32_t>(written);
+  // Storage faults must reach durableMediaItemFailed() unprefixed so they
+  // trigger a remount; otherwise a dead card looked like endless progress.
+  if (!ok && onDisk > resumeOffset && !durableStorageError(error) &&
+      !error.endsWith("_validation_failed") &&
+      (expectedTotalBytes == 0 || onDisk < expectedTotalBytes)) {
+    error = "partial_progress_" + String(onDisk - resumeOffset) + ":" + error;
+  }
+  bytesWritten = static_cast<uint32_t>(onDisk);
   refreshSdCapacityCache();
   return ok;
 }
@@ -9987,8 +10276,11 @@ bool deleteCameraMediaRecord(const DurableMediaRecord &record, String &error) {
   if (statusCode >= 200 && statusCode < 300 && jsonObjectIntField(body, "code", -1) == 0) return true;
   String gallery;
   int galleryStatus = 0;
-  if (proxyCameraRequest("GET", "/list/detail/backward/900000/60", gallery, galleryStatus) &&
-      galleryStatus >= 200 && galleryStatus < 300 && !galleryJsonContainsRecord(gallery, record)) {
+  // The listing is "IDs <= cursor, newest first", so a cursor at this ID
+  // returns the item itself if it still exists.
+  if (proxyCameraRequest("GET", "/list/detail/backward/" + String(record.id) + "/3", gallery, galleryStatus) &&
+      galleryStatus >= 200 && galleryStatus < 300 && gallery.indexOf("\"data\"") >= 0 &&
+      !galleryJsonContainsRecord(gallery, record)) {
     return true;
   }
   error = "delete_failed_http_" + String(statusCode);
@@ -10053,7 +10345,7 @@ bool sha256SdFile(const String &path, String &hexDigest, uint32_t &fileBytes) {
     if (count <= 0) { readOk = false; break; }
     mbedtls_sha256_update(&context, buffer, static_cast<size_t>(count));
     trailMediaUploadBytesHashed += static_cast<uint32_t>(count);
-    esp_task_wdt_reset();
+    feedTaskWdt();
     vTaskDelay(pdMS_TO_TICKS(1));
   }
   uint8_t digest[32];
@@ -10186,7 +10478,7 @@ bool putTrailMediaBlob(const String &uploadUrl, const String &mediaPath,
       break;
     }
     trailMediaUploadBytesSent += static_cast<uint32_t>(count);
-    esp_task_wdt_reset();
+    feedTaskWdt();
     // Leave airtime and lwIP servicing capacity for the board's management
     // API and HaLow driver tasks. Saturating TX can starve the other core's
     // web response path and trip its idle-task watchdog.
@@ -10393,6 +10685,8 @@ bool ensureTransferWifiConnected() {
   transferWifiLastError = "";
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_STA);
+  // Undo any 11b-only setting left from a camera session.
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
   WiFi.setHostname(BOARD_HOSTNAME);
   WiFi.setSleep(false);
   cooperativeDelay(200);
@@ -10866,7 +11160,24 @@ void durableMediaCameraBringupFailed() {
     }
   }
 
-  if (attempt >= DURABLE_MEDIA_CAMERA_BRINGUP_MAX_ATTEMPTS) {
+  if (attempt >= DURABLE_MEDIA_CAMERA_BRINGUP_MAX_ATTEMPTS &&
+      attempt < DURABLE_MEDIA_CAMERA_BRINGUP_GIVE_UP_ATTEMPTS) {
+    // A marginal camera link misses a few bring-ups in a row routinely. Back
+    // off instead of failing; the job must survive without a server to
+    // resubmit it. The attempt count stays in lastError across the wait.
+    durableMediaJob.status = DURABLE_MEDIA_WAITING_RETRY;
+    ++durableMediaJob.retryCount;
+    setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
+                      "camera_unavailable_backoff");
+    setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError),
+                      prefix + String(attempt));
+    durableMediaNextRetryMs = millis() + DURABLE_MEDIA_CAMERA_BACKOFF_MS;
+    saveDurableMediaJob();
+    requestCameraStandbyAndPowerDownWifi("durable_camera_backoff");
+    return;
+  }
+
+  if (attempt >= DURABLE_MEDIA_CAMERA_BRINGUP_GIVE_UP_ATTEMPTS) {
     durableMediaJob.status = DURABLE_MEDIA_FAILED;
     ++durableMediaJob.retryCount;
     setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
@@ -10883,10 +11194,48 @@ void durableMediaCameraBringupFailed() {
   durableMediaJobRetry(prefix + String(attempt));
 }
 
+bool durableStorageError(const String &error) {
+  return error.startsWith("sd_") || error.startsWith("storage_") ||
+         error.indexOf(";sd_") >= 0 || error.indexOf(":sd_") >= 0 ||
+         error.indexOf(":storage_") >= 0 || error.indexOf("manifest_") >= 0;
+}
+
+// Remounts the card and reloads the durable job from it as one step under
+// sdMountMutex, so loop()'s background recovery cannot interleave.
+void durableMediaRecoverStorage(const String &error, const char *recoveredMessage) {
+  cameraSdTransferActive = false;
+  requestCameraStandbyAndPowerDownWifi("durable_sd_recovery");
+  if (sdMountMutex != nullptr) xSemaphoreTakeRecursive(sdMountMutex, portMAX_DELAY);
+  sdReady = false;
+  sdLastMessage = "durable_job_storage_recovery";
+  const bool mounted = mountSdCardWithRetry();
+  const bool loaded = mounted && loadDurableMediaJob();
+  if (sdMountMutex != nullptr) xSemaphoreGiveRecursive(sdMountMutex);
+  if (loaded) {
+    durableMediaJobRetry(String(recoveredMessage) + ":" + error);
+    return;
+  }
+  sdLastMessage = mounted ? "durable_job_reload_failed" : "durable_job_remount_failed";
+  durableMediaJob.status = DURABLE_MEDIA_WAITING_RETRY;
+  setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "waiting_for_sd");
+  setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError), error);
+  durableMediaNextRetryMs = millis() + DURABLE_MEDIA_RETRY_MS;
+}
+
 bool durableMediaItemFailed(DurableMediaRecord &record, const String &error) {
+  if (durableStorageError(error)) {
+    // A card/volume fault is not a bad camera item. Do not consume an item
+    // attempt or eventually skip/delete the wrong thing. Close-out has already
+    // happened in downloadCameraMediaToSd(), so it is safe to remount here.
+    durableMediaRecoverStorage(error, "sd_recovered");
+    return false;
+  }
   if (record.reserved[0] < UINT8_MAX) ++record.reserved[0];
   if (!writeDurableManifestRecord(durableMediaJob.currentIndex, record)) {
-    durableMediaJobRetry("manifest_attempt_write_failed");
+    // The transfer error may have been network-related, but losing the
+    // manifest write means storage is unhealthy. Restore the volume and retry
+    // this same record without charging an attempt that cannot be persisted.
+    durableMediaRecoverStorage("manifest_attempt_write_failed", "manifest_storage_recovered");
     return false;
   }
   if (record.reserved[0] < DURABLE_MEDIA_ITEM_MAX_ATTEMPTS) {
@@ -10914,6 +11263,9 @@ bool durableMediaItemFailed(DurableMediaRecord &record, const String &error) {
 void serviceDurableMediaJob() {
   if (automaticRecoverySuspended) return;
   if (!durableMediaJobLoaded || !durableMediaJobIsActive() || trailMediaUploadActive) return;
+  // With the card absent the job is known only from the NVS mirror; loop()'s
+  // background recovery remounts and reloads it.
+  if (!sdReady) return;
   if (durableMediaJob.status == DURABLE_MEDIA_WAITING_RETRY &&
       static_cast<long>(millis() - durableMediaNextRetryMs) < 0) return;
   const bool recoveringFromLowBattery =
@@ -11059,9 +11411,42 @@ void serviceDurableMediaJob() {
       durableMediaLowBatteryHold(cachedStorageBatteryMv());
       return;
     }
+    refreshWifiState();
+    const bool linkFailure = !transferMessage.startsWith("partial_progress_") &&
+                             (transferMessage == "camera_connect_failed" ||
+                              transferMessage == "camera_header_timeout" ||
+                              transferMessage.endsWith("_closed") || !wifiConnected);
+    if (linkFailure && durableMediaLinkFailures < DURABLE_MEDIA_MAX_LINK_FAILURES) {
+      // The camera link dropped (weak signal, beacon loss). That says nothing
+      // about this media item, so re-run bring-up instead of charging one of
+      // its three attempts. Bounded so a link that never carries data still
+      // eventually falls through to the normal item accounting.
+      ++durableMediaLinkFailures;
+      durableMediaJobRetry("camera_link_lost_" + String(durableMediaLinkFailures) + ":" +
+                           transferMessage);
+      return;
+    }
+    durableMediaLinkFailures = 0;
+    if (transferMessage.startsWith("partial_progress_")) {
+      // The camera commonly ends a response after a fixed-size block. Since
+      // the .part file advanced and Range resume is supported, this is useful
+      // progress rather than a failed item attempt. Keep camera WiFi up and
+      // resume quickly; the normal three-attempt limit still applies to
+      // consecutive attempts that make no progress.
+      durableMediaJob.status = DURABLE_MEDIA_WAITING_RETRY;
+      ++durableMediaJob.retryCount;
+      setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage),
+                        "resuming_partial_download");
+      setDurableJobText(durableMediaJob.lastError, sizeof(durableMediaJob.lastError),
+                        transferMessage);
+      durableMediaNextRetryMs = millis() + 1000UL;
+      saveDurableMediaJob();
+      return;
+    }
     durableMediaItemFailed(record, transferMessage);
     return;
   }
+  durableMediaLinkFailures = 0;
   if (record.reserved[1] == 0) {
     record.reserved[1] = transferMessage == "already_staged" ? 2 : 1;
     if (!writeDurableManifestRecord(durableMediaJob.currentIndex, record)) {
@@ -11084,11 +11469,10 @@ void serviceDurableMediaJob() {
     }
     ++durableMediaJob.deletedCount;
   }
-  if (record.reserved[1] == 2) ++durableMediaJob.skippedCount;
-  else {
-    ++durableMediaJob.downloadedCount;
-    durableMediaJob.bytesDownloaded += record.expectedBytes > 0 ? record.expectedBytes : bytesWritten;
-  }
+  // "skipped" is reserved for items left on the camera after repeated
+  // failures. An item staged by an earlier attempt is still downloaded.
+  ++durableMediaJob.downloadedCount;
+  durableMediaJob.bytesDownloaded += record.expectedBytes > 0 ? record.expectedBytes : bytesWritten;
   ++durableMediaJob.currentIndex;
   durableMediaJob.currentMediaId = 0;
   setDurableJobText(durableMediaJob.stage, sizeof(durableMediaJob.stage), "item_complete");
@@ -12063,6 +12447,7 @@ void setup() {
 
   onboardFrameMutex = xSemaphoreCreateMutex();
   onboardStorageMutex = xSemaphoreCreateMutex();
+  sdMountMutex = xSemaphoreCreateRecursiveMutex();
   onboardCameraMutex = xSemaphoreCreateMutex();
   wifiRadioMutex = xSemaphoreCreateRecursiveMutex();
   observationUploadMutex = xSemaphoreCreateMutex();
