@@ -1,0 +1,24 @@
+[Unit]
+Description=GardePro trail-camera bridge (desktop replacement for the ESP32 firmware)
+Documentation=file:///home/matheau/code/trail_test/esp332_camera_bridge/DESKTOP_BRIDGE.md
+Wants=network-online.target bluetooth.service
+After=network-online.target NetworkManager.service bluetooth.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Runs as the desktop user: staged files stay user-owned. nmcli is run through
+# `sudo -n` (passwordless sudo) and BLE goes through BlueZ over D-Bus.
+User=matheau
+Group=matheau
+WorkingDirectory=/home/matheau/code/trail_test/esp332_camera_bridge
+Environment=PYTHONUNBUFFERED=1
+Environment=GARDEPRO_BRIDGE_CONFIG=/etc/gardepro-bridge.json
+ExecStart=/home/matheau/code/trail_test/esp332_camera_bridge/.venv/bin/python -m desktop_bridge
+Restart=on-failure
+RestartSec=10
+WatchdogSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

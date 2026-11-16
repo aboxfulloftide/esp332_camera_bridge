@@ -1,0 +1,16 @@
+{
+  "hostname": "trail_desktop",
+  "http_host": "uplink",
+  "http_port": 18080,
+  "cam_iface": "wlp5s0",
+  "uplink_iface": "enp4s0",
+  "ble_adapter": "hci0",
+  "camera": "e6_plus",
+  "server": "http://192.168.1.42/trail_cam",
+  "scanner_host": "trail_desktop",
+  "tunnel_host": "192.168.1.42",
+  "tunnel_port": 6000,
+  "register": false,
+  "staging_dir": "/home/matheau/code/trail_test/trail_staging",
+  "state_path": "/home/matheau/code/trail_test/trail_staging/bridge_state.json"
+}
